@@ -373,8 +373,28 @@ def ai_diagnose_failure(raw: str, failure: str) -> list[str]:
 
 def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
     def find(kind):
-        match = re.search(rf"{kind}\s*balance\D{{0,20}}([\d,]+(?:\.\d{{1,2}})?(?:\s*(?:CR|DR))?)", text, re.I)
-        return money(match.group(1)) if match else None
+        # A column heading such as "Closing Balance*" is commonly followed by
+        # the first transaction date (for example 01/04/2024).  It is not the
+        # statement endpoint. Prefer a labelled monetary value (with decimals)
+        # and, when a summary repeats it, take the final source occurrence.
+        monetary = re.findall(
+            rf"\b{kind}\s*balance\b[^\d\r\n]{{0,20}}(?:\r?\n\s*)?"
+            r"(-?[\d,]+\.\d{1,2}(?:\s*(?:CR|DR))?)",
+            text,
+            re.I,
+        )
+        if monetary:
+            return money(monetary[-1])
+        # Retain support for sources that print whole-number balances, while
+        # rejecting a date fragment immediately after a table heading.
+        match = re.search(rf"\b{kind}\s*balance\b\D{{0,20}}([\d,]+(?:\.\d{{1,2}})?(?:\s*(?:CR|DR))?)", text, re.I)
+        if not match:
+            return None
+        value = money(match.group(1))
+        following = text[match.end():match.end() + 12]
+        if value is not None and abs(value) <= 31 and re.match(r"\s*/\s*\d{1,2}\s*/", following):
+            return None
+        return value
     opening, closing = find("opening"), find("closing")
     summary = re.search(r"(?is)statement\s+summary\s*:-?.{0,300}?opening\s+balance.*?\n\s*([\d,]+(?:\.\d{1,2})?)\s+\d+\s+\d+\s+[\d,]+(?:\.\d{1,2})?\s+[\d,]+(?:\.\d{1,2})?\s+([\d,]+(?:\.\d{1,2})?)", text)
     if summary:
