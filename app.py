@@ -1081,6 +1081,19 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     diagnostic_rules: set[str] = set()
     while True:
         round_number += 1
+        # Keep API clients informed before starting expensive PDF work.
+        with JOBS_LOCK:
+            job = JOBS.get(job_id, {})
+            job.update({
+                "processing": True,
+                "valid": False,
+                "status": "processing",
+                "message": f"UPG retry round {round_number}: inspecting the source layout and preparing parser candidates.",
+                "retry_round": round_number,
+                "attempted_candidates": attempted_candidates,
+                "skipped_candidates": skipped_candidates,
+            })
+            JOBS[job_id] = job
         latest = None
         errors = []
         repair_context = f"UPG self-healing round {round_number}. No validated parser candidate has been found yet."
@@ -1105,6 +1118,19 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
             try:
+                candidate_name = "AI layout addendum" if force_ai_profile else (strategy or "detected transaction table")
+                with JOBS_LOCK:
+                    job = JOBS.get(job_id, {})
+                    job.update({
+                        "processing": True,
+                        "valid": False,
+                        "status": "processing",
+                        "message": f"UPG retry round {round_number}: testing {candidate_name} and running financial, narration, coverage, and balance checks.",
+                        "retry_round": round_number,
+                        "attempted_candidates": attempted_candidates,
+                        "skipped_candidates": skipped_candidates,
+                    })
+                    JOBS[job_id] = job
                 candidate = parse_statement(path, fallback_open, fallback_close, strategy, force_ai_profile, repair_context)
                 latest = candidate
                 # A failed mapping/strategy combination is never tested again
@@ -1122,7 +1148,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     name = export_excel(tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_wd, declared_dp, statement_totals_valid)
                     with JOBS_LOCK:
                         JOBS[job_id] = {"processing": False, "valid": True, "message": f"Validated after {round_number} UPG retry rounds. Parsed {len(tx)} transactions. Opening {indian_amount(op)} − withdrawals {indian_amount(wd)} + deposits {indian_amount(dp)} = {indian_amount(calculated)}; declared closing balance is {indian_amount(cl)}. Source coverage: PASS. Financial validation: PASS. Narration validation: PASS.", "download": "/download/" + name}
-                        JOBS[job_id].update({"status": "completed", "profile_id": profile_id})
+                        JOBS[job_id].update({"status": "completed", "profile_id": profile_id, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
                     post_completion_webhook(job_id, "completed", profile_id)
                     return
                 failed_candidates.add(signature)
@@ -1148,7 +1174,9 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         else:
             detail = f"UPG retry round {round_number}: no safe candidate was produced yet; it is continuing with new layout attempts."
         with JOBS_LOCK:
-            JOBS[job_id] = {"processing": True, "valid": False, "message": detail}
+            job = JOBS.get(job_id, {})
+            job.update({"processing": True, "valid": False, "status": "processing", "message": detail, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
+            JOBS[job_id] = job
         # Do not terminate on a failed validation. This pause avoids a busy loop
         # while allowing a long-running UPG job to continue beyond five minutes.
         time.sleep(8)
@@ -1208,7 +1236,15 @@ class App(BaseHTTPRequestHandler):
             if not job:
                 self.json({"job_id": job_id, "status": "failed", "error": "Job not found"}, 404); return
             status = job.get("status", "processing" if job.get("processing") else ("completed" if job.get("valid") else "failed"))
-            response = {"job_id": job_id, "status": status}
+            response = {
+                "job_id": job_id,
+                "status": status,
+                # BS Analyzer renders this verbatim as the UPG activity feed.
+                "message": job.get("message", "UPG is preparing parser candidates."),
+                "retry_round": job.get("retry_round", 0),
+                "attempted_candidates": job.get("attempted_candidates", 0),
+                "skipped_candidates": job.get("skipped_candidates", 0),
+            }
             if job.get("profile_id"): response["profile_id"] = job["profile_id"]
             if status == "failed": response["error"] = job.get("message", "Parser generation failed")
             self.json(response); return
