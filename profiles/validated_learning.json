@@ -1,0 +1,45 @@
+{
+  "validated_profiles": {
+    "cd02cb200d0ed9e9": {
+      "observations": 1,
+      "strategy": "detected_table",
+      "self_healed_addendum": false,
+      "parent_profile": null
+    },
+    "d9dd09a0e766345b": {
+      "observations": 4,
+      "strategy": "unsigned_running_balance_text",
+      "self_healed_addendum": false,
+      "diagnostic_rules": [],
+      "parent_profile": null
+    },
+    "a431227cffd017d1": {
+      "observations": 14,
+      "strategy": "detected_table",
+      "self_healed_addendum": false,
+      "diagnostic_rules": [],
+      "parent_profile": null
+    },
+    "4485cb7627e9e49c": {
+      "observations": 5,
+      "strategy": "value_date_unsigned",
+      "self_healed_addendum": false,
+      "diagnostic_rules": [],
+      "parent_profile": null
+    },
+    "b338d9ffda6efe54": {
+      "observations": 2,
+      "strategy": "detected_table",
+      "self_healed_addendum": false,
+      "diagnostic_rules": [],
+      "parent_profile": null
+    },
+    "7f8fdd048f017b44": {
+      "observations": 1,
+      "strategy": "detected_table",
+      "self_healed_addendum": false,
+      "diagnostic_rules": [],
+      "parent_profile": "cd02cb200d0ed9e9"
+    }
+  }
+}

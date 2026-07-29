@@ -1,0 +1,25 @@
+{
+  "version": 5,
+  "header_signature": [
+    "Date",
+    "Instrument ID",
+    "Amount(INR)",
+    "Type",
+    "Balance",
+    "Remarks"
+  ],
+  "layout_fingerprint": "",
+  "columns": {
+    "date": 0,
+    "narration": 5,
+    "balance": 4,
+    "amount": 2,
+    "transaction_type": 3,
+    "instrument_number": 1
+  },
+  "parent_profile": null,
+  "validated_observations": 2,
+  "last_validated_strategy": "detected_table",
+  "self_healed_addendum": false,
+  "diagnostic_rules": []
+}

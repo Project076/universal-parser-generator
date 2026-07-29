@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "header_signature": [
+    "Date",
+    "Narration",
+    "Chq. / Ref No.",
+    "Value Date",
+    "Withdrawal Amount",
+    "Deposit Amount",
+    "Closing Balance*"
+  ],
+  "columns": {
+    "date": 0,
+    "narration": 1,
+    "withdrawal": 4,
+    "deposit": 5,
+    "instrument_number": 2,
+    "balance": 6
+  }
+}

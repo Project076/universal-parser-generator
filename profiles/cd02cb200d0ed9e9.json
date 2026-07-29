@@ -1,0 +1,24 @@
+{
+  "version": 3,
+  "header_signature": [
+    "Tran Date",
+    "Chq No",
+    "Particulars",
+    "Debit",
+    "Credit",
+    "Balance",
+    "Init.\nBr"
+  ],
+  "columns": {
+    "narration": 2,
+    "withdrawal": 3,
+    "deposit": 4,
+    "instrument_number": 1,
+    "balance": 5,
+    "date": 0
+  },
+  "parent_profile": null,
+  "validated_observations": 1,
+  "last_validated_strategy": "detected_table",
+  "self_healed_addendum": false
+}

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "header_signature": [
+    "Sl\nNo",
+    "Tran\nId",
+    "Value\nDate",
+    "Transaction\nDate",
+    "Transaction\nPosted\nDate",
+    "Cheque no /\nRef No",
+    "Transaction\nRemarks",
+    "Withdra\nwal (Dr)",
+    "Deposit\n(Cr)",
+    "Balance"
+  ],
+  "columns": {
+    "date": 2,
+    "balance": 9,
+    "instrument_number": 5,
+    "narration": 6,
+    "withdrawal": 7,
+    "deposit": 8
+  }
+}

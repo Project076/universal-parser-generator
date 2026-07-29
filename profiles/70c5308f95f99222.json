@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "header_signature": [
+    "Date",
+    "Instrument ID",
+    "Amount(INR)",
+    "Type",
+    "Balance",
+    "Remarks"
+  ],
+  "columns": {
+    "date": 0,
+    "narration": 5,
+    "balance": 4,
+    "amount": 2,
+    "transaction_type": 3,
+    "instrument_number": 1
+  },
+  "parent_profile": null
+}

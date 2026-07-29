@@ -1,0 +1,25 @@
+{
+  "version": 5,
+  "header_signature": [
+    "Date",
+    "Narration",
+    "Withdrawal",
+    "Deposit",
+    "Instrument Number",
+    "Balance"
+  ],
+  "layout_fingerprint": "cfcae735fb6c24fa",
+  "columns": {
+    "date": 0,
+    "narration": 1,
+    "withdrawal": 2,
+    "deposit": 3,
+    "instrument_number": 4,
+    "balance": 5
+  },
+  "parent_profile": null,
+  "validated_observations": 5,
+  "last_validated_strategy": "value_date_unsigned",
+  "self_healed_addendum": false,
+  "diagnostic_rules": []
+}
