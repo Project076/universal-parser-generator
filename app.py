@@ -1374,7 +1374,12 @@ class App(BaseHTTPRequestHandler):
             self.json(response); return
         if path == "/parser-profiles":
             if not self.api_authorized(): return
-            fingerprint = parse_qs(parsed_url.query).get("fingerprint", [""])[0]
+            query = parse_qs(parsed_url.query)
+            fingerprint = query.get("fingerprint", [""])[0]
+            try: page = max(1, int(query.get("page", ["1"])[0]))
+            except ValueError: page = 1
+            try: limit = min(100, max(1, int(query.get("limit", ["100"])[0])))
+            except ValueError: limit = 100
             matches = []
             for profile_path in PROFILES.glob("*.json"):
                 profile = api_profile_payload(profile_path.stem)
@@ -1386,7 +1391,10 @@ class App(BaseHTTPRequestHandler):
                 self.json(matches); return
             # No fingerprint means an authenticated registry sync. Never expose
             # profiles through the public HTML endpoint.
-            self.json({"profiles": matches, "count": len(matches), "sync_cursor": None}); return
+            total = len(matches)
+            start = (page - 1) * limit
+            profiles = matches[start:start + limit]
+            self.json({"profiles": profiles, "count": total, "page": page, "limit": limit, "has_more": start + limit < total, "next_page": page + 1 if start + limit < total else None}); return
         if path.startswith("/parser-profiles/"):
             if not self.api_authorized(): return
             profile = api_profile_payload(Path(path).name)
