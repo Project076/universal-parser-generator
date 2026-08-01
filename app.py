@@ -292,7 +292,7 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     except (OSError, ValueError): prior = {}
     observations = int(prior.get("validated_observations", 0)) + 1
     detection_code, parser_code = certified_javascript_code(headers, strategy)
-    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}}
+    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
@@ -1159,6 +1159,9 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "columns": data.get("columns", {}),
         "rules": data.get("rules", {}),
         "validation": data.get("validation", {"status": "pass"}),
+        "parent_profile_id": data.get("parent_profile"),
+        "certification": data.get("certification", {"status": "certified", "source": data.get("upg_source", "upg_native")}),
+        "profile_origin": data.get("upg_source", "upg_native"),
     }
 
 def post_completion_webhook(job_id: str, status: str, profile_id: str | None = None, error: str | None = None) -> None:
@@ -1375,9 +1378,15 @@ class App(BaseHTTPRequestHandler):
             matches = []
             for profile_path in PROFILES.glob("*.json"):
                 profile = api_profile_payload(profile_path.stem)
-                if profile and profile.get("layout_fingerprint") == fingerprint:
+                if profile and (not fingerprint or profile.get("layout_fingerprint") == fingerprint):
                     matches.append(profile)
-            self.json(matches); return
+            matches.sort(key=lambda item: (item.get("bank_name", ""), item.get("profile_id", "")))
+            if fingerprint:
+                # Preserve the original lookup contract used by BS Analyzer.
+                self.json(matches); return
+            # No fingerprint means an authenticated registry sync. Never expose
+            # profiles through the public HTML endpoint.
+            self.json({"profiles": matches, "count": len(matches), "sync_cursor": None}); return
         if path.startswith("/parser-profiles/"):
             if not self.api_authorized(): return
             profile = api_profile_payload(Path(path).name)
@@ -1423,7 +1432,7 @@ class App(BaseHTTPRequestHandler):
                     "last_validated_strategy": incoming.get("extraction_strategy", incoming.get("strategy", "text-column-offsets")),
                     "columns": incoming.get("columns", {}), "rules": incoming.get("rules", {}),
                     "validation": {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True, "transaction_count": incoming.get("certification", {}).get("transaction_count")},
-                    "certification": incoming.get("certification", {}), "upg_source": "bs_analyzer_import",
+                    "certification": incoming.get("certification", {}), "parent_profile": incoming.get("parent_profile_id") or incoming.get("evolved_from_profile_id"), "upg_source": "bs_analyzer_import",
                 }
                 (PROFILES / f"{profile_id}.json").write_text(json.dumps(stored, indent=2), encoding="utf-8")
                 self.json(api_profile_payload(profile_id), HTTPStatus.CREATED)
