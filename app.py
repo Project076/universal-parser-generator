@@ -437,6 +437,59 @@ def sampled_pdf_text(path: Path) -> str:
         PDF_SAMPLE_CACHE[key] = sample
     return sample
 
+def sampled_pdf_geometry_evidence(path: Path) -> list[dict]:
+    """Structured original-PDF layout evidence for the parser-generator AI.
+
+    This intentionally sends table geometry, not a long character dump. Small
+    PDFs contribute every page; large PDFs contribute representative first,
+    middle, and last page groups (including boundary pages).
+    """
+    evidence: list[dict] = []
+    with open_pdfplumber(path) as pdf:
+        page_numbers = list(range(len(pdf.pages))) if len(pdf.pages) <= 60 else sampled_page_indices(len(pdf.pages))
+        for page_number in page_numbers:
+            page = pdf.pages[page_number]
+            tables = page.find_tables()
+            page_tables = []
+            for table in tables[:3]:
+                extracted = table.extract()
+                if not extracted:
+                    continue
+                header_index = next((i for i, row in enumerate(extracted[:12]) if len(map_headers(row or [])) >= 3), 0)
+                header_cells = table.rows[header_index].cells if header_index < len(table.rows) else []
+                bands = [[round(float(cell[0]), 1), round(float(cell[2]), 1)] for cell in header_cells if cell]
+                page_tables.append({
+                    "bbox": [round(float(value), 1) for value in table.bbox],
+                    "header_row_index": header_index,
+                    "header": [str(value or "") for value in (extracted[header_index] if header_index < len(extracted) else [])],
+                    "column_x_ranges": bands,
+                    "row_count": len(extracted),
+                })
+            # Borderless statements (including many bank exports) have no
+            # `find_tables()` result. Preserve their actual PDF geometry as
+            # coordinate evidence without exposing transaction wording.
+            words = page.extract_words(x_tolerance=1, y_tolerance=2)
+            lines: dict[int, list[dict]] = {}
+            for word in words:
+                lines.setdefault(round(float(word["top"]) / 3), []).append(word)
+            header_words: list[dict] = []
+            for line in lines.values():
+                labels = " ".join(str(word["text"]) for word in line).lower()
+                if "date" in labels and "balance" in labels and any(label in labels for label in ("particular", "narration", "description")):
+                    header_words = [{"label": str(word["text"]), "x0": round(float(word["x0"]), 1), "x1": round(float(word["x1"]), 1)} for word in sorted(line, key=lambda item: float(item["x0"]))]
+                    break
+            numeric_bands: dict[int, int] = {}
+            for word in words:
+                if re.fullmatch(r"-?[\d,]+(?:\.\d{1,2})?(?:Cr|Dr)?", str(word["text"]), re.I):
+                    band = round(float(word["x0"]) / 10) * 10
+                    numeric_bands[band] = numeric_bands.get(band, 0) + 1
+            coordinate_fallback = {
+                "header_word_positions": header_words,
+                "numeric_column_x_ranges": [{"x0": x0, "x1": x0 + 10, "observations": count} for x0, count in sorted(numeric_bands.items(), key=lambda item: item[1], reverse=True)[:10]],
+            }
+            evidence.append({"page": page_number + 1, "width": round(float(page.width), 1), "height": round(float(page.height), 1), "tables": page_tables, "borderless_coordinate_evidence": coordinate_fallback})
+    return evidence
+
 def sampled_page_indices(count: int) -> list[int]:
     """Seven-page regions plus boundary context for large PDF layout learning."""
     if count <= 21:
@@ -462,11 +515,11 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
             },
         }, "required": ["header_row", "columns"],
     }
-    sample = sampled_pdf_text(source_path) if source_path and source_path.suffix.lower() == ".pdf" else raw
-    evidence = {"rows": rows[:35], "text_excerpt": sample[:50000], "failed_validation_evidence": repair_context}
+    geometry = sampled_pdf_geometry_evidence(source_path) if source_path and source_path.suffix.lower() == ".pdf" else []
+    evidence = {"rows": rows[:35], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context}
     instruction = (PARSER_GENERATOR_POLICY + "\nYou are a bank-statement parser generator and controlled self-healing planner. Identify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
-        "and balance. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
+        "and balance. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
     )
     payload = {
         "model": AI_MODEL,
