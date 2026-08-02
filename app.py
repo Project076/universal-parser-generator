@@ -913,8 +913,12 @@ def sampled_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float
                 return labels, bands
     return None
 
-def extract_geometry_profile_rows(path: Path) -> list[list[object]]:
-    """Apply sampled column bands to all pages without table rediscovery."""
+def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = None) -> list[list[object]]:
+    """Apply sampled column bands without table rediscovery.
+
+    `page_numbers` is a zero-based representative-page set used for fast
+    structural screening. A final candidate always calls this for every page.
+    """
     profile = sampled_geometry_profile(path)
     if not profile:
         return []
@@ -924,7 +928,9 @@ def extract_geometry_profile_rows(path: Path) -> list[list[object]]:
     rows: list[list[object]] = [header]
     current: list[str] | None = None
     with open_pdfplumber(path) as pdf:
-        for page in pdf.pages:
+        for page_number, page in enumerate(pdf.pages):
+            if page_numbers is not None and page_number not in page_numbers:
+                continue
             lines: dict[int, list[dict]] = {}
             footer_started = False
             for word in page.extract_words(x_tolerance=1, y_tolerance=2):
@@ -985,6 +991,40 @@ def extract_geometry_profile_rows(path: Path) -> list[list[object]]:
     if current is not None:
         rows.append(current)
     return rows
+
+def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
+    """Reject structurally impossible large-PDF candidates before full parsing.
+
+    This is deliberately not a release validation. It only checks original-PDF
+    sample pages for a real header and multiple dated record shapes, letting
+    full extraction and all financial/narration gates remain the sole
+    certification authority.
+    """
+    if path.suffix.lower() != ".pdf" or not is_large_pdf(path):
+        return True
+    count = len(open_pdf_reader(path).pages)
+    samples = set(sampled_page_indices(count))
+    try:
+        if strategy == "geometry_profile":
+            rows = extract_geometry_profile_rows(path, samples)
+        else:
+            raw = sampled_pdf_text(path)
+            if strategy == "value_date_unsigned":
+                rows = extract_text_layout_rows(raw, unsigned_balance=True, use_value_date=True)
+            elif strategy == "unsigned_running_balance_text":
+                rows = extract_text_layout_rows(raw, unsigned_balance=True)
+            elif strategy in {"running_balance_text", "page_text_unsigned"}:
+                rows = extract_text_layout_rows(raw, unsigned_balance=(strategy == "page_text_unsigned"))
+            else:
+                # Table rediscovery is intentionally not run on every page of
+                # a large PDF. Geometry/AI candidates are stronger evidence.
+                return False
+        if len(rows) < 4 or len(map_headers(rows[0])) < 3:
+            return False
+        date_index = map_headers(rows[0]).get("date", 0)
+        return sum(bool(transaction_date_value(row[date_index] if date_index < len(row) else "")) for row in rows[1:]) >= 2
+    except Exception:
+        return False
 
 def extract_pdf_rows(path: Path, strategy_override: str | None = None) -> tuple[list[list[object]], str]:
     raw = remove_page_furniture(cached_pdf_text(path))
@@ -1523,6 +1563,12 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             initial_candidates = [preferred] + [item for item in initial_candidates if item != preferred]
         candidates = (initial_candidates if round_number == 1
             else [(None, True), ("geometry_profile", False), ("value_date_unsigned", False), ("page_text_unsigned", False), ("unsigned_running_balance_text", False), ("running_balance_text", False), (None, False)])
+        if large_pdf:
+            # Do not spend minutes rediscovering a table across every page.
+            # Original-PDF geometry and a controlled AI addendum are the two
+            # primary paths; text candidates must first prove themselves on
+            # the representative sample below.
+            candidates = [candidate for candidate in candidates if candidate != (None, False)]
         if planned_strategies:
             def plan_key(candidate: tuple[str | None, bool]) -> int:
                 name = "ai_layout_addendum" if candidate[1] else (candidate[0] or "detected_table")
@@ -1532,6 +1578,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         for strategy, force_ai_profile in candidates:
             try:
                 candidate_name = "AI layout addendum" if force_ai_profile else (strategy or "detected transaction table")
+                if large_pdf and not force_ai_profile and not sample_candidate_plausible(path, strategy):
+                    skipped_candidates += 1
+                    errors.append(f"{candidate_name}: rejected by sampled original-PDF structure")
+                    continue
                 with JOBS_LOCK:
                     job = JOBS.get(job_id, {})
                     job.update({
