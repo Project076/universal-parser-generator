@@ -122,8 +122,14 @@ def money(value: object) -> Decimal | None:
     if value is None or str(value).strip() == "": return None
     s = str(value).strip().replace(",", "").replace("₹", "").replace("$", "")
     s = re.sub(r"\s+", "", s)
-    neg = s.startswith("(") and s.endswith(")")
-    s = s.strip("()").replace("DR", "").replace("CR", "").strip()
+    # Coordinate extraction can leave a transaction value followed by a page
+    # total in the same cell. The first monetary token belongs to the row.
+    token = re.match(r"-?\d+(?:\.\d{1,2})?(?:DR|CR)?", s, re.I)
+    if token:
+        s = token.group()
+    suffix = re.search(r"(DR|CR)$", s, re.I)
+    neg = (s.startswith("(") and s.endswith(")")) or bool(suffix and suffix.group(1).upper() == "DR")
+    s = re.sub(r"(?:DR|CR)$", "", s.strip("()"), flags=re.I).strip()
     try: return (-1 if neg else 1) * Decimal(s)
     except InvalidOperation: return None
 
@@ -818,16 +824,39 @@ def sampled_geometry_header(path: Path, page_count: int) -> list[object] | None:
     return None
 
 def sampled_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float, float]]] | None:
-    """Learn column bands from representative original-PDF pages."""
+    """Learn column bands from representative original-PDF pages.
+
+    Prefer ruled-table cells, but also support borderless bank statements by
+    deriving bands from the x-position of their printed header words.
+    """
     with open_pdfplumber(path) as pdf:
-        for number in sampled_page_indices(len(pdf.pages)):
-            for table in pdf.pages[number].find_tables():
+        page_numbers = list(range(len(pdf.pages))) if len(pdf.pages) <= 60 else sampled_page_indices(len(pdf.pages))
+        for number in page_numbers:
+            page = pdf.pages[number]
+            for table in page.find_tables():
                 extracted = table.extract()
                 for index, row in enumerate(extracted):
                     if row and len(map_headers(row)) >= 3 and index < len(table.rows):
                         cells = table.rows[index].cells
                         if cells and all(cell for cell in cells):
                             return row, [(float(cell[0]), float(cell[2])) for cell in cells]
+            lines: dict[int, list[dict]] = {}
+            for word in page.extract_words(x_tolerance=1, y_tolerance=2):
+                lines.setdefault(round(float(word["top"]) / 3), []).append(word)
+            for words in lines.values():
+                ordered = sorted(words, key=lambda item: float(item["x0"]))
+                labels = [str(word["text"]) for word in ordered]
+                if len(map_headers(labels)) < 3:
+                    continue
+                starts = [float(word["x0"]) for word in ordered]
+                # Header words are the authoritative column starts. A band
+                # ends immediately before the next heading; the last reaches
+                # the page edge. This is the same coordinate method used for
+                # a ruled table, without requiring border lines.
+                bands = [(0.0 if index == 0 else starts[index] - 3.0,
+                          (starts[index + 1] - 3.0) if index + 1 < len(starts) else float(page.width))
+                         for index in range(len(starts))]
+                return labels, bands
     return None
 
 def extract_geometry_profile_rows(path: Path) -> list[list[object]]:
@@ -836,21 +865,52 @@ def extract_geometry_profile_rows(path: Path) -> list[list[object]]:
     if not profile:
         return []
     header, bands = profile
-    date_index = map_headers(header).get("date", 0)
+    column_map = map_headers(header)
+    date_index = column_map.get("date", 0)
     rows: list[list[object]] = [header]
     current: list[str] | None = None
     with open_pdfplumber(path) as pdf:
         for page in pdf.pages:
             lines: dict[int, list[dict]] = {}
+            footer_started = False
             for word in page.extract_words(x_tolerance=1, y_tolerance=2):
                 lines.setdefault(round(float(word["top"]) / 3), []).append(word)
             for words in lines.values():
+                if footer_started:
+                    continue
+                line_text = " ".join(str(word["text"]) for word in words)
+                footer_on_line = bool(re.search(r"(?i)\b(?:page\s+total|grand\s+total|date/time|system\s+generated|page\s+\d+\s+of)\b", line_text))
                 cells = ["" for _ in bands]
                 for word in sorted(words, key=lambda item: float(item["x0"])):
                     center = (float(word["x0"]) + float(word["x1"])) / 2
                     column = next((i for i, (left, right) in enumerate(bands) if left <= center <= right), None)
                     if column is not None:
                         cells[column] = (cells[column] + " " + word["text"]).strip()
+                # A page footer can share the final transaction's y-band.
+                # Keep the transaction portion, never append page/grand
+                # totals or the generated-statement disclaimer to its cells.
+                cells = [re.split(r"(?i)\b(?:page\s+total|grand\s+total|date/time|this\s+is\s+a\s+system\s+generated)", cell)[0].strip() for cell in cells]
+                if footer_on_line:
+                    withdrawal_index = column_map.get("withdrawal")
+                    deposit_index = column_map.get("deposit")
+                    balance_index = column_map.get("balance")
+                    numeric = lambda value: (re.search(r"-?[\d,]+(?:\.\d{1,2})?", value or "").group() if re.search(r"-?[\d,]+(?:\.\d{1,2})?", value or "") else "")
+                    # The final source row can share its y-band with Page
+                    # Total. Preserve its first amount and balance only.
+                    if withdrawal_index is not None and numeric(cells[withdrawal_index]):
+                        cells[withdrawal_index] = numeric(cells[withdrawal_index])
+                        if deposit_index is not None: cells[deposit_index] = ""
+                    elif deposit_index is not None and numeric(cells[deposit_index]):
+                        cells[deposit_index] = numeric(cells[deposit_index])
+                        if withdrawal_index is not None: cells[withdrawal_index] = ""
+                    if balance_index is not None:
+                        cells[balance_index] = numeric(cells[balance_index])
+                    footer_started = True
+                    # A standalone footer must never become a continuation of
+                    # the final transaction. If a transaction and footer share
+                    # one band, its valid date keeps the transaction portion.
+                    if not transaction_date_value(cells[date_index]):
+                        continue
                 if not any(cells) or len(map_headers(cells)) >= 3:
                     continue
                 if transaction_date_value(cells[date_index]):
@@ -1352,7 +1412,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     skipped_candidates = 0
     validated_strategy = saved_text_strategy(path)
     large_pdf = is_large_pdf(path)
-    text_first = large_pdf and prefers_running_balance_text(path)
+    # A sampled original-PDF geometry profile is stronger than text order.
+    # Use it first whenever it exists, including for borderless statements.
+    geometry_ready = large_pdf and sampled_geometry_profile(path) is not None
+    text_first = large_pdf and not geometry_ready and prefers_running_balance_text(path)
     diagnostic_rules: set[str] = set()
     planned_strategies: list[str] = []
     while True:
