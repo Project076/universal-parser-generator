@@ -134,7 +134,7 @@ Bank statement extraction policy:
 - A printed statement-level opening or closing balance overrides any inferred value. Otherwise, the closing balance is the signed running balance of the last real transaction, never a page total, grand total, available amount, or other footer balance.
 - Normalize Cr balances as positive and Dr balances as negative. A signed increase is a deposit; a signed decrease is a withdrawal.
 - Balance-chain validation is mandatory for every transaction with a running balance: previous balance = current balance + current withdrawal - current deposit. Equivalently, current balance = previous balance - withdrawal + deposit. Do not release a parser when any transaction balance is missing or breaks this chain.
-- Exception: if the source itself proves that its printed running-balance column is unreliable (systemic chain breaks), do not use transaction-row balances to infer either endpoint or classify transactions. One independently printed statement-level opening *or* closing balance may anchor the statement when exact printed debit/credit totals, narration coverage and transaction count are present: derive the missing endpoint from that anchor and totals. When both endpoints are printed, both must agree. Record `source running balance unreliable` and which endpoint was derived. If neither endpoint, totals, or evidence is present or consistent, withhold the parser.
+- Exception: if the source itself proves that its printed running-balance column is unreliable (systemic chain breaks), do not use it for a normal balance-chain pass or transaction classification. When statement-level opening/closing figures are absent, form a candidate opening from the first logical transaction (balance - deposit + withdrawal) and a candidate closing from the last logical transaction balance. Certify only when those candidate endpoints agree exactly with the printed debit/credit totals, narration coverage and transaction count. Record `source running balance unreliable` and require manual source review. If the endpoint equation, totals, or evidence is inconsistent, withhold the parser.
 - Transaction-count validation is mandatory: independently count source records that have a transaction date plus amount/running-balance evidence, and require exactly that many parsed transactions. More or fewer parsed rows is a failure even if balances reconcile.
 - Particulars must contain only actual transaction narration. Do not put monetary amounts, blank-field substitutes, page headers, account-holder text, totals, or statement furniture in it. If the source Particulars is blank, output a blank narration.
 - Join continuation fragments of the same transaction across pages and ignore repeated headers/footers.
@@ -1511,16 +1511,13 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # complete source-record count, transaction-level balance chain, and the
     # statement opening-to-closing reconciliation.
     # Exception for objectively unreliable *source* balance columns.  This is
-    # intentionally narrow: it only applies when the PDF has an independently
-    # printed statement-level opening OR closing balance, both printed
-    # debit/credit totals are present and exactly matched by parsed source
-    # amounts, every source transaction is covered, and the normal displayed
-    # chain is demonstrably broken.  The other endpoint may be derived only
-    # from that anchor and verified totals — never from a bad transaction row.
+    # intentionally narrow: printed debit/credit totals must exactly match
+    # parsed source amounts, all source records must be covered, and the normal
+    # chain must be demonstrably broken. Missing statement-level endpoints are
+    # tested from the logical first/last transaction against those totals.
     source_balance_unreliable = False
     if (
         not running_balance_valid
-        and (source_opening is not None or source_closing is not None)
         and declared_withdrawals is not None
         and declared_deposits is not None
         and statement_totals_valid
@@ -1530,17 +1527,22 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         and chain_checked >= 20
         and Decimal(chain_breaks) / Decimal(chain_checked) >= Decimal("0.80")
     ):
-        derived_opening = source_closing + declared_withdrawals - declared_deposits if source_closing is not None else None
-        derived_closing = source_opening - declared_withdrawals + declared_deposits if source_opening is not None else None
+        first_tx, last_tx = tx[0], tx[-1]
+        inferred_opening = (first_tx["balance"] - first_tx["deposit"] + first_tx["withdrawal"] if first_tx.get("balance") is not None else None)
+        inferred_closing = last_tx.get("balance")
+        candidate_opening = source_opening if source_opening is not None else inferred_opening
+        candidate_closing = source_closing if source_closing is not None else inferred_closing
+        expected_closing = candidate_opening - declared_withdrawals + declared_deposits if candidate_opening is not None else None
+        expected_opening = candidate_closing + declared_withdrawals - declared_deposits if candidate_closing is not None else None
         endpoints_agree = (
-            source_opening is None or derived_opening is None or source_opening.quantize(Decimal(".01")) == derived_opening.quantize(Decimal(".01"))
-        ) and (
-            source_closing is None or derived_closing is None or source_closing.quantize(Decimal(".01")) == derived_closing.quantize(Decimal(".01"))
+            candidate_opening is not None and candidate_closing is not None
+            and expected_closing.quantize(Decimal(".01")) == candidate_closing.quantize(Decimal(".01"))
+            and expected_opening.quantize(Decimal(".01")) == candidate_opening.quantize(Decimal(".01"))
         )
         if endpoints_agree:
-            endpoint_derived = "closing" if source_closing is None else ("opening" if source_opening is None else "none")
-            opening = source_opening if source_opening is not None else derived_opening
-            closing = source_closing if source_closing is not None else derived_closing
+            endpoint_derived = "transaction_candidates" if source_opening is None and source_closing is None else ("closing" if source_closing is None else ("opening" if source_opening is None else "none"))
+            opening = candidate_opening
+            closing = candidate_closing
             computed = opening - total_w + total_d
             total_reconciles = True
             source_balance_unreliable = True
@@ -1756,6 +1758,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             "status": "pass", "financial_pass": True, "narration_pass": True,
                             "balance_chain_pass": not bool(columns.get("_source_balance_unreliable")),
                             "balance_chain_exception": bool(columns.get("_source_balance_unreliable")),
+                            "manual_review_required": bool(columns.get("_source_balance_unreliable")),
+                            "review_message": "Running balances are unreliable. Review the source statement; UPG used verified totals and candidate endpoints.",
                             "transaction_count": len(tx),
                             "source_transaction_count": expected_source_count,
                             "source_coverage_pass": bool(coverage_valid),
