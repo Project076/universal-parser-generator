@@ -47,6 +47,9 @@ EXTRACTION_CACHE: dict[tuple[str, str], tuple[list[list[object]], str]] = {}
 EXTRACTION_CACHE_LOCK = threading.Lock()
 PDF_TEXT_CACHE: dict[str, str] = {}
 PDF_SAMPLE_CACHE: dict[str, str] = {}
+# Passwords are request-scoped, held only in memory, and are never written to
+# profiles, learning, exports, logs, or webhook payloads.
+PDF_PASSWORD_CACHE: dict[str, str] = {}
 
 CANONICAL = ["date", "narration", "withdrawal", "deposit", "instrument_number", "balance"]
 FIVE_MINUTES_MS = 300000
@@ -103,7 +106,7 @@ ALIASES = {
 }
 
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><title>Statement Normalizer</title><style>
-body{font-family:system-ui;max-width:860px;margin:50px auto;color:#172033;background:#f5f7fb}.card{background:white;padding:30px;border-radius:16px;box-shadow:0 4px 22px #1223}h1{margin-top:0}label{display:block;margin:16px 0 5px;font-weight:650}input,button{font:inherit;padding:10px}input{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:7px}button{margin-top:22px;background:#0f766e;color:white;border:0;border-radius:8px;cursor:pointer}.hint{color:#52606d}.result{margin-top:20px;padding:16px;border-radius:8px}.ok{background:#dcfce7}.fail{background:#fee2e2}.field{display:grid;grid-template-columns:1fr 1fr;gap:15px}</style></head><body><main class="card"><h1>Bank Statement Normalizer</h1><p class="hint">Upload a statement. Excel is created only after the declared balances reconcile with parsed transactions. For unfamiliar layouts, the configured AI parser generator may inspect the layout to create a profile; no export is released unless both checks pass.</p><form id="form"><label>Statement file</label><input name="file" type="file" accept=".csv,.xlsx,.xls,.txt,.pdf,.doc,.docx" required><div class="field"><div><label>Opening balance (optional fallback)</label><input name="opening" placeholder="Extracted from source when present"></div><div><label>Closing balance (optional fallback)</label><input name="closing" placeholder="Extracted from source when present"></div></div><button>Parse and validate</button></form><section id="result"></section></main><script>
+body{font-family:system-ui;max-width:860px;margin:50px auto;color:#172033;background:#f5f7fb}.card{background:white;padding:30px;border-radius:16px;box-shadow:0 4px 22px #1223}h1{margin-top:0}label{display:block;margin:16px 0 5px;font-weight:650}input,button{font:inherit;padding:10px}input{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:7px}button{margin-top:22px;background:#0f766e;color:white;border:0;border-radius:8px;cursor:pointer}.hint{color:#52606d}.result{margin-top:20px;padding:16px;border-radius:8px}.ok{background:#dcfce7}.fail{background:#fee2e2}.field{display:grid;grid-template-columns:1fr 1fr;gap:15px}</style></head><body><main class="card"><h1>Bank Statement Normalizer</h1><p class="hint">Upload a statement. Excel is created only after the declared balances reconcile with parsed transactions. For unfamiliar layouts, the configured AI parser generator may inspect the layout to create a profile; no export is released unless both checks pass.</p><form id="form"><label>Statement file</label><input name="file" type="file" accept=".csv,.xlsx,.xls,.txt,.pdf,.doc,.docx" required><div class="field"><div><label>Opening balance (optional fallback)</label><input name="opening" placeholder="Extracted from source when present"></div><div><label>Closing balance (optional fallback)</label><input name="closing" placeholder="Extracted from source when present"></div></div><label>PDF password (only if protected)</label><input name="password" type="password" autocomplete="off" placeholder="Used only in memory for this upload"><button>Parse and validate</button></form><section id="result"></section></main><script>
 const f=document.querySelector('#form'), r=document.querySelector('#result'), submit=f.querySelector('button');let activeJob=null;
 function show(d){const label=d.valid?'Validated':d.processing?'UPG is retrying':d.interrupted?'UPG job interrupted':'Not validated';r.className='result '+(d.valid?'ok':d.processing||d.interrupted?'':'fail');r.innerHTML=`<strong>${label}</strong><br>${d.message}`+(d.download?`<br><br><a href="${d.download}">Download validated Excel</a>`:'')}
 async function poll(job){const d=await (await fetch('/status/'+job)).json();if(job!==activeJob)return;show(d);if(d.processing)setTimeout(()=>poll(job),2500);else{activeJob=null;submit.disabled=false;submit.textContent='Parse and validate'}}
@@ -238,6 +241,26 @@ def certified_javascript_code(headers: list[object], strategy: str | None) -> tu
   const anchors = __ANCHORS__;
   return anchors.every((anchor) => normalized.includes(anchor));
 }""".replace("__ANCHORS__", anchors_json)
+    if strategy in {"running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "page_text_unsigned"}:
+        parser = """function parse(text, options) {
+  const blocks = String(text || '').split(/(?=^\\s*\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}\\b)/m);
+  const dateRe = /^\\s*(\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4})\\b/;
+  const moneyRe = /-?\\d[\\d,]*\\.\\d{2}\\b/g;
+  const asNumber = (value) => Number(String(value).replace(/,/g, ''));
+  const rows = []; let previous = Number(options && options.openingBalance); if (!Number.isFinite(previous)) previous = null;
+  for (const block of blocks) {
+    const match = block.match(dateRe); if (!match || /\\bB\\/F\\b/i.test(block) || /^(?:page total|grand total)/im.test(block)) continue;
+    const signed = [...block.matchAll(/(-?[\\d,]+\\.\\d{2})\\s*(Dr|Cr)\\b/ig)]; const values = [...block.matchAll(moneyRe)];
+    if (!signed.length || values.length < 2) continue;
+    const balanceToken = signed[signed.length - 1], balance = asNumber(balanceToken[1]) * (balanceToken[2].toLowerCase() === 'dr' ? -1 : 1);
+    const amountToken = values.filter((value) => value.index < balanceToken.index).pop(); if (!amountToken) continue;
+    const amount = Math.abs(asNumber(amountToken[0])); const particulars = block.slice(match[0].length, amountToken.index).replace(/\\s+/g, ' ').trim();
+    const refs = particulars.match(/\\b\\d{6,}\\b/g) || []; const p = match[1].split(/[\\/-]/); const year = p[2].length === 2 ? `20${p[2]}` : p[2];
+    const delta = previous == null ? amount : balance - previous;
+    rows.push({date:`${p[0].padStart(2,'0')}/${p[1].padStart(2,'0')}/${year}`, particulars, withdrawal:delta < 0 ? -delta : 0, deposit:delta > 0 ? delta : 0, balance, chqNo:refs.length ? refs[refs.length - 1] : ''}); previous = balance;
+  } return rows;
+}"""
+        return detection, parser
     parser = """function parse(text, options) {
   const lines = String(text || '').split(/\\r?\\n/);
   const dateRe = /^\\s*(\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4})\\b/;
@@ -338,11 +361,56 @@ def saved_text_strategy(path: Path) -> str | None:
         pass
     return None
 
+def pdf_password(path: Path) -> str:
+    with EXTRACTION_CACHE_LOCK:
+        return PDF_PASSWORD_CACHE.get(str(path.resolve()), "")
+
+def register_pdf_password(path: Path, password: str) -> None:
+    if path.suffix.lower() != ".pdf":
+        return
+    key = str(path.resolve())
+    with EXTRACTION_CACHE_LOCK:
+        if password:
+            PDF_PASSWORD_CACHE[key] = password
+        else:
+            PDF_PASSWORD_CACHE.pop(key, None)
+
+def clear_pdf_password(path: Path) -> None:
+    with EXTRACTION_CACHE_LOCK:
+        PDF_PASSWORD_CACHE.pop(str(path.resolve()), None)
+
+def open_pdf_reader(path: Path) -> PdfReader:
+    reader = PdfReader(str(path))
+    if reader.is_encrypted:
+        password = pdf_password(path)
+        if not password or not reader.decrypt(password):
+            raise ValueError("PASSWORD_REQUIRED: This PDF is password protected. Enter its password and submit it again; UPG will not retry unreadable encrypted files.")
+    return reader
+
+def open_pdfplumber(path: Path):
+    password = pdf_password(path)
+    try:
+        return pdfplumber.open(path, password=password or None)
+    except Exception as error:
+        if "password" in str(error).lower() or "encrypt" in str(error).lower():
+            raise ValueError("PASSWORD_REQUIRED: This PDF is password protected. Enter its password and submit it again; UPG will not retry unreadable encrypted files.") from error
+        raise
+
 def is_large_pdf(path: Path) -> bool:
     try:
-        return path.suffix.lower() == ".pdf" and len(PdfReader(str(path)).pages) > 60
+        return path.suffix.lower() == ".pdf" and len(open_pdf_reader(path).pages) > 60
     except Exception:
         return False
+
+def prefers_running_balance_text(path: Path) -> bool:
+    """Identify long text-layer statements before full-page geometry work."""
+    if path.suffix.lower() != ".pdf":
+        return False
+    raw = remove_page_furniture(cached_pdf_text(path))
+    heading = bool(re.search(r"(?i)(?:particulars|narration|description).*?(?:withdrawals?|debits?|deposits?|credits?).*?balance", raw[:6000]))
+    dated_rows = len(re.findall(r"(?m)^\s*\d{2}[-/]\d{2}[-/]\d{2,4}\b", raw))
+    signed_balances = bool(re.search(r"\b(?:cr|dr)\b", raw, re.I))
+    return heading and dated_rows >= 10 and signed_balances
 
 def sampled_pdf_text(path: Path) -> str:
     """Representative evidence for profile generation on very long PDFs."""
@@ -351,7 +419,7 @@ def sampled_pdf_text(path: Path) -> str:
         cached = PDF_SAMPLE_CACHE.get(key)
     if cached is not None:
         return cached
-    reader = PdfReader(str(path))
+    reader = open_pdf_reader(path)
     count = len(reader.pages)
     indices = sampled_page_indices(count)
     sample = "\n".join(f"[PAGE {index + 1}]\n{reader.pages[index].extract_text() or ''}" for index in indices)
@@ -608,9 +676,7 @@ def structured_source_count(path: Path) -> int | None:
         return None
 
 def read_pdf_text(path: Path) -> str:
-    reader = PdfReader(str(path))
-    if reader.is_encrypted and not reader.decrypt(""):
-        raise ValueError("This PDF is password protected. Remove its password before upload.")
+    reader = open_pdf_reader(path)
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 def cached_pdf_text(path: Path) -> str:
@@ -667,14 +733,14 @@ def repair_detached_dated_continuations(raw: str) -> str:
 
 def extract_pdf_table_batch(path_text: str, page_numbers: list[int], use_learned_geometry: bool = False) -> list[list[list[object]]]:
     """Worker-safe batch extraction used only for very large PDFs."""
-    with pdfplumber.open(path_text) as pdf:
+    with open_pdfplumber(Path(path_text)) as pdf:
         if use_learned_geometry:
             return [[pdf.pages[number].extract_table()] for number in page_numbers]
         return [pdf.pages[number].extract_tables() for number in page_numbers]
 
 def sampled_geometry_header(path: Path, page_count: int) -> list[object] | None:
     """Learn a transaction-table header from representative original pages."""
-    with pdfplumber.open(path) as pdf:
+    with open_pdfplumber(path) as pdf:
         for number in sampled_page_indices(page_count):
             for table in pdf.pages[number].extract_tables():
                 for row in table:
@@ -684,7 +750,7 @@ def sampled_geometry_header(path: Path, page_count: int) -> list[object] | None:
 
 def sampled_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float, float]]] | None:
     """Learn column bands from representative original-PDF pages."""
-    with pdfplumber.open(path) as pdf:
+    with open_pdfplumber(path) as pdf:
         for number in sampled_page_indices(len(pdf.pages)):
             for table in pdf.pages[number].find_tables():
                 extracted = table.extract()
@@ -704,7 +770,7 @@ def extract_geometry_profile_rows(path: Path) -> list[list[object]]:
     date_index = map_headers(header).get("date", 0)
     rows: list[list[object]] = [header]
     current: list[str] | None = None
-    with pdfplumber.open(path) as pdf:
+    with open_pdfplumber(path) as pdf:
         for page in pdf.pages:
             lines: dict[int, list[dict]] = {}
             for word in page.extract_words(x_tolerance=1, y_tolerance=2):
@@ -739,7 +805,7 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None) -> tuple[
         return extract_geometry_profile_rows(path), raw
     if strategy_override == "page_text_unsigned":
         header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
-        reader = PdfReader(str(path))
+        reader = open_pdf_reader(path)
         merged = [header]
         for page in reader.pages:
             page_rows = extract_text_layout_rows(remove_page_furniture(page.extract_text() or ""), unsigned_balance=True)
@@ -747,7 +813,7 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None) -> tuple[
                 merged.extend(page_rows[1:])
         return merged if len(merged) > 1 else [], raw
     if strategy_override not in ("running_balance_text", "unsigned_running_balance_text", "value_date_unsigned"):
-        with pdfplumber.open(path) as pdf:
+        with open_pdfplumber(path) as pdf:
             page_count = len(pdf.pages)
             if page_count > 60:
                 # Learn the geometry/header from the original-PDF sample before
@@ -1094,7 +1160,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # count produced by the same failed extraction path.
     if path.suffix.lower() == ".pdf":
         try:
-            if len(PdfReader(str(path)).pages) > 1 and len(tx) < 2:
+            if len(open_pdf_reader(path).pages) > 1 and len(tx) < 2:
                 coverage_valid = False
         except Exception:
             pass
@@ -1102,10 +1168,18 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # banks issue statements with incorrect summary totals. They are reported
     # as a warning; release still depends on transaction-level running-balance
     # reconciliation, endpoints, coverage, and narration validation.
-    financial_valid = total_reconciles and running_balance_valid and no_opening_as_transaction and coverage_valid and statement_totals_plausible
+    # Printed debit/credit summary totals are useful cross-check evidence, but
+    # some bank statements print them incorrectly. They must never override a
+    # complete source-record count, transaction-level balance chain, and the
+    # statement opening-to-closing reconciliation.
+    financial_valid = total_reconciles and running_balance_valid and no_opening_as_transaction and coverage_valid
     # The original source text is independent evidence.  A narration that cannot
     # be located there is not silently accepted just because amounts reconcile.
-    unmatched = [x["narration"] for x in tx if normalize_narration(x["narration"]) and normalize_narration(x["narration"]) not in normalize_narration(raw)]
+    # Build the normalized source once. Re-normalizing a 250-page statement
+    # for every transaction made narration validation quadratic and could turn
+    # a valid parser attempt into a 20+ minute wait.
+    normalized_source = normalize_narration(raw)
+    unmatched = [x["narration"] for x in tx if normalize_narration(x["narration"]) and normalize_narration(x["narration"]) not in normalized_source]
     malformed_narrations = [x["narration"] for x in tx if re.fullmatch(r"\s*[\d,.]+\s*", x["narration"] or "")]
     narration_valid = not unmatched and not malformed_narrations and coverage_valid
     return tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_withdrawals, declared_deposits, statement_totals_valid
@@ -1200,6 +1274,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     skipped_candidates = 0
     validated_strategy = saved_text_strategy(path)
     large_pdf = is_large_pdf(path)
+    text_first = large_pdf and prefers_running_balance_text(path)
     diagnostic_rules: set[str] = set()
     while True:
         round_number += 1
@@ -1232,7 +1307,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # The plan adapts after failure: once table candidates fail, prioritize
         # new AI addenda and page-aware text candidates over already-explored
         # layouts. Candidate memory below prevents duplicate validation work.
-        initial_candidates = ([("geometry_profile", False), ("value_date_unsigned", False), ("unsigned_running_balance_text", False), ("running_balance_text", False), ("page_text_unsigned", False), (None, False), (None, True)] if large_pdf
+        initial_candidates = ([("unsigned_running_balance_text", False), ("running_balance_text", False), ("geometry_profile", False), ("value_date_unsigned", False), ("page_text_unsigned", False), (None, False), (None, True)] if text_first
+            else [("geometry_profile", False), ("value_date_unsigned", False), ("unsigned_running_balance_text", False), ("running_balance_text", False), ("page_text_unsigned", False), (None, False), (None, True)] if large_pdf
             else [(None, False), (None, True), ("value_date_unsigned", False), ("running_balance_text", False), ("unsigned_running_balance_text", False), ("page_text_unsigned", False)])
         if validated_strategy in {"geometry_profile", "running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "page_text_unsigned"}:
             initial_candidates = [(validated_strategy, False)] + [item for item in initial_candidates if item[0] != validated_strategy]
@@ -1291,6 +1367,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         JOBS[job_id] = {"processing": False, "valid": True, "message": f"Validated after {round_number} UPG retry rounds. Parsed {len(tx)} transactions. Opening {indian_amount(op)} − withdrawals {indian_amount(wd)} + deposits {indian_amount(dp)} = {indian_amount(calculated)}; declared closing balance is {indian_amount(cl)}. Source coverage: PASS. Financial validation: PASS. Narration validation: PASS.", "download": "/download/" + name}
                         JOBS[job_id].update({"status": "completed", "profile_id": profile_id, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
                     post_completion_webhook(job_id, "completed", profile_id)
+                    clear_pdf_password(path)
                     return
                 failed_candidates.add(signature)
                 repair_context = (f"UPG self-healing round {round_number}: candidate extracted {len(candidate[0])} of "
@@ -1299,9 +1376,13 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     "Propose a safe header/column addendum only; do not weaken validation.")
             except Exception as error:
                 errors.append(str(error))
-                if "OCR_REQUIRED:" in str(error):
+                if "OCR_REQUIRED:" in str(error) or "PASSWORD_REQUIRED:" in str(error):
+                    message = ("Not validated. This is an image-only PDF, so UPG has locked parser creation and Excel export until OCR is available. The statement was not treated as a one-row parser."
+                        if "OCR_REQUIRED:" in str(error)
+                        else "Not validated. This PDF is password protected. Enter the correct PDF password and resubmit it; UPG has stopped instead of retrying unreadable encrypted content.")
                     with JOBS_LOCK:
-                        JOBS[job_id] = {"processing": False, "valid": False, "message": "Not validated. This is an image-only PDF, so UPG has locked parser creation and Excel export until OCR is available. The statement was not treated as a one-row parser."}
+                        JOBS[job_id] = {"processing": False, "valid": False, "status": "failed", "message": message}
+                    clear_pdf_password(path)
                     return
         if latest is not None and new_candidates_this_round:
             tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_wd, declared_dp, statement_totals_valid = latest
@@ -1363,6 +1444,7 @@ class App(BaseHTTPRequestHandler):
         safe = Path(filename).name
         saved = UPLOADS / f"{uuid.uuid4().hex}-{safe}"
         saved.write_bytes(content)
+        register_pdf_password(saved, str(fields.get("password", fields.get("pdf_password", ""))))
         job_id = uuid.uuid4().hex
         opening = fields.get("ob", fields.get("opening", ""))
         closing = fields.get("cb", fields.get("closing", ""))
@@ -1472,6 +1554,7 @@ class App(BaseHTTPRequestHandler):
         try:
             fields = self.multipart_fields()
             filename, content=fields["file"]; safe=Path(filename).name; saved=UPLOADS / f"{uuid.uuid4().hex}-{safe}"; saved.write_bytes(content)
+            register_pdf_password(saved, str(fields.get("password", fields.get("pdf_password", ""))))
             job_id = uuid.uuid4().hex
             with JOBS_LOCK:
                 JOBS[job_id] = {"processing": True, "valid": False, "message": "UPG is creating and validating parser candidates."}
