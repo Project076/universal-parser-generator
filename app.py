@@ -134,6 +134,7 @@ Bank statement extraction policy:
 - A printed statement-level opening or closing balance overrides any inferred value. Otherwise, the closing balance is the signed running balance of the last real transaction, never a page total, grand total, available amount, or other footer balance.
 - Normalize Cr balances as positive and Dr balances as negative. A signed increase is a deposit; a signed decrease is a withdrawal.
 - Balance-chain validation is mandatory for every transaction with a running balance: previous balance = current balance + current withdrawal - current deposit. Equivalently, current balance = previous balance - withdrawal + deposit. Do not release a parser when any transaction balance is missing or breaks this chain.
+- Exception: if the source itself proves that its printed running-balance column is unreliable (systemic chain breaks) while the extracted dated rows exactly match the source's printed debit/credit totals, narration coverage and transaction count, do not use that balance column to classify or reject transactions. Derive opening from closing plus the verified printed totals, record `source running balance unreliable`, and validate from the independent source totals and endpoints. If totals are absent, inconsistent, or the evidence is incomplete, withhold the parser.
 - Transaction-count validation is mandatory: independently count source records that have a transaction date plus amount/running-balance evidence, and require exactly that many parsed transactions. More or fewer parsed rows is a failure even if balances reconcile.
 - Particulars must contain only actual transaction narration. Do not put monetary amounts, blank-field substitutes, page headers, account-holder text, totals, or statement furniture in it. If the source Particulars is blank, output a blank narration.
 - Join continuation fragments of the same transaction across pages and ignore repeated headers/footers.
@@ -1445,25 +1446,33 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         # it is strong evidence that the parser read reference IDs as amounts.
         return abs(parsed - declared) / abs(declared) > Decimal("0.05")
     statement_totals_plausible = not (materially_divergent(total_w, declared_withdrawals) or materially_divergent(total_d, declared_deposits))
-    running = opening
-    # Validate each step independently, not just the final reconciliation.
-    # This is the user's balance-chain equation rearranged forward.
-    running_balance_valid = bool(tx)
+    # Validate each movement against its source amount independently of the
+    # running-balance chain.  A bad balance column must not hide an amount
+    # mapping error simply because the chain stops at its first bad row.
     source_amount_valid = True
     for transaction in tx:
-        balance = transaction["balance"]
-        if balance is None:
-            running_balance_valid = False
-            break
-        expected_current = running - transaction["withdrawal"] + transaction["deposit"]
-        if expected_current.quantize(Decimal(".01")) != balance.quantize(Decimal(".01")):
-            running_balance_valid = False
-            break
         source_amount = transaction.get("source_amount")
         movement = abs(transaction["deposit"] - transaction["withdrawal"])
         if source_amount is not None and movement.quantize(Decimal(".01")) != abs(source_amount).quantize(Decimal(".01")):
             source_amount_valid = False
             break
+    running = opening
+    # Validate each step independently, not just the final reconciliation.
+    # This is the user's balance-chain equation rearranged forward.
+    running_balance_valid = bool(tx)
+    chain_checked = 0
+    chain_breaks = 0
+    for transaction in tx:
+        balance = transaction["balance"]
+        if balance is None:
+            running_balance_valid = False
+            chain_breaks += 1
+            continue
+        chain_checked += 1
+        expected_current = running - transaction["withdrawal"] + transaction["deposit"]
+        if expected_current.quantize(Decimal(".01")) != balance.quantize(Decimal(".01")):
+            running_balance_valid = False
+            chain_breaks += 1
         running = balance
     no_opening_as_transaction = not any(normalize_narration(x["narration"]) in ("bf", "openingbalance") for x in tx)
     # A fallback may find only a small group of rows that happens to reconcile.
@@ -1501,7 +1510,38 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # some bank statements print them incorrectly. They must never override a
     # complete source-record count, transaction-level balance chain, and the
     # statement opening-to-closing reconciliation.
-    financial_valid = total_reconciles and running_balance_valid and source_amount_valid and no_opening_as_transaction and coverage_valid
+    # Exception for objectively unreliable *source* balance columns.  This is
+    # intentionally narrow: it only applies when the PDF does not declare a
+    # true opening balance, both printed debit/credit totals are present and
+    # exactly matched by parsed source amounts, every source transaction is
+    # covered, and the normal displayed chain is demonstrably broken.  The
+    # opening is then derived from independent statement totals and closing
+    # balance.  This never uses a bad balance column to classify transactions.
+    source_balance_unreliable = False
+    if (
+        not running_balance_valid
+        and source_opening is None
+        and declared_withdrawals is not None
+        and declared_deposits is not None
+        and statement_totals_valid
+        and source_amount_valid
+        and coverage_valid
+        and len(tx) >= 20
+        and chain_checked >= 20
+        and Decimal(chain_breaks) / Decimal(chain_checked) >= Decimal("0.80")
+    ):
+        total_derived_opening = closing + declared_withdrawals - declared_deposits
+        derived_computed = total_derived_opening - total_w + total_d
+        if derived_computed.quantize(Decimal(".01")) == closing.quantize(Decimal(".01")):
+            opening = total_derived_opening
+            computed = derived_computed
+            total_reconciles = True
+            source_balance_unreliable = True
+    financial_valid = total_reconciles and (running_balance_valid or source_balance_unreliable) and source_amount_valid and no_opening_as_transaction and coverage_valid
+    # Preserve this certified exception in the profile without changing any
+    # actual column mapping.  Consumers must never present it as a normal
+    # balance-chain pass.
+    columns["_source_balance_unreliable"] = source_balance_unreliable
     # The original source text is independent evidence.  A narration that cannot
     # be located there is not silently accepted just because amounts reconcile.
     # Build the normalized source once. Re-normalizing a 250-page statement
@@ -1513,7 +1553,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     narration_valid = not unmatched and not malformed_narrations and coverage_valid
     return tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_withdrawals, declared_deposits, statement_totals_valid
 
-def export_excel(tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_withdrawals=None, declared_deposits=None, statement_totals_valid=True):
+def export_excel(tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_withdrawals=None, declared_deposits=None, statement_totals_valid=True, source_balance_unreliable=False):
     out = EXPORTS / f"validated-statement-{uuid.uuid4().hex}.xlsx"; wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Transactions"
     ws.append(["Date", "Narration", "Withdrawal", "Deposit", "Instrument number", "Balance"])
     for x in tx: ws.append([x[k] for k in CANONICAL])
@@ -1527,6 +1567,7 @@ def export_excel(tx, opening, closing, total_w, total_d, computed, financial_val
     if declared_withdrawals is not None: rows.append(("Declared withdrawals from statement", declared_withdrawals))
     if declared_deposits is not None: rows.append(("Declared deposits from statement", declared_deposits))
     if declared_withdrawals is not None or declared_deposits is not None: rows.append(("Statement total cross-check", "PASS" if statement_totals_valid else "WARNING - printed totals differ; transaction-level reconciliation used"))
+    if source_balance_unreliable: rows.append(("Running balance validation", "SOURCE UNRELIABLE - verified totals, endpoints, source count, and narration used"))
     rows += [("Calculated closing balance",computed),("Closing balance from statement",closing),("Source transaction records", expected_source_count),("Parsed transaction records", len(tx)),("Transaction count validation", "PASS" if coverage_valid else "FAIL"),("Source coverage validation", "PASS" if coverage_valid else "FAIL"),("Financial validation", "PASS" if financial_valid else "FAIL"),("Narration validation", "PASS" if narration_valid else "FAIL"),("Release validation", "PASS" if financial_valid and narration_valid else "FAIL")]
     for row in rows: check.append(row)
     for cell in check['B'][1:]:
@@ -1705,16 +1746,19 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         layout_fingerprint, sorted(diagnostic_rules),
                         validation={
                             "status": "pass", "financial_pass": True, "narration_pass": True,
-                            "balance_chain_pass": True, "transaction_count": len(tx),
+                            "balance_chain_pass": not bool(columns.get("_source_balance_unreliable")),
+                            "balance_chain_exception": bool(columns.get("_source_balance_unreliable")),
+                            "transaction_count": len(tx),
                             "source_transaction_count": expected_source_count,
                             "source_coverage_pass": bool(coverage_valid),
                         },
                         bank_name=str(job_context.get("bank_name") or "Unknown"),
                         format_name=f"{path.suffix.lower().lstrip('.') or 'pdf'} statement".upper(),
                     )
-                    name = export_excel(tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_wd, declared_dp, statement_totals_valid)
+                    name = export_excel(tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_wd, declared_dp, statement_totals_valid, bool(columns.get("_source_balance_unreliable")))
                     with JOBS_LOCK:
-                        JOBS[job_id] = {"processing": False, "valid": True, "message": f"Validated after {round_number} UPG retry rounds. Parsed {len(tx)} transactions. Opening {indian_amount(op)} − withdrawals {indian_amount(wd)} + deposits {indian_amount(dp)} = {indian_amount(calculated)}; declared closing balance is {indian_amount(cl)}. Source coverage: PASS. Financial validation: PASS. Narration validation: PASS.", "download": "/download/" + name}
+                        balance_note = " Running-balance column: SOURCE UNRELIABLE; independent totals, endpoints, source count, and narration controls passed." if columns.get("_source_balance_unreliable") else " Balance-chain validation: PASS."
+                        JOBS[job_id] = {"processing": False, "valid": True, "message": f"Validated after {round_number} UPG retry rounds. Parsed {len(tx)} transactions. Opening {indian_amount(op)} − withdrawals {indian_amount(wd)} + deposits {indian_amount(dp)} = {indian_amount(calculated)}; declared closing balance is {indian_amount(cl)}. Source coverage: PASS. Financial validation: PASS. Narration validation: PASS.{balance_note}", "download": "/download/" + name}
                         JOBS[job_id].update({"status": "completed", "profile_id": profile_id, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
                         persist_job_locked(job_id)
                     post_completion_webhook(job_id, "completed", profile_id)
