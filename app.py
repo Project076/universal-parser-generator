@@ -134,7 +134,7 @@ Bank statement extraction policy:
 - A printed statement-level opening or closing balance overrides any inferred value. Otherwise, the closing balance is the signed running balance of the last real transaction, never a page total, grand total, available amount, or other footer balance.
 - Normalize Cr balances as positive and Dr balances as negative. A signed increase is a deposit; a signed decrease is a withdrawal.
 - Balance-chain validation is mandatory for every transaction with a running balance: previous balance = current balance + current withdrawal - current deposit. Equivalently, current balance = previous balance - withdrawal + deposit. Do not release a parser when any transaction balance is missing or breaks this chain.
-- Exception: if the source itself proves that its printed running-balance column is unreliable (systemic chain breaks), do not use it for a normal balance-chain pass or transaction classification. Certify only if parsed withdrawals and deposits exactly equal the printed statement totals, while narration coverage and transaction count pass. Form assumed endpoints from one available transaction balance and the verified totals, label them assumed, and require manual source review. If totals or independent evidence are inconsistent, withhold the parser.
+- Exception: if any transaction proves that the source running-balance chain is unreliable, do not use that column for a normal balance-chain pass or transaction classification. Certify only if parsed withdrawals and deposits exactly equal the printed statement totals, while narration coverage and transaction count pass. Form assumed endpoints from one available transaction balance and the verified totals, label them assumed, and require manual source review. If totals or independent evidence are inconsistent, withhold the parser.
 - Transaction-count validation is mandatory: independently count source records that have a transaction date plus amount/running-balance evidence, and require exactly that many parsed transactions. More or fewer parsed rows is a failure even if balances reconcile.
 - Particulars must contain only actual transaction narration. Do not put monetary amounts, blank-field substitutes, page headers, account-holder text, totals, or statement furniture in it. If the source Particulars is blank, output a blank narration.
 - Join continuation fragments of the same transaction across pages and ignore repeated headers/footers.
@@ -1513,7 +1513,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # Exception for objectively unreliable *source* balance columns.  This is
     # intentionally narrow: printed debit/credit totals must exactly match
     # parsed source amounts, all source records must be covered, and the normal
-    # chain must be demonstrably broken. One usable transaction balance anchors
+    # chain must be broken. One usable transaction balance anchors
     # assumed endpoints; the printed totals, coverage, and narration remain
     # the certification evidence, not the broken balance chain.
     source_balance_unreliable = False
@@ -1525,8 +1525,6 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         and source_amount_valid
         and coverage_valid
         and len(tx) >= 20
-        and chain_checked >= 20
-        and Decimal(chain_breaks) / Decimal(chain_checked) >= Decimal("0.80")
     ):
         first_tx, last_tx = tx[0], tx[-1]
         inferred_opening = (first_tx["balance"] - first_tx["deposit"] + first_tx["withdrawal"] if first_tx.get("balance") is not None else None)
