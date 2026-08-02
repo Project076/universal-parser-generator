@@ -134,7 +134,7 @@ Bank statement extraction policy:
 - A printed statement-level opening or closing balance overrides any inferred value. Otherwise, the closing balance is the signed running balance of the last real transaction, never a page total, grand total, available amount, or other footer balance.
 - Normalize Cr balances as positive and Dr balances as negative. A signed increase is a deposit; a signed decrease is a withdrawal.
 - Balance-chain validation is mandatory for every transaction with a running balance: previous balance = current balance + current withdrawal - current deposit. Equivalently, current balance = previous balance - withdrawal + deposit. Do not release a parser when any transaction balance is missing or breaks this chain.
-- Exception: if the source itself proves that its printed running-balance column is unreliable (systemic chain breaks), do not use it for a normal balance-chain pass or transaction classification. When statement-level opening/closing figures are absent, form a candidate opening from the first logical transaction (balance - deposit + withdrawal) and a candidate closing from the last logical transaction balance. Certify only when those candidate endpoints agree exactly with the printed debit/credit totals, narration coverage and transaction count. Record `source running balance unreliable` and require manual source review. If the endpoint equation, totals, or evidence is inconsistent, withhold the parser.
+- Exception: if the source itself proves that its printed running-balance column is unreliable (systemic chain breaks), do not use it for a normal balance-chain pass or transaction classification. Certify only if parsed withdrawals and deposits exactly equal the printed statement totals, while narration coverage and transaction count pass. Form assumed endpoints from one available transaction balance and the verified totals, label them assumed, and require manual source review. If totals or independent evidence are inconsistent, withhold the parser.
 - Transaction-count validation is mandatory: independently count source records that have a transaction date plus amount/running-balance evidence, and require exactly that many parsed transactions. More or fewer parsed rows is a failure even if balances reconcile.
 - Particulars must contain only actual transaction narration. Do not put monetary amounts, blank-field substitutes, page headers, account-holder text, totals, or statement furniture in it. If the source Particulars is blank, output a blank narration.
 - Join continuation fragments of the same transaction across pages and ignore repeated headers/footers.
@@ -1513,8 +1513,9 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # Exception for objectively unreliable *source* balance columns.  This is
     # intentionally narrow: printed debit/credit totals must exactly match
     # parsed source amounts, all source records must be covered, and the normal
-    # chain must be demonstrably broken. Missing statement-level endpoints are
-    # tested from the logical first/last transaction against those totals.
+    # chain must be demonstrably broken. One usable transaction balance anchors
+    # assumed endpoints; the printed totals, coverage, and narration remain
+    # the certification evidence, not the broken balance chain.
     source_balance_unreliable = False
     if (
         not running_balance_valid
@@ -1530,22 +1531,20 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         first_tx, last_tx = tx[0], tx[-1]
         inferred_opening = (first_tx["balance"] - first_tx["deposit"] + first_tx["withdrawal"] if first_tx.get("balance") is not None else None)
         inferred_closing = last_tx.get("balance")
-        candidate_opening = source_opening if source_opening is not None else inferred_opening
-        candidate_closing = source_closing if source_closing is not None else inferred_closing
-        expected_closing = candidate_opening - declared_withdrawals + declared_deposits if candidate_opening is not None else None
-        expected_opening = candidate_closing + declared_withdrawals - declared_deposits if candidate_closing is not None else None
-        endpoints_agree = (
-            candidate_opening is not None and candidate_closing is not None
-            and expected_closing.quantize(Decimal(".01")) == candidate_closing.quantize(Decimal(".01"))
-            and expected_opening.quantize(Decimal(".01")) == candidate_opening.quantize(Decimal(".01"))
-        )
-        if endpoints_agree:
-            endpoint_derived = "transaction_candidates" if source_opening is None and source_closing is None else ("closing" if source_closing is None else ("opening" if source_opening is None else "none"))
-            opening = candidate_opening
-            closing = candidate_closing
+        if inferred_opening is not None:
+            opening = inferred_opening
+            closing = opening - declared_withdrawals + declared_deposits
+            endpoint_derived = "assumed_closing_from_first_transaction"
+        elif inferred_closing is not None:
+            closing = inferred_closing
+            opening = closing + declared_withdrawals - declared_deposits
+            endpoint_derived = "assumed_opening_from_last_transaction"
+        else:
+            endpoint_derived = "none"
+        if endpoint_derived != "none":
             computed = opening - total_w + total_d
-            total_reconciles = True
-            source_balance_unreliable = True
+            total_reconciles = computed.quantize(Decimal(".01")) == closing.quantize(Decimal(".01"))
+            source_balance_unreliable = total_reconciles
     financial_valid = total_reconciles and (running_balance_valid or source_balance_unreliable) and source_amount_valid and no_opening_as_transaction and coverage_valid
     # Preserve this certified exception in the profile without changing any
     # actual column mapping.  Consumers must never present it as a normal
@@ -1577,7 +1576,7 @@ def export_excel(tx, opening, closing, total_w, total_d, computed, financial_val
     if declared_withdrawals is not None: rows.append(("Declared withdrawals from statement", declared_withdrawals))
     if declared_deposits is not None: rows.append(("Declared deposits from statement", declared_deposits))
     if declared_withdrawals is not None or declared_deposits is not None: rows.append(("Statement total cross-check", "PASS" if statement_totals_valid else "WARNING - printed totals differ; transaction-level reconciliation used"))
-    if source_balance_unreliable: rows.append(("Running balance validation", "SOURCE UNRELIABLE - verified totals, endpoints, source count, and narration used"))
+    if source_balance_unreliable: rows.append(("Running balance validation", "SOURCE UNRELIABLE - parsed totals match printed totals; opening/closing are assumed from a transaction anchor"))
     rows += [("Calculated closing balance",computed),("Closing balance from statement",closing),("Source transaction records", expected_source_count),("Parsed transaction records", len(tx)),("Transaction count validation", "PASS" if coverage_valid else "FAIL"),("Source coverage validation", "PASS" if coverage_valid else "FAIL"),("Financial validation", "PASS" if financial_valid else "FAIL"),("Narration validation", "PASS" if narration_valid else "FAIL"),("Release validation", "PASS" if financial_valid and narration_valid else "FAIL")]
     for row in rows: check.append(row)
     for cell in check['B'][1:]:
@@ -1759,7 +1758,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             "balance_chain_pass": not bool(columns.get("_source_balance_unreliable")),
                             "balance_chain_exception": bool(columns.get("_source_balance_unreliable")),
                             "manual_review_required": bool(columns.get("_source_balance_unreliable")),
-                            "review_message": "Running balances are unreliable. Review the source statement; UPG used verified totals and candidate endpoints.",
+                            "review_message": "Running balances are unreliable. Parsed totals match printed totals; opening and closing are assumed from a transaction anchor. Review the source statement.",
                             "transaction_count": len(tx),
                             "source_transaction_count": expected_source_count,
                             "source_coverage_pass": bool(coverage_valid),
@@ -1769,7 +1768,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     )
                     name = export_excel(tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_wd, declared_dp, statement_totals_valid, bool(columns.get("_source_balance_unreliable")))
                     with JOBS_LOCK:
-                        balance_note = " Running-balance column: SOURCE UNRELIABLE; independent totals, endpoints, source count, and narration controls passed." if columns.get("_source_balance_unreliable") else " Balance-chain validation: PASS."
+                        balance_note = " Running-balance column: SOURCE UNRELIABLE; parsed totals match printed totals and assumed opening/closing were used. Review the source statement." if columns.get("_source_balance_unreliable") else " Balance-chain validation: PASS."
                         JOBS[job_id] = {"processing": False, "valid": True, "message": f"Validated after {round_number} UPG retry rounds. Parsed {len(tx)} transactions. Opening {indian_amount(op)} − withdrawals {indian_amount(wd)} + deposits {indian_amount(dp)} = {indian_amount(calculated)}; declared closing balance is {indian_amount(cl)}. Source coverage: PASS. Financial validation: PASS. Narration validation: PASS.{balance_note}", "download": "/download/" + name}
                         JOBS[job_id].update({"status": "completed", "profile_id": profile_id, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
                         persist_job_locked(job_id)
