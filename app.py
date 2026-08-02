@@ -239,13 +239,16 @@ def certified_javascript_code(headers: list[object], strategy: str | None) -> tu
     detection = """function detect(text) {
   const normalized = String(text || '').toLowerCase().replace(/\\s+/g, ' ');
   const anchors = __ANCHORS__;
-  return anchors.every((anchor) => normalized.includes(anchor));
+  const hasNarration = normalized.includes('narration') || normalized.includes('particular') || normalized.includes('description');
+  const hasDebit = normalized.includes('withdrawal') || normalized.includes('debit') || normalized.includes('dr');
+  const hasCredit = normalized.includes('deposit') || normalized.includes('credit') || normalized.includes('cr');
+  return normalized.includes('date') && normalized.includes('balance') && hasNarration && hasDebit && hasCredit && anchors.length >= 2;
 }""".replace("__ANCHORS__", anchors_json)
     if strategy in {"running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "page_text_unsigned"}:
         parser = """function parse(text, options) {
   const blocks = String(text || '').split(/(?=^\\s*\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}\\b)/m);
   const dateRe = /^\\s*(\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4})\\b/;
-  const moneyRe = /-?\\d[\\d,]*\\.\\d{2}\\b/g;
+  const moneyRe = /-?\\d[\\d,]*\\.\\d{2}/g;
   const asNumber = (value) => Number(String(value).replace(/,/g, ''));
   const rows = []; let previous = Number(options && options.openingBalance); if (!Number.isFinite(previous)) previous = null;
   for (const block of blocks) {

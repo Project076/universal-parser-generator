@@ -42,7 +42,7 @@
       "parent_profile": "cd02cb200d0ed9e9"
     },
     "b7f403479a06fe56": {
-      "observations": 3,
+      "observations": 4,
       "strategy": "running_balance_text",
       "self_healed_addendum": false,
       "diagnostic_rules": [],
