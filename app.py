@@ -59,7 +59,11 @@ JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.RLock()
 # Heavy PDF work is deliberately bounded. Extra requests remain queued instead
 # of starting dozens of competing OCR/PDF/AI jobs in a single Railway process.
-JOB_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("UPG_WORKERS", "2"))))
+# A full geometry parse of a 200+ page PDF is memory-intensive. One worker is
+# the safe Railway default on a 1 GB container; additional requests remain
+# durably queued rather than causing an out-of-memory restart. Larger worker
+# fleets can opt in explicitly with UPG_WORKERS after being independently sized.
+JOB_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("UPG_WORKERS", "1"))))
 # Per-upload, in-memory evidence cache. This speeds candidate retries without
 # persisting statement text or transactions as long-term learning data.
 EXTRACTION_CACHE: dict[tuple[str, str], tuple[list[list[object]], str]] = {}
@@ -971,6 +975,13 @@ def extract_geometry_profile_rows(path: Path) -> list[list[object]]:
                     for i, value in enumerate(cells):
                         if value:
                             current[i] = (current[i] + " " + value).strip()
+            # pdfplumber caches page character/word objects. Explicitly clear
+            # each page after converting it to compact row strings so a 250+
+            # page PDF does not retain all geometry in the 1 GB web container.
+            try:
+                page.close()
+            except Exception:
+                pass
     if current is not None:
         rows.append(current)
     return rows
