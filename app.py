@@ -46,6 +46,7 @@ JOBS_LOCK = threading.Lock()
 EXTRACTION_CACHE: dict[tuple[str, str], tuple[list[list[object]], str]] = {}
 EXTRACTION_CACHE_LOCK = threading.Lock()
 PDF_TEXT_CACHE: dict[str, str] = {}
+PDF_SAMPLE_CACHE: dict[str, str] = {}
 
 CANONICAL = ["date", "narration", "withdrawal", "deposit", "instrument_number", "balance"]
 FIVE_MINUTES_MS = 300000
@@ -345,10 +346,20 @@ def is_large_pdf(path: Path) -> bool:
 
 def sampled_pdf_text(path: Path) -> str:
     """Representative evidence for profile generation on very long PDFs."""
+    key = str(path.resolve())
+    with EXTRACTION_CACHE_LOCK:
+        cached = PDF_SAMPLE_CACHE.get(key)
+    if cached is not None:
+        return cached
     reader = PdfReader(str(path))
     count = len(reader.pages)
     indices = sampled_page_indices(count)
-    return "\n".join(f"[PAGE {index + 1}]\n{reader.pages[index].extract_text() or ''}" for index in indices)
+    sample = "\n".join(f"[PAGE {index + 1}]\n{reader.pages[index].extract_text() or ''}" for index in indices)
+    with EXTRACTION_CACHE_LOCK:
+        if len(PDF_SAMPLE_CACHE) >= 12:
+            PDF_SAMPLE_CACHE.pop(next(iter(PDF_SAMPLE_CACHE)))
+        PDF_SAMPLE_CACHE[key] = sample
+    return sample
 
 def sampled_page_indices(count: int) -> list[int]:
     """Seven-page regions plus boundary context for large PDF layout learning."""
@@ -1208,6 +1219,12 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         latest = None
         errors = []
         repair_context = f"UPG self-healing round {round_number}. No validated parser candidate has been found yet."
+        # On a long statement, candidate parsing already works from cached
+        # full-document evidence.  Diagnostic AI needs only representative
+        # layout evidence, not the entire 252-page text layer.  Keep this
+        # outside the per-candidate loop too: one controlled diagnosis per
+        # round prevents seven serial API waits after seven failed candidates.
+        diagnostic_evidence = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
         # Each round includes a fresh AI-generated layout candidate. It is not
         # a hand-written parser for the uploaded bank; the model proposes a
         # header/column profile from the current source evidence, which must
@@ -1280,10 +1297,6 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     f"{candidate[13]} source records; source coverage={'PASS' if candidate[12] else 'FAIL'}, "
                     f"financial={'PASS' if candidate[6] else 'FAIL'}, narration={'PASS' if candidate[7] else 'FAIL'}. "
                     "Propose a safe header/column addendum only; do not weaken validation.")
-                selected = ai_diagnose_failure(cached_pdf_text(path), repair_context)
-                diagnostic_rules.update(selected)
-                if selected:
-                    repair_context += " Diagnostic AI selected safe rules: " + ", ".join(selected) + "."
             except Exception as error:
                 errors.append(str(error))
                 if "OCR_REQUIRED:" in str(error):
@@ -1297,6 +1310,14 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             detail = f"UPG retry round {round_number}: tested {attempted_candidates} distinct candidates and skipped {skipped_candidates} duplicate failures. All known candidates were skipped; UPG is requesting a materially new AI layout addendum."
         else:
             detail = f"UPG retry round {round_number}: no safe candidate was produced yet; it is continuing with new layout attempts."
+        # A diagnosis is guidance for the *next* retry round. It must never
+        # weaken validation or cause the same failed candidate to run again.
+        # Calling this once rather than after each failed candidate is the
+        # largest safe speed-up for long PDFs.
+        selected = ai_diagnose_failure(diagnostic_evidence, repair_context)
+        diagnostic_rules.update(selected)
+        if selected:
+            detail += " UPG recorded new layout guidance for the next round."
         with JOBS_LOCK:
             job = JOBS.get(job_id, {})
             job.update({"processing": True, "valid": False, "status": "processing", "message": detail, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
