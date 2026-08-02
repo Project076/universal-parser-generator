@@ -123,6 +123,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "multi_page_continuation": "Preserve a dated transaction whose narration or amount cells continue across a page boundary, excluding page headers and footers between its parts.",
     "summary_total_warning": "Keep inconsistent printed debit or credit totals as a warning when transaction count, balance chain, and endpoint reconciliation independently pass.",
     "amount_balance_consistency": "When a source row visibly prints its transaction amount, require that amount to agree with the running-balance movement; reject a layout that only reconciles after replacing source amounts.",
+    "unordered_balance_chain": "When a statement prints valid dated rows but their on-page order is not the running-balance order, reconstruct direction and order only from unique amount-and-balance links; reject ambiguity or any incomplete chain.",
 }
 PARSER_GENERATOR_POLICY = """
 Bank statement extraction policy:
@@ -141,6 +142,7 @@ Bank statement extraction policy:
 - If a combined text layer is unreliable, also test a page-by-page text candidate and join its dated rows before validation. This candidate must still reconcile across the complete statement.
 - When a layout has one unsigned amount column rather than separate debit/credit columns, infer withdrawal or deposit only from the signed change between consecutive running balances. Ignore long reference IDs, account numbers, dates, timestamps, page numbers, and footer postal codes as monetary values.
 - A running balance of exactly zero is valid even when its usual Dr/Cr suffix is omitted. Treat a dated row ending in an explicit zero amount as a real transaction only when it has the row's amount and running-balance evidence; derive its direction from the balance chain.
+- Some statements group or print same-date transactions out of running-balance order. If each row visibly has an amount and a balance, reconstruct the order only when each next row is uniquely proved by `next balance = previous balance - withdrawal + deposit`, from the declared opening balance through the declared closing balance. Preserve each row's actual source amount and narration; reject any ambiguous, partial, or disconnected chain.
 - If an undated narration/reference fragment is immediately followed by a date, time, amount and signed running balance, join that fragment to the dated row. The date/time line is a continuation of that transaction, not a separate blank-narration transaction.
 - A table extractor can truncate or misplace a date while still correctly reading the amount and running balance. For a date-like cell with a missing final year digit, consult the original source text for the immediately following digit and repair it only when that exact completion is present. Keep that transaction; do not discard it merely because the table cell is malformed. If its source Particulars is blank, export a blank Particulars field rather than inventing text.
 - Cut a transaction block before closing-balance labels, transaction totals, grand totals, available-balance labels, disclaimers, and other footer furniture. The printed closing balance is validation evidence, never a transaction amount.
@@ -741,7 +743,12 @@ def raw_transaction_record_count(raw: str) -> int | None:
     # A few text layers detach a transaction's reference/narration onto the
     # preceding line and put its date, time, amount and balance below it. That
     # date is part of the same record, not another transaction.
-    numeric_long_form = re.findall(r"(?m)^\s*\d{2}-\d{2}-\d{4}\b(?!\s+\d{2}:\d{2}:\d{1,2}\s+[-\d,]+(?:\.\d+)?\s+[-\d,]+(?:\.\d+)?\s*(?:Dr|Cr)\b)", raw)
+    numeric_long_form = re.findall(
+        r"(?m)^\s*\d{2}-\d{2}-\d{4}\b"
+        # Repeated statement-period headings can begin a text line with
+        # `01-04-2025 TO 31-03-2026`; that is metadata, not a transaction.
+        r"(?!\s+TO\s+\d{2}-\d{2}-\d{4}\b)"
+        r"(?!\s+\d{2}:\d{2}:\d{1,2}\s+[-\d,]+(?:\.\d+)?\s+[-\d,]+(?:\.\d+)?\s*(?:Dr|Cr)\b)", raw)
     if len(numeric_long_form) >= 3:
         return len(numeric_long_form)
     # Numeric-date statements use the same rule when a visible header has a
@@ -988,6 +995,22 @@ def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = No
                 page.close()
             except Exception:
                 pass
+            # Close a fully evidenced final row before the next page's bank
+            # header arrives. Keep only incomplete rows open so genuine
+            # two-page narrations/amounts can still be merged on page N+1.
+            if current is not None:
+                row_date = transaction_date_value(current[date_index] if date_index < len(current) else "")
+                withdrawal_index = column_map.get("withdrawal")
+                deposit_index = column_map.get("deposit")
+                balance_index = column_map.get("balance")
+                has_amount = bool(
+                    (withdrawal_index is not None and withdrawal_index < len(current) and money(current[withdrawal_index]) is not None)
+                    or (deposit_index is not None and deposit_index < len(current) and money(current[deposit_index]) is not None)
+                )
+                has_balance = balance_index is not None and balance_index < len(current) and money(current[balance_index]) is not None
+                if row_date and has_amount and has_balance:
+                    rows.append(current)
+                    current = None
     if current is not None:
         rows.append(current)
     return rows
@@ -1245,6 +1268,46 @@ def load_rows(path: Path, strategy_override: str | None = None) -> tuple[list[li
         EXTRACTION_CACHE[cache_key] = result
     return result
 
+def reconstruct_unordered_balance_chain(transactions: list[dict], opening: Decimal, closing: Decimal) -> list[dict] | None:
+    """Recover a source-proved chain when PDF row order is not ledger order.
+
+    Each source row supplies its visible amount and balance. For a balance B
+    and amount A, its predecessor can only be B-A (deposit) or B+A
+    (withdrawal). We follow those links from the stated opening balance and
+    accept the reconstruction only when every transaction is used exactly once
+    and the final balance equals the stated closing balance.
+    """
+    if len(transactions) < 3:
+        return None
+    by_predecessor: dict[Decimal, list[tuple[int, str]]] = {}
+    for index, transaction in enumerate(transactions):
+        balance = transaction.get("balance")
+        amount = abs(Decimal(transaction.get("withdrawal", 0)) - Decimal(transaction.get("deposit", 0)))
+        if balance is None or amount <= 0:
+            return None
+        by_predecessor.setdefault(balance - amount, []).append((index, "deposit"))
+        by_predecessor.setdefault(balance + amount, []).append((index, "withdrawal"))
+    ordered: list[dict] = []
+    used: set[int] = set()
+    running = opening
+    for _ in range(len(transactions)):
+        options = [(index, direction) for index, direction in by_predecessor.get(running, []) if index not in used]
+        # More than one possible next source row means the evidence cannot
+        # prove one particular chain. Never guess merely to pass validation.
+        if len(options) != 1:
+            return None
+        index, direction = options[0]
+        transaction = dict(transactions[index])
+        amount = abs(Decimal(transaction["withdrawal"]) - Decimal(transaction["deposit"]))
+        transaction["withdrawal"] = amount if direction == "withdrawal" else Decimal("0")
+        transaction["deposit"] = amount if direction == "deposit" else Decimal("0")
+        running = transaction["balance"]
+        ordered.append(transaction)
+        used.add(index)
+    if running.quantize(Decimal(".01")) != closing.quantize(Decimal(".01")):
+        return None
+    return ordered
+
 def parse_statement(path: Path, fallback_open: str, fallback_close: str, strategy_override: str | None = None, force_ai_profile: bool = False, repair_context: str = ""):
     if path.suffix.lower() == ".pdf":
         source_text = remove_page_furniture(cached_pdf_text(path))
@@ -1270,10 +1333,17 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # During controlled self-healing, the newly proposed AI addendum is allowed
     # to supersede a prior mapping only for this candidate. It is persisted only
     # after all validation gates pass.
+    # Explicit headers on the uploaded source are stronger than a related
+    # profile. An addendum may supply only a missing field; it must never move
+    # a clearly labelled Withdrawal, Deposit or Balance column merely because
+    # an older layout used different offsets.
+    source_columns = map_headers(headers)
+    inherited_missing = {key: value for key, value in inherited_columns.items() if key not in source_columns}
+    exact_missing = {key: value for key, value in (exact_profile or {}).items() if key not in source_columns}
     if force_ai_profile:
-        columns = {**map_headers(headers), **inherited_columns, **(exact_profile or {}), **(ai_columns or {})}
+        columns = {**source_columns, **inherited_missing, **exact_missing, **(ai_columns or {})}
     else:
-        columns = {**map_headers(headers), **inherited_columns, **(ai_columns or {}), **(exact_profile or {})}
+        columns = {**source_columns, **inherited_missing, **(ai_columns or {}), **exact_missing}
     tx = []
     for row in rows[header_at + 1:]:
         def cell(key):
@@ -1326,6 +1396,26 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     opening = opening if opening is not None else money(fallback_open)
     closing = closing if closing is not None else money(fallback_close)
     if opening is None or closing is None: raise ValueError("Opening and closing balances could not be found. Supply them only as a fallback after confirming them from the source statement.")
+    # Certain bank exports visually group same-date rows rather than preserving
+    # ledger order. Try a source-amount-preserving reconstruction before any
+    # balance-delta fallback; it succeeds only for one complete, unique chain.
+    if strategy_override == "geometry_profile":
+        reconstructed = reconstruct_unordered_balance_chain(tx, opening, closing)
+        # In an unordered statement, the first displayed row is not reliable
+        # opening evidence. A printed Grand Total can instead derive opening,
+        # but only when its own source amounts create one complete, unique
+        # balance chain all the way to the declared closing balance.
+        if reconstructed is None and source_opening is None:
+            declared_opening_withdrawals, declared_opening_deposits = source_transaction_totals(
+                cached_pdf_text(path) if path.suffix.lower() == ".pdf" else raw
+            )
+            if declared_opening_withdrawals is not None and declared_opening_deposits is not None:
+                total_derived_opening = closing + declared_opening_withdrawals - declared_opening_deposits
+                reconstructed = reconstruct_unordered_balance_chain(tx, total_derived_opening, closing)
+                if reconstructed is not None:
+                    opening = total_derived_opening
+        if reconstructed is not None:
+            tx = reconstructed
     if strategy_override in ("running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "page_text_unsigned"):
         # A page-level extraction may start a new page without the preceding
         # running balance. Recompute debit/credit from the joined balances so
