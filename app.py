@@ -68,6 +68,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "headerless_layout": "Treat a repeated or missing table header as layout evidence, not as a transaction; infer columns only from dated rows and running balances.",
     "multi_page_continuation": "Preserve a dated transaction whose narration or amount cells continue across a page boundary, excluding page headers and footers between its parts.",
     "summary_total_warning": "Keep inconsistent printed debit or credit totals as a warning when transaction count, balance chain, and endpoint reconciliation independently pass.",
+    "amount_balance_consistency": "When a source row visibly prints its transaction amount, require that amount to agree with the running-balance movement; reject a layout that only reconciles after replacing source amounts.",
 }
 PARSER_GENERATOR_POLICY = """
 Bank statement extraction policy:
@@ -994,7 +995,10 @@ def extract_text_layout_rows(raw: str, unsigned_balance: bool = False, use_value
         instrument_source = chunk[date.end():value_date_match.start()] if use_value_date and value_date_match is not None else narration
         instrument_matches = list(re.finditer(r"\b\d{6,}\b", instrument_source))
         instrument = instrument_matches[-1].group() if instrument_matches else ""
-        rows.append([display_date(output_date), narration, withdrawal, deposit, instrument, balance])
+        # Retain the source amount as private, in-memory validation evidence.
+        # It is not exported as a column, but prevents a balance-delta parser
+        # from silently replacing a visibly printed transaction amount.
+        rows.append([display_date(output_date), narration, withdrawal, deposit, instrument, balance, amount])
         previous_balance = balance
     return rows if len(rows) > 1 else []
 
@@ -1075,7 +1079,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         if withdrawal is None: withdrawal = Decimal("0")
         if deposit is None: deposit = Decimal("0")
         if withdrawal or deposit:
-            tx.append({"date": display_date(table_date), "narration": str(cell("narration") or ""), "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": money(cell("balance"))})
+            tx.append({"date": display_date(table_date), "narration": str(cell("narration") or ""), "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": money(cell("balance")), "source_amount": money(row[6]) if len(row) > 6 else None})
     source_opening, source_closing = source_balances(raw)
     opening, closing = source_opening, source_closing
     tab_opening, tab_closing = table_balances(rows, header_at, columns)
@@ -1141,6 +1145,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # Validate each step independently, not just the final reconciliation.
     # This is the user's balance-chain equation rearranged forward.
     running_balance_valid = bool(tx)
+    source_amount_valid = True
     for transaction in tx:
         balance = transaction["balance"]
         if balance is None:
@@ -1149,6 +1154,11 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         expected_current = running - transaction["withdrawal"] + transaction["deposit"]
         if expected_current.quantize(Decimal(".01")) != balance.quantize(Decimal(".01")):
             running_balance_valid = False
+            break
+        source_amount = transaction.get("source_amount")
+        movement = abs(transaction["deposit"] - transaction["withdrawal"])
+        if source_amount is not None and movement.quantize(Decimal(".01")) != abs(source_amount).quantize(Decimal(".01")):
+            source_amount_valid = False
             break
         running = balance
     no_opening_as_transaction = not any(normalize_narration(x["narration"]) in ("bf", "openingbalance") for x in tx)
@@ -1187,7 +1197,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # some bank statements print them incorrectly. They must never override a
     # complete source-record count, transaction-level balance chain, and the
     # statement opening-to-closing reconciliation.
-    financial_valid = total_reconciles and running_balance_valid and no_opening_as_transaction and coverage_valid
+    financial_valid = total_reconciles and running_balance_valid and source_amount_valid and no_opening_as_transaction and coverage_valid
     # The original source text is independent evidence.  A narration that cannot
     # be located there is not silently accepted just because amounts reconcile.
     # Build the normalized source once. Re-normalizing a 250-page statement
