@@ -64,6 +64,10 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "reverse_order": "Reverse newest-first statements before reconciliation.",
     "source_coverage": "Reject partial extracts and require all detectable source records.",
     "truncated_table_date": "Repair a date cell only when the original source proves its missing final year digit; retain the row's actual amount and balance, never discard it.",
+    "signed_balance_text": "Use dated text blocks with Dr/Cr running balances, then classify debit or credit from each balance movement.",
+    "headerless_layout": "Treat a repeated or missing table header as layout evidence, not as a transaction; infer columns only from dated rows and running balances.",
+    "multi_page_continuation": "Preserve a dated transaction whose narration or amount cells continue across a page boundary, excluding page headers and footers between its parts.",
+    "summary_total_warning": "Keep inconsistent printed debit or credit totals as a warning when transaction count, balance chain, and endpoint reconciliation independently pass.",
 }
 PARSER_GENERATOR_POLICY = """
 Bank statement extraction policy:
@@ -509,20 +513,28 @@ def ai_choose_text_strategy(raw: str) -> str | None:
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
         return None
 
-def ai_diagnose_failure(raw: str, failure: str) -> list[str]:
-    """Select only pre-approved diagnostic rules; never generate code."""
+def ai_diagnose_failure(raw: str, failure: str) -> dict[str, list[str]]:
+    """Create a privacy-safe, bounded investigation plan for the next retry."""
     key = os.environ.get("OPENAI_API_KEY")
-    if not key: return []
-    schema = {"type": "object", "additionalProperties": False, "properties": {"rules": {"type": "array", "items": {"type": "string", "enum": list(DIAGNOSTIC_RULE_LIBRARY)}, "maxItems": 4}}, "required": ["rules"]}
-    prompt = PARSER_GENERATOR_POLICY + "\nControlled Diagnostic AI: choose applicable rule IDs only from this library; do not write code, invent transactions, or weaken validation.\n" + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
+    if not key: return {"rules": [], "strategies": []}
+    safe_strategies = ["geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table", "ai_layout_addendum"]
+    schema = {"type": "object", "additionalProperties": False, "properties": {
+        "rules": {"type": "array", "items": {"type": "string", "enum": list(DIAGNOSTIC_RULE_LIBRARY)}, "maxItems": 5},
+        "strategies": {"type": "array", "items": {"type": "string", "enum": safe_strategies}, "maxItems": 4},
+    }, "required": ["rules", "strategies"]}
+    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Study the source sample and failed validation evidence. Select only safe rule IDs and a priority order of already-supported candidate strategies for the next retry. Do not write executable code, invent transactions, expose source data, or weaken any validation.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
     payload = {"model": AI_MODEL, "input": prompt, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=90) as response: result = json.loads(response.read().decode())
         output = next((item["text"] for item_out in result.get("output", []) for item in item_out.get("content", []) if item.get("type") == "output_text"), "")
-        return [rule for rule in json.loads(output)["rules"] if rule in DIAGNOSTIC_RULE_LIBRARY]
+        plan = json.loads(output)
+        return {
+            "rules": [rule for rule in plan["rules"] if rule in DIAGNOSTIC_RULE_LIBRARY],
+            "strategies": [strategy for strategy in plan["strategies"] if strategy in safe_strategies],
+        }
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
-        return []
+        return {"rules": [], "strategies": []}
 
 def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
     def find(kind):
@@ -1279,6 +1291,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     large_pdf = is_large_pdf(path)
     text_first = large_pdf and prefers_running_balance_text(path)
     diagnostic_rules: set[str] = set()
+    planned_strategies: list[str] = []
     while True:
         round_number += 1
         # Keep API clients informed before starting expensive PDF work.
@@ -1322,6 +1335,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             initial_candidates = [preferred] + [item for item in initial_candidates if item != preferred]
         candidates = (initial_candidates if round_number == 1
             else [(None, True), ("geometry_profile", False), ("value_date_unsigned", False), ("page_text_unsigned", False), ("unsigned_running_balance_text", False), ("running_balance_text", False), (None, False)])
+        if planned_strategies:
+            def plan_key(candidate: tuple[str | None, bool]) -> int:
+                name = "ai_layout_addendum" if candidate[1] else (candidate[0] or "detected_table")
+                return planned_strategies.index(name) if name in planned_strategies else len(planned_strategies)
+            candidates = sorted(candidates, key=plan_key)
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
             try:
@@ -1398,10 +1416,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # weaken validation or cause the same failed candidate to run again.
         # Calling this once rather than after each failed candidate is the
         # largest safe speed-up for long PDFs.
-        selected = ai_diagnose_failure(diagnostic_evidence, repair_context)
-        diagnostic_rules.update(selected)
-        if selected:
-            detail += " UPG recorded new layout guidance for the next round."
+        investigation = ai_diagnose_failure(diagnostic_evidence, repair_context)
+        diagnostic_rules.update(investigation["rules"])
+        planned_strategies = investigation["strategies"]
+        if investigation["rules"] or planned_strategies:
+            detail += " UPG recorded a new layout investigation plan for the next round."
         with JOBS_LOCK:
             job = JOBS.get(job_id, {})
             job.update({"processing": True, "valid": False, "status": "processing", "message": detail, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
