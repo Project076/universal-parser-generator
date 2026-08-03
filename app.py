@@ -1834,6 +1834,58 @@ def submit_retry_job(job_id: str, path: Path, fallback_open: str, fallback_close
               message="UPG job is queued for a parser-engine worker.")
     JOB_EXECUTOR.submit(run_retry_job, job_id, path, fallback_open, fallback_close)
 
+def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = "", fallback_close: str = "") -> dict:
+    """Run UPG's native, certified extraction against the original source.
+
+    Geometry-based profiles cannot be reproduced safely by a generic
+    text-only JavaScript sandbox.  This API is therefore the authoritative
+    execution path for BS Analyzer after it detects a UPG profile.
+    """
+    profile_path = PROFILES / f"{Path(profile_id).name}.json"
+    if not profile_path.exists():
+        raise ValueError("Certified UPG profile was not found")
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    validation = profile.get("validation") or {}
+    if validation.get("status") != "pass" or not profile.get("certification"):
+        raise ValueError("UPG profile is not certified")
+    strategy = str(profile.get("last_validated_strategy") or "geometry_profile")
+    result = parse_statement(path, fallback_open, fallback_close, strategy)
+    tx, opening, closing, total_w, total_d, computed, financial_pass, narration_pass, unmatched, _headers, columns, _parent, coverage_pass, source_count, _fingerprint, declared_wd, declared_dp, totals_pass = result
+    special_balance_exception = bool(columns.get("_source_balance_unreliable"))
+    execution_validation = {
+        "status": "pass" if financial_pass and narration_pass else "fail",
+        "financial_pass": bool(financial_pass),
+        "narration_pass": bool(narration_pass),
+        "balance_chain_pass": not special_balance_exception,
+        "balance_chain_exception": special_balance_exception,
+        "manual_review_required": special_balance_exception,
+        "source_coverage_pass": bool(coverage_pass),
+        "transaction_count": len(tx),
+        "source_transaction_count": source_count,
+        "statement_totals_pass": bool(totals_pass),
+    }
+    if not (financial_pass and narration_pass):
+        raise ValueError(f"Certified profile did not validate this statement: financial={financial_pass}, narration={narration_pass}, coverage={coverage_pass}")
+    def output_row(row: dict) -> dict:
+        narration = row.get("narration", "")
+        instrument = row.get("instrument_number", "")
+        return {
+            "date": row.get("date", ""), "narration": narration, "particulars": narration,
+            "withdrawal": float(row.get("withdrawal") or 0), "deposit": float(row.get("deposit") or 0),
+            "instrument_number": instrument, "chqNo": instrument,
+            "balance": float(row.get("balance")) if row.get("balance") is not None else None,
+        }
+    return {
+        "profile_id": profile_id, "profile_version": int(profile.get("version", 1)),
+        "transactions": [output_row(row) for row in tx],
+        "opening_balance": float(opening), "closing_balance": float(closing),
+        "total_withdrawals": float(total_w), "total_deposits": float(total_d),
+        "calculated_closing_balance": float(computed),
+        "declared_withdrawals": float(declared_wd) if declared_wd is not None else None,
+        "declared_deposits": float(declared_dp) if declared_dp is not None else None,
+        "validation": execution_validation,
+    }
+
 def recover_persisted_jobs() -> None:
     """Recover safe unprotected jobs after a Railway restart.
 
@@ -2008,6 +2060,32 @@ class App(BaseHTTPRequestHandler):
                 self.json(api_profile_payload(profile_id), HTTPStatus.CREATED)
             except Exception as error:
                 self.json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+            return
+        execute_match = re.fullmatch(r"/parser-profiles/([^/]+)/execute", path)
+        if execute_match:
+            if not self.api_authorized(): return
+            saved = None
+            try:
+                fields = self.multipart_fields()
+                if "file" not in fields:
+                    raise ValueError("file is required")
+                filename, content = fields["file"]
+                saved = UPLOADS / f"{uuid.uuid4().hex}-{Path(filename).name}"
+                saved.write_bytes(content)
+                register_pdf_password(saved, str(fields.get("password", fields.get("pdf_password", ""))))
+                result = execute_certified_profile(
+                    execute_match.group(1), saved,
+                    str(fields.get("opening", fields.get("ob", ""))),
+                    str(fields.get("closing", fields.get("cb", ""))),
+                )
+                self.json(result)
+            except Exception as error:
+                self.json({"ok": False, "error": str(error)}, HTTPStatus.UNPROCESSABLE_ENTITY)
+            finally:
+                if saved is not None:
+                    clear_pdf_password(saved)
+                    try: saved.unlink(missing_ok=True)
+                    except OSError: pass
             return
         if path != "/parse": self.send_error(404); return
         try:
