@@ -770,7 +770,8 @@ def ai_diagnose_failure(raw: str, failure: str) -> dict[str, object]:
     transactions, balances, executable code, or a weaker validation standard.
     """
     key = os.environ.get("OPENAI_API_KEY")
-    if not key: return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum"}
+    if not key:
+        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum", "diagnostic_error": "AI diagnosis unavailable: OPENAI_API_KEY is not configured."}
     safe_strategies = ["geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table", "ai_layout_addendum"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "rules": {"type": "array", "items": {"type": "string", "enum": list(DIAGNOSTIC_RULE_LIBRARY)}, "maxItems": 5},
@@ -790,9 +791,12 @@ def ai_diagnose_failure(raw: str, failure: str) -> dict[str, object]:
             "strategies": [strategy for strategy in plan["strategies"] if strategy in safe_strategies],
             "failure_type": str(plan["failure_type"]),
             "profile_action": str(plan["profile_action"]),
+            "diagnostic_error": "",
         }
-    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
-        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum"}
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError) as error:
+        # Keep only a short, non-sensitive diagnostic.  This lets the retry
+        # loop distinguish an AI/API failure from a genuine but empty plan.
+        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum", "diagnostic_error": f"AI diagnosis unavailable: {type(error).__name__}."}
 
 def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
     def find(kind):
@@ -1809,6 +1813,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     diagnostic_rules: set[str] = {str(item) for item in saved_state.get("diagnostic_rules", [])}
     planned_strategies: list[str] = [str(item) for item in saved_state.get("planned_strategies", [])]
     prior_investigation = saved_state.get("investigation") if isinstance(saved_state.get("investigation"), dict) else {}
+    # Retrying is required only while the AI can propose a materially new,
+    # supported path.  Persist this across fair worker leases so an empty AI
+    # diagnosis can never turn into an infinite queue-consuming loop.
+    empty_ai_diagnoses = int(saved_state.get("empty_ai_diagnoses", 0) or 0)
     rounds_this_lease = 0
     while True:
         round_number += 1
@@ -1987,12 +1995,38 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         investigation = ai_diagnose_failure(diagnostic_evidence, repair_context)
         diagnostic_rules.update(investigation["rules"])
         planned_strategies = investigation["strategies"]
+        diagnosis_error = str(investigation.get("diagnostic_error", "") or "")
         prior_investigation = {
             "failure_type": investigation.get("failure_type", "novel_layout"),
             "profile_action": investigation.get("profile_action", "ai_addendum"),
+            "diagnostic_error": diagnosis_error,
         }
         if investigation["rules"] or planned_strategies:
             detail += " UPG recorded a new layout investigation plan for the next round."
+            empty_ai_diagnoses = 0
+        elif new_candidates_this_round == 0:
+            empty_ai_diagnoses += 1
+            detail += " The AI investigation supplied no materially new supported parser plan."
+        else:
+            empty_ai_diagnoses = 0
+        if empty_ai_diagnoses >= 2:
+            reason = diagnosis_error or "The AI returned no new safe rule or supported strategy after all known candidates were exhausted."
+            message = ("UPG stopped safely before certification: " + reason +
+                       " No parser profile was saved and no Excel was released. "
+                       "Upload another statement of this layout or add a new supported extraction capability before retrying.")
+            with JOBS_LOCK:
+                job = JOBS.get(job_id, {})
+                job.update({"processing": False, "valid": False, "status": "failed", "message": message,
+                            "retry_round": round_number, "attempted_candidates": attempted_candidates,
+                            "skipped_candidates": skipped_candidates, "failed_candidates": sorted(failed_candidates),
+                            "failed_strategy_keys": sorted(failed_strategy_keys),
+                            "diagnostic_rules": sorted(diagnostic_rules), "planned_strategies": planned_strategies,
+                            "empty_ai_diagnoses": empty_ai_diagnoses, "investigation": prior_investigation})
+                JOBS[job_id] = job
+                persist_job_locked(job_id)
+            post_completion_webhook(job_id, "failed", error=message)
+            clear_pdf_password(path)
+            return
         yield_to_queue = rounds_this_lease >= WORKER_LEASE_ROUNDS
         with JOBS_LOCK:
             job = JOBS.get(job_id, {})
@@ -2006,7 +2040,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         "failed_candidates": sorted(failed_candidates),
                         "failed_strategy_keys": sorted(failed_strategy_keys),
                         "diagnostic_rules": sorted(diagnostic_rules),
-                        "planned_strategies": planned_strategies})
+                        "planned_strategies": planned_strategies,
+                        "empty_ai_diagnoses": empty_ai_diagnoses})
             job["investigation"] = prior_investigation
             job["worker_heartbeat_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             JOBS[job_id] = job
