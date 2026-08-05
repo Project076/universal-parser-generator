@@ -196,6 +196,15 @@ def cancel_job(job_id: str, reason: str = "Cancelled by the requesting client.")
         refresh_queue_positions_locked()
         return True
 
+def cancel_direct_job(job_id: str, cancel_token: str) -> bool:
+    """Allow only the browser that submitted a public UI job to cancel it."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        expected = str(job.get("cancel_token", "")) if job else ""
+    if not expected or not cancel_token or not hmac.compare_digest(expected, cancel_token):
+        return False
+    return cancel_job(job_id, "Cancelled because the direct UPG page was closed or refreshed.")
+
 def job_cancel_requested(job_id: str) -> bool:
     with JOBS_LOCK:
         job = JOBS.get(job_id, {})
@@ -286,10 +295,12 @@ ALIASES = {
 
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><title>Statement Normalizer</title><style>
 body{font-family:system-ui;max-width:860px;margin:50px auto;color:#172033;background:#f5f7fb}.card{background:white;padding:30px;border-radius:16px;box-shadow:0 4px 22px #1223}h1{margin-top:0}label{display:block;margin:16px 0 5px;font-weight:650}input,button{font:inherit;padding:10px}input{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:7px}button{margin-top:22px;background:#0f766e;color:white;border:0;border-radius:8px;cursor:pointer}.hint{color:#52606d}.result{margin-top:20px;padding:16px;border-radius:8px}.ok{background:#dcfce7}.fail{background:#fee2e2}.field{display:grid;grid-template-columns:1fr 1fr;gap:15px}</style></head><body><main class="card"><h1>Bank Statement Normalizer</h1><p class="hint">Upload a statement. Excel is created only after the declared balances reconcile with parsed transactions. For unfamiliar layouts, the configured AI parser generator may inspect the layout to create a profile; no export is released unless both checks pass.</p><form id="form"><label>Statement file</label><input name="file" type="file" accept=".csv,.xlsx,.xls,.txt,.pdf,.doc,.docx" required><div class="field"><div><label>Opening balance (optional fallback)</label><input name="opening" placeholder="Extracted from source when present"></div><div><label>Closing balance (optional fallback)</label><input name="closing" placeholder="Extracted from source when present"></div></div><label>PDF password (only if protected)</label><input name="password" type="password" autocomplete="off" placeholder="Used only in memory for this upload"><button>Parse and validate</button></form><section id="result"></section></main><script>
-const f=document.querySelector('#form'), r=document.querySelector('#result'), submit=f.querySelector('button');let activeJob=null;
+const f=document.querySelector('#form'), r=document.querySelector('#result'), submit=f.querySelector('button');let activeJob=null,activeCancelToken=null;
 function show(d){const label=d.valid?'Validated':d.processing?'UPG is retrying':d.interrupted?'UPG job interrupted':'Not validated';r.className='result '+(d.valid?'ok':d.processing||d.interrupted?'':'fail');r.innerHTML=`<strong>${label}</strong><br>${d.message}`+(d.download?`<br><br><a href="${d.download}">Download validated Excel</a>`:'')}
-async function poll(job){const d=await (await fetch('/status/'+job)).json();if(job!==activeJob)return;show(d);if(d.processing)setTimeout(()=>poll(job),2500);else{activeJob=null;submit.disabled=false;submit.textContent='Parse and validate'}}
-f.onsubmit=async e=>{e.preventDefault();if(activeJob)return;r.className='result';r.innerHTML='<strong>UPG is retrying</strong><br>Creating and validating parser candidates.';submit.disabled=true;submit.textContent='UPG is working...';try{const d=await (await fetch('/parse',{method:'POST',body:new FormData(f)})).json();activeJob=d.job||null;show(d);if(d.processing)poll(d.job);else{submit.disabled=false;submit.textContent='Parse and validate'}}catch(err){activeJob=null;submit.disabled=false;submit.textContent='Parse and validate';r.className='result fail';r.innerHTML='<strong>Unable to start UPG</strong><br>The parser retry job could not start.'}};
+async function poll(job){const d=await (await fetch('/status/'+job)).json();if(job!==activeJob)return;show(d);if(d.processing)setTimeout(()=>poll(job),2500);else{activeJob=null;activeCancelToken=null;submit.disabled=false;submit.textContent='Parse and validate'}}
+function cancelDirectJob(){if(!activeJob||!activeCancelToken)return;const body=JSON.stringify({job_id:activeJob,cancel_token:activeCancelToken});navigator.sendBeacon('/cancel',new Blob([body],{type:'application/json'}));}
+window.addEventListener('pagehide',cancelDirectJob);
+f.onsubmit=async e=>{e.preventDefault();if(activeJob)return;r.className='result';r.innerHTML='<strong>UPG is retrying</strong><br>Creating and validating parser candidates.';submit.disabled=true;submit.textContent='UPG is working...';try{const d=await (await fetch('/parse',{method:'POST',body:new FormData(f)})).json();activeJob=d.job||null;activeCancelToken=d.cancel_token||null;show(d);if(d.processing)poll(d.job);else{activeJob=null;activeCancelToken=null;submit.disabled=false;submit.textContent='Parse and validate'}}catch(err){activeJob=null;activeCancelToken=null;submit.disabled=false;submit.textContent='Parse and validate';r.className='result fail';r.innerHTML='<strong>Unable to start UPG</strong><br>The parser retry job could not start.'}};
 </script></body></html>'''
 
 def money(value: object) -> Decimal | None:
@@ -2246,6 +2257,20 @@ class App(BaseHTTPRequestHandler):
         self.send_error(404)
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/cancel":
+            # The direct browser UI cannot possess the server API key.  Its
+            # one-time random token is issued only with the matching /parse
+            # response and allows cancellation of that one public job only.
+            try:
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                data = json.loads(body or b"{}")
+                if cancel_direct_job(str(data.get("job_id", "")), str(data.get("cancel_token", ""))):
+                    self.json({"ok": True, "status": "cancelled"})
+                else:
+                    self.json({"ok": False, "error": "Unknown or unauthorized job"}, HTTPStatus.NOT_FOUND)
+            except (ValueError, json.JSONDecodeError):
+                self.json({"ok": False, "error": "Invalid cancellation request"}, HTTPStatus.BAD_REQUEST)
+            return
         cancel_match = re.fullmatch(r"/parser-jobs/([^/]+)/cancel", path)
         if cancel_match:
             if not self.api_authorized(): return
@@ -2318,11 +2343,12 @@ class App(BaseHTTPRequestHandler):
             filename, content=fields["file"]; safe=Path(filename).name; saved=UPLOADS / f"{uuid.uuid4().hex}-{safe}"; saved.write_bytes(content)
             register_pdf_password(saved, str(fields.get("password", fields.get("pdf_password", ""))))
             job_id = uuid.uuid4().hex
+            cancel_token = uuid.uuid4().hex
             with JOBS_LOCK:
-                JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": timestamp_now(), "client_heartbeat_at": timestamp_now(), "source_file": saved.name, "fallback_open": fields.get("opening", ""), "fallback_close": fields.get("closing", ""), "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
+                JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": timestamp_now(), "client_heartbeat_at": timestamp_now(), "cancel_token": cancel_token, "source_file": saved.name, "fallback_open": fields.get("opening", ""), "fallback_close": fields.get("closing", ""), "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
                 persist_job_locked(job_id)
             submit_retry_job(job_id, saved, fields.get("opening", ""), fields.get("closing", ""))
-            self.json({"processing": True, "valid": False, "job": job_id, "message": "UPG is retrying parser candidates. Excel and profile creation remain locked until both validations pass."})
+            self.json({"processing": True, "valid": False, "job": job_id, "cancel_token": cancel_token, "message": "UPG is retrying parser candidates. Excel and profile creation remain locked until both validations pass."})
             return
             # UPG retry loop: do not treat the first failed strategy as final.
             result = None
