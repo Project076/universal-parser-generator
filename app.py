@@ -579,10 +579,38 @@ def certified_learning_context(limit: int = 16) -> list[dict[str, object]]:
         })
     return lessons
 
-def ai_learning_packet() -> dict[str, object]:
+def closest_certified_lessons(path: Path | None, headers: list[object] | None = None, limit: int = 3) -> list[dict[str, object]]:
+    """Find the closest certified layouts using this source's safe structure."""
+    target_headers = {norm(item) for item in (headers or []) if norm(item)}
+    target_fingerprint = ""
+    if path and path.suffix.lower() == ".pdf":
+        try:
+            target_fingerprint = text_layout_fingerprint(remove_page_furniture(cached_pdf_text(path)))
+        except (OSError, ValueError):
+            pass
+    if not target_headers and not target_fingerprint:
+        return []
+    ranked: list[tuple[float, dict[str, object]]] = []
+    for lesson in certified_learning_context(limit=64):
+        profile_headers = {norm(item) for item in lesson.get("headers", []) if norm(item)}
+        overlap = len(target_headers & profile_headers) / max(1, len(target_headers | profile_headers))
+        try:
+            profile = json.loads((PROFILES / f"{lesson['profile_id']}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, KeyError):
+            continue
+        exact_fingerprint = bool(target_fingerprint and profile.get("layout_fingerprint") == target_fingerprint)
+        score = (1_000 if exact_fingerprint else 0) + overlap * 400
+        if score <= 0:
+            continue
+        ranked.append((score, {**lesson, "similarity_score": round(score, 1), "exact_layout": exact_fingerprint}))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [lesson for _, lesson in ranked[:limit]]
+
+def ai_learning_packet(path: Path | None = None, headers: list[object] | None = None) -> dict[str, object]:
     """The complete non-sensitive knowledge supplied to UPG's AI workers."""
     return {
         "permanent_historical_lessons": HISTORICAL_CHALLENGE_LESSONS,
+        "closest_certified_layouts": closest_certified_lessons(path, headers),
         "certified_profile_lessons": certified_learning_context(),
     }
 
@@ -620,6 +648,88 @@ def saved_text_strategy(path: Path) -> str | None:
     except (OSError, ValueError, KeyError):
         pass
     return None
+
+def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool, validated_strategy: str | None,
+                              planned_strategies: list[str], retry_round: int) -> list[tuple[str | None, bool]]:
+    """Rank parser candidates from source evidence before parsing the full file.
+
+    A candidate is never accepted by score alone.  The score only decides which
+    small set earns a full-document extraction and the normal release gates.
+    """
+    scores: dict[tuple[str | None, bool], int] = {}
+    def add(strategy: str | None, ai_addendum: bool, score: int) -> None:
+        key = (strategy, ai_addendum)
+        scores[key] = max(scores.get(key, -10_000), score)
+    def candidate_for(name: str) -> tuple[str | None, bool]:
+        return (None, True) if name == "ai_layout_addendum" else ((None, False) if name == "detected_table" else (name, False))
+
+    # Exact validated reuse is strongest evidence, followed by a closely
+    # related layout addendum and original-PDF geometry.
+    if validated_strategy:
+        add(validated_strategy, False, 1_000)
+    headers: list[object] = []
+    if path.suffix.lower() == ".pdf":
+        try:
+            geometry = sampled_geometry_profile(path)
+            if geometry:
+                headers = geometry[0]
+                exact = load_profile(headers)
+                related_id, related_columns = (None, {}) if exact else find_related_profile(headers)
+                if exact:
+                    add(str(exact.get("last_validated_strategy", "detected_table")), False, 900)
+                elif related_id and related_columns:
+                    add("geometry_profile" if large_pdf else "detected_table", False, 800)
+                add("geometry_profile", False, 750 if large_pdf else 650)
+        except (OSError, ValueError, KeyError):
+            pass
+    if geometry_ready:
+        add("geometry_profile", False, 780)
+
+    for lesson in closest_certified_lessons(path, headers):
+        strategy = str(lesson.get("strategy", "detected_table"))
+        if strategy == "detected_table":
+            strategy = "geometry_profile" if large_pdf else "detected_table"
+        if strategy in {"geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"}:
+            add(None if strategy == "detected_table" else strategy, False, int(820 + min(130, float(lesson.get("similarity_score", 0)) / 10)))
+
+    # Lightweight source signals only rank supported alternatives; they never
+    # create a parser or classify a transaction without validation.
+    try:
+        sample = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
+        if re.search(r"(?i)\bvalue\s+date\b", sample):
+            add("value_date_unsigned", False, 520)
+        if re.search(r"(?i)\b(?:dr|cr)\b", sample):
+            add("running_balance_text", False, 500)
+        if re.search(r"(?i)\b(?:running|closing|available)\s+balance\b", sample):
+            add("unsigned_running_balance_text", False, 460)
+        if not headers:
+            add("page_text_unsigned", False, 300)
+    except (OSError, ValueError):
+        pass
+
+    # Certified lessons add a small preference only.  They never outweigh an
+    # exact profile or this statement's original-PDF geometry.
+    for lesson in certified_learning_context():
+        strategy = str(lesson.get("strategy", ""))
+        if strategy in {"geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned"}:
+            add(strategy, False, 350 + min(90, int(lesson.get("observations", 0) or 0) * 5))
+
+    # A controlled AI addendum is the main path for an unfamiliar layout. On a
+    # retry it outranks exhausted heuristics, but it must still be materially
+    # new (enforced by the candidate signature memory below).
+    add(None, True, 700 if retry_round == 1 else 850)
+    for index, name in enumerate(planned_strategies):
+        strategy, ai_addendum = candidate_for(name)
+        add(strategy, ai_addendum, 880 - index * 20)
+
+    ordered = sorted(scores, key=lambda item: scores[item], reverse=True)
+    # Two strong evidence-led candidates normally suffice. A third is allowed
+    # only for an unfamiliar layout, where it is the controlled AI addendum.
+    selected = ordered[:2]
+    ai_key = (None, True)
+    if ai_key not in selected and ai_key in scores and not validated_strategy:
+        selected.append(ai_key)
+    return selected
 
 def pdf_password(path: Path) -> str:
     with EXTRACTION_CACHE_LOCK:
@@ -769,7 +879,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     }
     geometry = sampled_pdf_geometry_evidence(source_path) if source_path and source_path.suffix.lower() == ".pdf" else []
     evidence = {"rows": rows[:35], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context,
-                "upg_learning": ai_learning_packet()}
+                "upg_learning": ai_learning_packet(source_path, rows[0] if rows else None)}
     instruction = (PARSER_GENERATOR_POLICY + "\nYou are a bank-statement parser generator and controlled self-healing planner. First discard PDF furniture and non-transaction visual/text objects. Identify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
         "and balance. These are the only allowed transaction outputs. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
@@ -835,7 +945,7 @@ def safe_openai_error(error: Exception) -> str:
         return f"OpenAI network error: {type(error.reason).__name__}."
     return f"OpenAI response error: {type(error).__name__}."
 
-def ai_diagnose_failure(raw: str, failure: str) -> dict[str, object]:
+def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None) -> dict[str, object]:
     """Create a privacy-safe expert investigation plan for the next retry.
 
     The model may choose a diagnosis and a parser-profile action, but never
@@ -851,7 +961,7 @@ def ai_diagnose_failure(raw: str, failure: str) -> dict[str, object]:
         "failure_type": {"type": "string", "enum": ["column_geometry", "header_mapping", "date_order", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "novel_layout"]},
         "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "ai_addendum", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
-    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Diagnose the root cause from the source sample and failed validation evidence, then select one safe parser-profile action and a priority order of already-supported candidate strategies. Use the UPG learning packet to recognize layouts and avoid known mistakes, but never copy values or accept a candidate without this statement passing all gates. A later generator will receive your diagnosis to create a materially different addendum. Do not write executable code, invent transactions, expose source data, replace source amounts, or weaken validation. If evidence is insufficient, choose novel_layout + ai_addendum; do not pretend a failed mapping is valid.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(ai_learning_packet()) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
+    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Diagnose the root cause from the source sample and failed validation evidence, then select one safe parser-profile action and a priority order of already-supported candidate strategies. First compare this statement against the closest certified layouts in the UPG learning packet; identify what changed before proposing an addendum. Use the learning packet to recognize layouts and avoid known mistakes, but never copy values or accept a candidate without this statement passing all gates. A later generator will receive your diagnosis to create a materially different addendum. Do not write executable code, invent transactions, expose source data, replace source amounts, or weaken validation. If evidence is insufficient, choose novel_layout + ai_addendum; do not pretend a failed mapping is valid.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(ai_learning_packet(source_path)) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
     payload = {"model": AI_MODEL, "input": prompt, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
@@ -1934,29 +2044,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # The plan adapts after failure: once table candidates fail, prioritize
         # new AI addenda and page-aware text candidates over already-explored
         # layouts. Candidate memory below prevents duplicate validation work.
-        initial_candidates = ([("unsigned_running_balance_text", False), ("running_balance_text", False), ("geometry_profile", False), ("value_date_unsigned", False), ("page_text_unsigned", False), (None, False), (None, True)] if text_first
-            else [("geometry_profile", False), ("value_date_unsigned", False), ("unsigned_running_balance_text", False), ("running_balance_text", False), ("page_text_unsigned", False), (None, False), (None, True)] if large_pdf
-            else [(None, False), (None, True), ("value_date_unsigned", False), ("running_balance_text", False), ("unsigned_running_balance_text", False), ("page_text_unsigned", False)])
-        if validated_strategy in {"geometry_profile", "running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "page_text_unsigned"}:
-            initial_candidates = [(validated_strategy, False)] + [item for item in initial_candidates if item[0] != validated_strategy]
-        elif validated_strategy == "detected_table":
-            # Reuse the validated table mapping, but for a large statement run
-            # it through the sampled original-PDF geometry path first.
-            preferred = ("geometry_profile", False) if large_pdf else (None, False)
-            initial_candidates = [preferred] + [item for item in initial_candidates if item != preferred]
-        candidates = (initial_candidates if round_number == 1
-            else [(None, True), ("geometry_profile", False), ("value_date_unsigned", False), ("page_text_unsigned", False), ("unsigned_running_balance_text", False), ("running_balance_text", False), (None, False)])
-        if large_pdf:
-            # Do not spend minutes rediscovering a table across every page.
-            # Original-PDF geometry and a controlled AI addendum are the two
-            # primary paths; text candidates must first prove themselves on
-            # the representative sample below.
-            candidates = [candidate for candidate in candidates if candidate != (None, False)]
-        if planned_strategies:
-            def plan_key(candidate: tuple[str | None, bool]) -> int:
-                name = "ai_layout_addendum" if candidate[1] else (candidate[0] or "detected_table")
-                return planned_strategies.index(name) if name in planned_strategies else len(planned_strategies)
-            candidates = sorted(candidates, key=plan_key)
+        candidates = evidence_first_candidates(path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number)
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
             try:
@@ -2065,7 +2153,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # weaken validation or cause the same failed candidate to run again.
         # Calling this once rather than after each failed candidate is the
         # largest safe speed-up for long PDFs.
-        investigation = ai_diagnose_failure(diagnostic_evidence, repair_context)
+        investigation = ai_diagnose_failure(diagnostic_evidence, repair_context, path)
         diagnostic_rules.update(investigation["rules"])
         planned_strategies = investigation["strategies"]
         diagnosis_error = str(investigation.get("diagnostic_error", "") or "")
