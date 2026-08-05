@@ -301,7 +301,7 @@ ALIASES = {
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><title>Statement Normalizer</title><style>
 body{font-family:system-ui;max-width:860px;margin:50px auto;color:#172033;background:#f5f7fb}.card{background:white;padding:30px;border-radius:16px;box-shadow:0 4px 22px #1223}h1{margin-top:0}label{display:block;margin:16px 0 5px;font-weight:650}input,button{font:inherit;padding:10px}input{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:7px}button{margin-top:22px;background:#0f766e;color:white;border:0;border-radius:8px;cursor:pointer}.hint{color:#52606d}.result{margin-top:20px;padding:16px;border-radius:8px}.ok{background:#dcfce7}.fail{background:#fee2e2}.field{display:grid;grid-template-columns:1fr 1fr;gap:15px}</style></head><body><main class="card"><h1>Bank Statement Normalizer</h1><p class="hint">Upload a statement. Excel is created only after the declared balances reconcile with parsed transactions. For unfamiliar layouts, the configured AI parser generator may inspect the layout to create a profile; no export is released unless both checks pass.</p><form id="form"><label>Statement file</label><input name="file" type="file" accept=".csv,.xlsx,.xls,.txt,.pdf,.doc,.docx" required><div class="field"><div><label>Opening balance (optional fallback)</label><input name="opening" placeholder="Extracted from source when present"></div><div><label>Closing balance (optional fallback)</label><input name="closing" placeholder="Extracted from source when present"></div></div><label>PDF password (only if protected)</label><input name="password" type="password" autocomplete="off" placeholder="Used only in memory for this upload"><button>Parse and validate</button></form><section id="result"></section></main><script>
 const f=document.querySelector('#form'), r=document.querySelector('#result'), submit=f.querySelector('button');let activeJob=null,activeCancelToken=null;
-function show(d){const label=d.valid?'Validated':d.processing?'UPG is retrying':d.interrupted?'UPG job interrupted':'Not validated';r.className='result '+(d.valid?'ok':d.processing||d.interrupted?'':'fail');r.innerHTML=`<strong>${label}</strong><br>${d.message}`+(d.download?`<br><br><a href="${d.download}">Download validated Excel</a>`:'')}
+function show(d){const label=d.valid?'Validated':d.processing?'UPG is retrying':d.interrupted?'UPG job interrupted':'Not validated';const job=d.job_id?`<br><small>Job ID: ${d.job_id}</small>`:'';const diagnosis=d.investigation?`<br><small>AI diagnosis: ${d.investigation.failure_type||'investigating'}; action: ${d.investigation.profile_action||'planning addendum'}.</small>`:'';r.className='result '+(d.valid?'ok':d.processing||d.interrupted?'':'fail');r.innerHTML=`<strong>${label}</strong><br>${d.message}`+job+diagnosis+(d.download?`<br><br><a href="${d.download}">Download validated Excel</a>`:'')}
 async function poll(job){const d=await (await fetch('/status/'+job)).json();if(job!==activeJob)return;show(d);if(d.processing)setTimeout(()=>poll(job),2500);else{activeJob=null;activeCancelToken=null;submit.disabled=false;submit.textContent='Parse and validate'}}
 function cancelDirectJob(){if(!activeJob||!activeCancelToken)return;const body=JSON.stringify({job_id:activeJob,cancel_token:activeCancelToken});navigator.sendBeacon('/cancel',new Blob([body],{type:'application/json'}));}
 window.addEventListener('pagehide',cancelDirectJob);
@@ -2272,7 +2272,12 @@ class App(BaseHTTPRequestHandler):
             with JOBS_LOCK:
                 status = JOBS.get(job_id)
             if status is None: self.json({"processing": False, "interrupted": True, "valid": False, "message": "UPG was restarted while this retry job was running. The saved parser is unchanged; click Parse and validate to start a fresh job for this uploaded statement."}, 404)
-            else: self.json(status)
+            else:
+                # Copy before adding UI-only observability fields; do not
+                # mutate the durable job record on every browser poll.
+                response = dict(status)
+                response["job_id"] = job_id
+                self.json(response)
             return
         if path.startswith("/download/"):
             file=EXPORTS / Path(path).name
