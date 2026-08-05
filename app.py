@@ -820,6 +820,21 @@ def ai_choose_text_strategy(raw: str) -> str | None:
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
         return None
 
+def safe_openai_error(error: Exception) -> str:
+    """Expose actionable provider diagnostics without exposing keys or source text."""
+    if isinstance(error, urllib.error.HTTPError):
+        message = ""
+        try:
+            body = json.loads(error.read().decode("utf-8", errors="replace"))
+            message = str(body.get("error", {}).get("message", ""))
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        message = re.sub(r"\s+", " ", message).strip()[:220]
+        return f"OpenAI HTTP {error.code}" + (f": {message}" if message else ".")
+    if isinstance(error, urllib.error.URLError):
+        return f"OpenAI network error: {type(error.reason).__name__}."
+    return f"OpenAI response error: {type(error).__name__}."
+
 def ai_diagnose_failure(raw: str, failure: str) -> dict[str, object]:
     """Create a privacy-safe expert investigation plan for the next retry.
 
@@ -853,7 +868,7 @@ def ai_diagnose_failure(raw: str, failure: str) -> dict[str, object]:
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError) as error:
         # Keep only a short, non-sensitive diagnostic.  This lets the retry
         # loop distinguish an AI/API failure from a genuine but empty plan.
-        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum", "diagnostic_error": f"AI diagnosis unavailable: {type(error).__name__}."}
+        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum", "diagnostic_error": "AI diagnosis unavailable: " + safe_openai_error(error)}
 
 def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
     def find(kind):
