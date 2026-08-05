@@ -66,6 +66,14 @@ try:
     WORKER_CAPACITY = min(4, max(1, int(os.environ.get("UPG_WORKERS", "1"))))
 except ValueError:
     WORKER_CAPACITY = 1
+try:
+    # A parser must keep retrying until it validates, but no single difficult
+    # statement may occupy a multi-tenant worker forever.  One full retry
+    # round per lease gives every queued tenant a fair turn; the job resumes
+    # automatically from its persisted investigation state.
+    WORKER_LEASE_ROUNDS = min(3, max(1, int(os.environ.get("UPG_WORKER_LEASE_ROUNDS", "1"))))
+except ValueError:
+    WORKER_LEASE_ROUNDS = 1
 JOB_EXECUTOR = ThreadPoolExecutor(max_workers=WORKER_CAPACITY, thread_name_prefix="upg-parser")
 ACTIVE_JOB_IDS: set[str] = set()
 # Per-upload, in-memory evidence cache. This speeds candidate retries without
@@ -1681,20 +1689,24 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     touch_worker(job_id, processing=True, valid=False, status="processing",
                  started_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
                  message="UPG worker acquired the job and is preparing parser candidates.")
-    round_number = 0
-    failed_candidates: set[str] = set()
-    attempted_candidates = 0
-    skipped_candidates = 0
+    with JOBS_LOCK:
+        saved_state = dict(JOBS.get(job_id, {}))
+    round_number = int(saved_state.get("retry_round", 0) or 0)
+    failed_candidates: set[str] = {str(item) for item in saved_state.get("failed_candidates", [])}
+    attempted_candidates = int(saved_state.get("attempted_candidates", 0) or 0)
+    skipped_candidates = int(saved_state.get("skipped_candidates", 0) or 0)
     validated_strategy = saved_text_strategy(path)
     large_pdf = is_large_pdf(path)
     # A sampled original-PDF geometry profile is stronger than text order.
     # Use it first whenever it exists, including for borderless statements.
     geometry_ready = large_pdf and sampled_geometry_profile(path) is not None
     text_first = large_pdf and not geometry_ready and prefers_running_balance_text(path)
-    diagnostic_rules: set[str] = set()
-    planned_strategies: list[str] = []
+    diagnostic_rules: set[str] = {str(item) for item in saved_state.get("diagnostic_rules", [])}
+    planned_strategies: list[str] = [str(item) for item in saved_state.get("planned_strategies", [])]
+    rounds_this_lease = 0
     while True:
         round_number += 1
+        rounds_this_lease += 1
         # Keep API clients informed before starting expensive PDF work.
         with JOBS_LOCK:
             job = JOBS.get(job_id, {})
@@ -1843,12 +1855,28 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         planned_strategies = investigation["strategies"]
         if investigation["rules"] or planned_strategies:
             detail += " UPG recorded a new layout investigation plan for the next round."
+        yield_to_queue = rounds_this_lease >= WORKER_LEASE_ROUNDS
         with JOBS_LOCK:
             job = JOBS.get(job_id, {})
-            job.update({"processing": True, "valid": False, "status": "processing", "message": detail, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
+            job.update({"processing": True, "valid": False,
+                        "status": "queued" if yield_to_queue else "processing",
+                        "message": (f"UPG completed retry round {round_number} and yielded its worker fairly; "
+                                    "it will continue automatically after other queued statements receive a turn."
+                                    if yield_to_queue else detail),
+                        "retry_round": round_number, "attempted_candidates": attempted_candidates,
+                        "skipped_candidates": skipped_candidates,
+                        "failed_candidates": sorted(failed_candidates),
+                        "diagnostic_rules": sorted(diagnostic_rules),
+                        "planned_strategies": planned_strategies})
             job["worker_heartbeat_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             JOBS[job_id] = job
             persist_job_locked(job_id)
+        if yield_to_queue:
+            # Place this still-unvalidated job at the end of the FIFO queue.
+            # Its persisted candidate memory prevents it from repeating old
+            # failures when its next fair worker lease begins.
+            submit_retry_job(job_id, path, fallback_open, fallback_close)
+            return
         # Do not terminate on a failed validation. This pause avoids a busy loop
         # while allowing a long-running UPG job to continue beyond five minutes.
         time.sleep(8)
