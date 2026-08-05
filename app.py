@@ -1508,7 +1508,11 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
                         continue
                     if known_header and len(row) == len(known_header): merged.append(row)
     if not merged:
-        strategy = strategy_override or ai_choose_text_strategy(raw, job_id)
+        # A queued UPG job already completed a measured preflight plan. Do not
+        # spend a second AI call merely to classify the same source text again;
+        # the deterministic text fallback below remains a candidate and the
+        # reserved expert calls can instead diagnose and repair a real failure.
+        strategy = strategy_override or (None if job_id else ai_choose_text_strategy(raw))
         if strategy == "running_balance_text":
             merged = extract_text_layout_rows(raw)
         elif strategy == "unsigned_running_balance_text":
@@ -2566,6 +2570,11 @@ class App(BaseHTTPRequestHandler):
                 # Copy before adding UI-only observability fields; do not
                 # mutate the durable job record on every browser poll.
                 response = dict(status)
+                # The public browser polling endpoint must never disclose the
+                # one-time cancellation credential or upload/account inputs.
+                # Those remain available only to the server-side job worker.
+                for private_key in ("cancel_token", "source_file", "fallback_open", "fallback_close", "password_provided"):
+                    response.pop(private_key, None)
                 response["job_id"] = job_id
                 self.json(response)
             return
