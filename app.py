@@ -1769,6 +1769,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         saved_state = dict(JOBS.get(job_id, {}))
     round_number = int(saved_state.get("retry_round", 0) or 0)
     failed_candidates: set[str] = {str(item) for item in saved_state.get("failed_candidates", [])}
+    # Deterministic strategies (geometry/text modes) must never be re-run once
+    # they have already failed this exact job.  The older signature-only memory
+    # was recorded *after* a costly extraction, which made a job appear to
+    # retry seven times while doing the same work repeatedly.
+    failed_strategy_keys: set[str] = {str(item) for item in saved_state.get("failed_strategy_keys", [])}
     attempted_candidates = int(saved_state.get("attempted_candidates", 0) or 0)
     skipped_candidates = int(saved_state.get("skipped_candidates", 0) or 0)
     validated_strategy = saved_text_strategy(path)
@@ -1851,8 +1856,14 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     clear_pdf_password(path)
                     return
                 candidate_name = "AI layout addendum" if force_ai_profile else (strategy or "detected transaction table")
+                strategy_key = f"{strategy or 'detected_table'}:{'ai' if force_ai_profile else 'deterministic'}"
+                if not force_ai_profile and strategy_key in failed_strategy_keys:
+                    skipped_candidates += 1
+                    errors.append(f"{candidate_name}: already failed for this statement")
+                    continue
                 if large_pdf and not force_ai_profile and not sample_candidate_plausible(path, strategy):
                     skipped_candidates += 1
+                    failed_strategy_keys.add(strategy_key)
                     errors.append(f"{candidate_name}: rejected by sampled original-PDF structure")
                     continue
                 with JOBS_LOCK:
@@ -1915,6 +1926,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     clear_pdf_password(path)
                     return
                 failed_candidates.add(signature)
+                if not force_ai_profile:
+                    failed_strategy_keys.add(strategy_key)
                 repair_context = (f"UPG self-healing round {round_number}: candidate extracted {len(candidate[0])} of "
                     f"{candidate[13]} source records; source coverage={'PASS' if candidate[12] else 'FAIL'}, "
                     f"financial={'PASS' if candidate[6] else 'FAIL'}, narration={'PASS' if candidate[7] else 'FAIL'}. "
@@ -1957,6 +1970,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         "retry_round": round_number, "attempted_candidates": attempted_candidates,
                         "skipped_candidates": skipped_candidates,
                         "failed_candidates": sorted(failed_candidates),
+                        "failed_strategy_keys": sorted(failed_strategy_keys),
                         "diagnostic_rules": sorted(diagnostic_rules),
                         "planned_strategies": planned_strategies})
             job["worker_heartbeat_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
