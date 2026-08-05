@@ -253,6 +253,10 @@ DIAGNOSTIC_RULE_LIBRARY = {
 }
 PARSER_GENERATOR_POLICY = """
 Bank statement extraction policy:
+- Transaction output is a strict six-field whitelist only: Date, Particulars/Narration, Withdrawal, Deposit, Instrument/Cheque Number, and Running/Closing Balance. A parser profile may map only these fields; every other PDF object is non-transaction evidence unless it directly proves one of the six fields.
+- Treat a column headed Closing Balance, Balance, Available Balance, or Running Balance as the transaction running-balance field only when it is aligned with a dated transaction row. A statement-level Closing Balance label is endpoint evidence, never a transaction row.
+- Ignore logos, seals, images, QR codes, coloured banners, decorative lines, account-holder/address blocks, bank/branch contact information, page numbers, generated-on stamps, signatures, legal notices, repeated headings, and empty visual cells. Images and logos are never narration or an instrument number.
+- Particulars/Narration is source text from its own transaction cell only. Do not fill it using numbers, balances, dates, bank names, logos, headers, or nearby furniture. Keep it blank if the actual particulars cell is blank.
 - Use the original PDF's word coordinates, column x-ranges, and row y-ranges as the primary evidence for creating and reusing a parser profile. Use extracted text only to join narration continuations, provide validation evidence, or as a fallback when usable PDF geometry is absent.
 - B/F, opening balance, and brought-forward entries are statement metadata, never transactions.
 - A row without a valid transaction date is statement furniture, a page/transaction total, or a balance label; never treat it as a transaction merely because it contains amounts.
@@ -709,9 +713,9 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     }
     geometry = sampled_pdf_geometry_evidence(source_path) if source_path and source_path.suffix.lower() == ".pdf" else []
     evidence = {"rows": rows[:35], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context}
-    instruction = (PARSER_GENERATOR_POLICY + "\nYou are a bank-statement parser generator and controlled self-healing planner. Identify one transaction-table header row and map "
+    instruction = (PARSER_GENERATOR_POLICY + "\nYou are a bank-statement parser generator and controlled self-healing planner. First discard PDF furniture and non-transaction visual/text objects. Identify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
-        "and balance. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
+        "and balance. These are the only allowed transaction outputs. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
     )
     payload = {
         "model": AI_MODEL,
