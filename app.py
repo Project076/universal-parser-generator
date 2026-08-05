@@ -1910,6 +1910,17 @@ def submit_retry_job(job_id: str, path: Path, fallback_open: str, fallback_close
               message="UPG job is queued for a parser-engine worker.")
     with JOBS_LOCK:
         refresh_queue_positions_locked()
+        job = JOBS.get(job_id, {})
+        position = int(job.get("queue_position", 0) or 0)
+        depth = int(job.get("queue_depth", 0) or 0)
+        retry_round = int(job.get("retry_round", 0) or 0)
+        job["message"] = (
+            f"UPG is waiting for its next fair worker turn: position {position} of {depth}. "
+            + (f"It has safely completed {retry_round} retry round(s) and will continue automatically."
+               if retry_round else "Parser generation will start automatically when a worker is free.")
+        )
+        JOBS[job_id] = job
+        persist_job_locked(job_id)
     JOB_EXECUTOR.submit(run_retry_job, job_id, path, fallback_open, fallback_close)
 
 def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = "", fallback_close: str = "") -> dict:
