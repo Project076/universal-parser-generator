@@ -287,6 +287,22 @@ Bank statement extraction policy:
 - On every failed candidate, act as an evidence-led expert: classify the root cause (geometry, headers, date order, continuation, furniture, balance direction, endpoints, totals, narration, count, or novel layout), choose a materially different safe addendum action, and remember only that non-sensitive investigation result. Never retry a deterministic strategy that already failed the same statement.
 - For long PDFs, create or repair a layout profile from a representative sample: first seven pages, seven pages centered around the middle, and last seven pages, plus adjacent boundary pages so transactions split across sampled-page edges remain visible. Apply the resulting candidate to the complete statement and validate the whole source before learning or export.
 """
+# Historical lessons captured from previously resolved statement layouts.  This
+# is deliberately generic: it teaches recognition and safe handling, never
+# any customer's statement text, balances, account numbers, or transactions.
+HISTORICAL_CHALLENGE_LESSONS = [
+    "B/F, opening balance, brought-forward, page total, and grand total are metadata, never transactions.",
+    "A blank source Particulars remains blank; an amount, instrument number, balance, or nearby furniture must never fill it.",
+    "Page headers, addresses, branch/account blocks, logos, QR codes, legal notes, print stamps, and repeated titles are furniture even when they sit between two parts of a transaction.",
+    "A transaction may continue over a page boundary. Remove intervening furniture, then merge only source-proven narration/amount/balance fragments into the same dated transaction.",
+    "Use the original PDF geometry for layout decisions. For large PDFs, use first/middle/last samples with boundary pages to design the profile, then parse and validate all pages.",
+    "Statements may run newest-to-oldest. Detect direction before calculating endpoints or balance chains; reverse the chain logic only when source balances prove it.",
+    "With a single unsigned amount column, determine withdrawal/deposit from signed running-balance movement, not from references or arbitrary numeric text.",
+    "When the source running-balance column is demonstrably unreliable, do not use it as ordinary evidence. Use the narrowly defined printed-totals exception only with exact totals, source coverage, count, narration checks, assumed endpoints, and a manual-review warning.",
+    "Printed debit/credit summary totals can be wrong. They are an additional warning unless the unreliable-balance exception requires exact source-total equality; never change parsed rows merely to match a summary.",
+    "A correct financial endpoint alone is insufficient. Require one-to-one narration/source coverage, transaction count, and a complete balance chain whenever the source balance is reliable.",
+    "Do not re-run a failed deterministic strategy. A repair must change a source-proven layout mapping or select a different supported strategy.",
+]
 ALIASES = {
     "date": ["date", "transaction date", "txn date", "value date"],
     "narration": ["narration", "particular", "particulars", "description", "remarks", "details"],
@@ -563,6 +579,13 @@ def certified_learning_context(limit: int = 16) -> list[dict[str, object]]:
         })
     return lessons
 
+def ai_learning_packet() -> dict[str, object]:
+    """The complete non-sensitive knowledge supplied to UPG's AI workers."""
+    return {
+        "permanent_historical_lessons": HISTORICAL_CHALLENGE_LESSONS,
+        "certified_profile_lessons": certified_learning_context(),
+    }
+
 def find_related_profile(headers: list[object]) -> tuple[str | None, dict[str, int]]:
     """Find a near-match without changing the original validated profile."""
     if generated_canonical_headers(headers): return None, {}
@@ -746,7 +769,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     }
     geometry = sampled_pdf_geometry_evidence(source_path) if source_path and source_path.suffix.lower() == ".pdf" else []
     evidence = {"rows": rows[:35], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context,
-                "certified_parser_lessons": certified_learning_context()}
+                "upg_learning": ai_learning_packet()}
     instruction = (PARSER_GENERATOR_POLICY + "\nYou are a bank-statement parser generator and controlled self-healing planner. First discard PDF furniture and non-transaction visual/text objects. Identify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
         "and balance. These are the only allowed transaction outputs. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
@@ -785,7 +808,7 @@ def ai_choose_text_strategy(raw: str) -> str | None:
     payload = {
         "model": AI_MODEL,
         "input": (PARSER_GENERATOR_POLICY + "\nClassify this bank statement layout. Choose running_balance_text when dated entries have Dr/Cr running balances. Choose unsigned_running_balance_text when dated entries have unsigned running balances whose changes can infer debit or credit; choose "
-            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported. Learn only from the supplied certified parser lessons; they are reusable layout patterns, not proof that this statement has the same values.\nCertified parser lessons: " + json.dumps(certified_learning_context()) + "\n\n" + raw[:50000]
+            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported. Learn only from the supplied UPG learning packet; it provides reusable layout patterns and historical failure lessons, not proof that this statement has the same values.\nUPG learning: " + json.dumps(ai_learning_packet()) + "\n\n" + raw[:50000]
         ),
         "text": {"format": {"type": "json_schema", "name": "extraction_strategy", "strict": True, "schema": schema}},
     }
@@ -813,7 +836,7 @@ def ai_diagnose_failure(raw: str, failure: str) -> dict[str, object]:
         "failure_type": {"type": "string", "enum": ["column_geometry", "header_mapping", "date_order", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "novel_layout"]},
         "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "ai_addendum", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
-    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Diagnose the root cause from the source sample and failed validation evidence, then select one safe parser-profile action and a priority order of already-supported candidate strategies. Use certified parser lessons to recognize layouts and avoid known mistakes, but never copy values or accept a candidate without this statement passing all gates. A later generator will receive your diagnosis to create a materially different addendum. Do not write executable code, invent transactions, expose source data, replace source amounts, or weaken validation. If evidence is insufficient, choose novel_layout + ai_addendum; do not pretend a failed mapping is valid.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nCertified parser lessons: " + json.dumps(certified_learning_context()) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
+    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Diagnose the root cause from the source sample and failed validation evidence, then select one safe parser-profile action and a priority order of already-supported candidate strategies. Use the UPG learning packet to recognize layouts and avoid known mistakes, but never copy values or accept a candidate without this statement passing all gates. A later generator will receive your diagnosis to create a materially different addendum. Do not write executable code, invent transactions, expose source data, replace source amounts, or weaken validation. If evidence is insufficient, choose novel_layout + ai_addendum; do not pretend a failed mapping is valid.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(ai_learning_packet()) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
     payload = {"model": AI_MODEL, "input": prompt, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
