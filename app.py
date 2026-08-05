@@ -124,6 +124,38 @@ def patch_job(job_id: str, **changes: object) -> dict:
         persist_job_locked(job_id)
         return job
 
+def reserve_ai_call(job_id: str | None, purpose: str) -> bool:
+    """Reserve one bounded expert-AI decision for a parser job.
+
+    Deterministic extraction, cached certified profiles and validation never
+    consume this allowance.  This only prevents an unfamiliar layout from
+    repeatedly sending the same source evidence to the model during retries.
+    """
+    if not job_id:
+        return True
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return False
+        used = int(job.get("ai_calls", 0) or 0)
+        if used >= MAX_AI_CALLS_PER_JOB:
+            job.update({
+                "ai_budget_exhausted": True,
+                "ai_budget_message": (
+                    f"UPG used its {MAX_AI_CALLS_PER_JOB} evidence-led AI decisions for this job. "
+                    "It will not repeat AI calls without new source evidence."
+                ),
+            })
+            JOBS[job_id] = job
+            persist_job_locked(job_id)
+            return False
+        history = [str(item) for item in job.get("ai_call_purposes", [])][-5:]
+        history.append(purpose)
+        job.update({"ai_calls": used + 1, "ai_call_purposes": history})
+        JOBS[job_id] = job
+        persist_job_locked(job_id)
+        return True
+
 def queue_snapshot_locked() -> tuple[int, int]:
     """Return this job's FIFO position and the total queued depth.
 
@@ -235,6 +267,13 @@ def queue_supervisor() -> None:
 CANONICAL = ["date", "narration", "withdrawal", "deposit", "instrument_number", "balance"]
 FIVE_MINUTES_MS = 300000
 AI_MODEL = "gpt-5.6-sol"
+try:
+    # Four decisions preserve an expert plan → build → diagnose → material
+    # repair workflow, without allowing a difficult PDF to make dozens of
+    # repeated API calls. Railway can explicitly tune this between 2 and 6.
+    MAX_AI_CALLS_PER_JOB = min(6, max(2, int(os.environ.get("UPG_MAX_AI_CALLS_PER_JOB", "4"))))
+except ValueError:
+    MAX_AI_CALLS_PER_JOB = 4
 DIAGNOSTIC_RULE_LIBRARY = {
     "value_date": "Use Value Date as the output date when both posting and value dates exist.",
     "dual_date_running_balance": "For layouts with both posting and Value Date, begin records only at the posting-date column but export the Value Date and infer amounts from running-balance changes.",
@@ -548,7 +587,7 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     LEARNING_LEDGER.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     return ident
 
-def certified_learning_context(limit: int = 16) -> list[dict[str, object]]:
+def certified_learning_context(limit: int = 8) -> list[dict[str, object]]:
     """Return compact, privacy-safe lessons from certified profiles for AI planning.
 
     This intentionally excludes statement text, account values, narration, and
@@ -880,10 +919,12 @@ def sampled_page_indices(count: int) -> list[int]:
     last = set(range(max(0, count - 8), count))
     return sorted(first | middle_window | last)
 
-def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str = "", source_path: Path | None = None) -> tuple[int, dict[str, int]] | None:
+def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str = "", source_path: Path | None = None, job_id: str | None = None) -> tuple[int, dict[str, int]] | None:
     """Ask the embedded parser-generator AI for a new table layout, not transactions."""
     key = os.environ.get("OPENAI_API_KEY")
     if not key: return None
+    if not reserve_ai_call(job_id, "layout_blueprint"):
+        return None
     schema = {
         "type": "object", "additionalProperties": False,
         "properties": {
@@ -924,10 +965,12 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
         return None
 
-def ai_choose_text_strategy(raw: str) -> str | None:
+def ai_choose_text_strategy(raw: str, job_id: str | None = None) -> str | None:
     """Let the parser-generator select a supported extraction path for a new layout."""
     key = os.environ.get("OPENAI_API_KEY")
     if not key: return None
+    if not reserve_ai_call(job_id, "strategy_classification"):
+        return None
     schema = {
         "type": "object", "additionalProperties": False,
         "properties": {"strategy": {"type": "string", "enum": ["running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "needs_ocr", "unsupported"]}},
@@ -936,7 +979,7 @@ def ai_choose_text_strategy(raw: str) -> str | None:
     payload = {
         "model": AI_MODEL,
         "input": (PARSER_GENERATOR_POLICY + "\nClassify this bank statement layout. Choose running_balance_text when dated entries have Dr/Cr running balances. Choose unsigned_running_balance_text when dated entries have unsigned running balances whose changes can infer debit or credit; choose "
-            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported. Learn only from the supplied UPG learning packet; it provides reusable layout patterns and historical failure lessons, not proof that this statement has the same values.\nUPG learning: " + json.dumps(ai_learning_packet()) + "\n\n" + raw[:50000]
+            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported. Learn only from the supplied UPG learning packet; it provides reusable layout patterns and historical failure lessons, not proof that this statement has the same values.\nUPG learning: " + json.dumps(ai_learning_packet()) + "\n\n" + raw[:12000]
         ),
         "text": {"format": {"type": "json_schema", "name": "extraction_strategy", "strict": True, "schema": schema}},
     }
@@ -963,7 +1006,7 @@ def safe_openai_error(error: Exception) -> str:
         return f"OpenAI network error: {type(error.reason).__name__}."
     return f"OpenAI response error: {type(error).__name__}."
 
-def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None) -> dict[str, object]:
+def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None, job_id: str | None = None) -> dict[str, object]:
     """Create a privacy-safe expert investigation plan for the next retry.
 
     The model may choose a diagnosis and a parser-profile action, but never
@@ -972,6 +1015,8 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None)
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum", "diagnostic_error": "AI diagnosis unavailable: OPENAI_API_KEY is not configured."}
+    if not reserve_ai_call(job_id, "failure_diagnosis"):
+        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI call budget reached for this job; no new evidence-led repair remains."}
     safe_strategies = ["geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table", "ai_layout_addendum"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "rules": {"type": "array", "items": {"type": "string", "enum": list(DIAGNOSTIC_RULE_LIBRARY)}, "maxItems": 5},
@@ -979,7 +1024,7 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None)
         "failure_type": {"type": "string", "enum": ["column_geometry", "header_mapping", "date_order", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "novel_layout"]},
         "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "ai_addendum", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
-    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Diagnose the root cause from the source sample and failed validation evidence, then select one safe parser-profile action and a priority order of already-supported candidate strategies. First compare this statement against the closest certified layouts in the UPG learning packet; identify what changed before proposing an addendum. Use the learning packet to recognize layouts and avoid known mistakes, but never copy values or accept a candidate without this statement passing all gates. A later generator will receive your diagnosis to create a materially different addendum. Do not write executable code, invent transactions, expose source data, replace source amounts, or weaken validation. If evidence is insufficient, choose novel_layout + ai_addendum; do not pretend a failed mapping is valid.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(ai_learning_packet(source_path)) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
+    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Diagnose the root cause from the source sample and failed validation evidence, then select one safe parser-profile action and a priority order of already-supported candidate strategies. First compare this statement against the closest certified layouts in the UPG learning packet; identify what changed before proposing an addendum. Use the learning packet to recognize layouts and avoid known mistakes, but never copy values or accept a candidate without this statement passing all gates. A later generator will receive your diagnosis to create a materially different addendum. Do not write executable code, invent transactions, expose source data, replace source amounts, or weaken validation. If evidence is insufficient, choose novel_layout + ai_addendum; do not pretend a failed mapping is valid.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(ai_learning_packet(source_path)) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:8000]
     payload = {"model": AI_MODEL, "input": prompt, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
@@ -1412,7 +1457,7 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
     except Exception:
         return False
 
-def extract_pdf_rows(path: Path, strategy_override: str | None = None) -> tuple[list[list[object]], str]:
+def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: str | None = None) -> tuple[list[list[object]], str]:
     raw = remove_page_furniture(cached_pdf_text(path))
     dual_date_time_layout = bool(re.search(r"\d{2}-[A-Za-z]{3}-\d{4}[\s\S]{0,180}\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", raw))
     merged: list[list[object]] = []
@@ -1463,7 +1508,7 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None) -> tuple[
                         continue
                     if known_header and len(row) == len(known_header): merged.append(row)
     if not merged:
-        strategy = strategy_override or ai_choose_text_strategy(raw)
+        strategy = strategy_override or ai_choose_text_strategy(raw, job_id)
         if strategy == "running_balance_text":
             merged = extract_text_layout_rows(raw)
         elif strategy == "unsigned_running_balance_text":
@@ -1602,7 +1647,7 @@ def extract_text_layout_rows(raw: str, unsigned_balance: bool = False, use_value
         previous_balance = balance
     return rows if len(rows) > 1 else []
 
-def load_rows(path: Path, strategy_override: str | None = None) -> tuple[list[list[object]], str]:
+def load_rows(path: Path, strategy_override: str | None = None, job_id: str | None = None) -> tuple[list[list[object]], str]:
     cache_key = (str(path.resolve()), strategy_override or "detected_table")
     with EXTRACTION_CACHE_LOCK:
         cached = EXTRACTION_CACHE.get(cache_key)
@@ -1621,7 +1666,7 @@ def load_rows(path: Path, strategy_override: str | None = None) -> tuple[list[li
         raw = path.read_text(encoding="utf-8", errors="replace")
         dialect = csv.excel_tab if "\t" in raw.splitlines()[0] else csv.excel
         result = list(csv.reader(io.StringIO(raw), dialect=dialect)), raw
-    elif ext == ".pdf": result = extract_pdf_rows(path, strategy_override)
+    elif ext == ".pdf": result = extract_pdf_rows(path, strategy_override, job_id)
     else: raise ValueError("This file needs a document-text extraction profile before it can be parsed.")
     with EXTRACTION_CACHE_LOCK:
         # Keep only recent upload evidence; validated learning remains separate
@@ -1671,17 +1716,17 @@ def reconstruct_unordered_balance_chain(transactions: list[dict], opening: Decim
         return None
     return ordered
 
-def parse_statement(path: Path, fallback_open: str, fallback_close: str, strategy_override: str | None = None, force_ai_profile: bool = False, repair_context: str = ""):
+def parse_statement(path: Path, fallback_open: str, fallback_close: str, strategy_override: str | None = None, force_ai_profile: bool = False, repair_context: str = "", job_id: str | None = None):
     if path.suffix.lower() == ".pdf":
         source_text = remove_page_furniture(cached_pdf_text(path))
         if len(re.sub(r"\W", "", source_text)) < 80:
             raise ValueError("OCR_REQUIRED: This PDF is image-only and has no reliable machine-readable transaction text. OCR must recover the source before any parser can be validated.")
-    rows, raw = load_rows(path, strategy_override)
+    rows, raw = load_rows(path, strategy_override, job_id)
     if not rows: raise ValueError("The statement contains no readable rows.")
     header_at = next((i for i, row in enumerate(rows[:20]) if len(map_headers(row)) >= 3), None)
     ai_columns = None
     if header_at is None or force_ai_profile:
-        generated = ai_generated_profile(rows, raw, repair_context, path)
+        generated = ai_generated_profile(rows, raw, repair_context, path, job_id)
         if generated:
             header_at, ai_columns = generated
         elif header_at is None:
@@ -2127,7 +2172,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     })
                     JOBS[job_id] = job
                     persist_job_locked(job_id)
-                candidate = parse_statement(path, fallback_open, fallback_close, strategy, force_ai_profile, repair_context)
+                candidate = parse_statement(path, fallback_open, fallback_close, strategy, force_ai_profile, repair_context, job_id)
                 if job_cancel_requested(job_id):
                     patch_job(job_id, processing=False, valid=False, status="cancelled",
                               message="UPG job was cancelled safely after the current extraction step.")
@@ -2202,7 +2247,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # weaken validation or cause the same failed candidate to run again.
         # Calling this once rather than after each failed candidate is the
         # largest safe speed-up for long PDFs.
-        investigation = ai_diagnose_failure(diagnostic_evidence, repair_context, path)
+        investigation = ai_diagnose_failure(diagnostic_evidence, repair_context, path, job_id)
         diagnostic_rules.update(investigation["rules"])
         planned_strategies = investigation["strategies"]
         diagnosis_error = str(investigation.get("diagnostic_error", "") or "")
