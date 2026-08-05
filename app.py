@@ -511,7 +511,7 @@ def certified_javascript_code(headers: list[object], strategy: str | None) -> tu
 }"""
     return detection, parser
 
-def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement") -> str:
+def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None) -> str:
     """Persist only validated, privacy-safe layout learning; never source rows."""
     if generated_canonical_headers(headers) and not layout_fingerprint: return ""
     ident = profile_id(headers, layout_fingerprint)
@@ -520,15 +520,48 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     except (OSError, ValueError): prior = {}
     observations = int(prior.get("validated_observations", 0)) + 1
     detection_code, parser_code = certified_javascript_code(headers, strategy)
-    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
+    challenges = sorted({str(item) for item in (challenge_history or []) if str(item) and str(item) != "none"})
+    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
     try: ledger = json.loads(LEARNING_LEDGER.read_text(encoding="utf-8"))
     except (OSError, ValueError): ledger = {"validated_profiles": {}}
-    ledger.setdefault("validated_profiles", {})[ident] = {"observations": observations, "strategy": data["last_validated_strategy"], "self_healed_addendum": data["self_healed_addendum"], "diagnostic_rules": data["diagnostic_rules"], "parent_profile": parent_profile}
+    ledger.setdefault("validated_profiles", {})[ident] = {"observations": observations, "strategy": data["last_validated_strategy"], "self_healed_addendum": data["self_healed_addendum"], "diagnostic_rules": data["diagnostic_rules"], "challenge_history": challenges, "parent_profile": parent_profile}
     LEARNING_LEDGER.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     return ident
+
+def certified_learning_context(limit: int = 16) -> list[dict[str, object]]:
+    """Return compact, privacy-safe lessons from certified profiles for AI planning.
+
+    This intentionally excludes statement text, account values, narration, and
+    transaction rows.  It carries only reusable layout/validation knowledge.
+    """
+    try:
+        ledger = json.loads(LEARNING_LEDGER.read_text(encoding="utf-8"))
+        learned = ledger.get("validated_profiles", {})
+    except (OSError, ValueError):
+        return []
+    lessons: list[dict[str, object]] = []
+    ranked = sorted(learned.items(), key=lambda item: int(item[1].get("observations", 0) or 0), reverse=True)
+    for ident, summary in ranked[:limit]:
+        try:
+            profile = json.loads((PROFILES / f"{ident}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        validation = profile.get("validation", {}) if isinstance(profile.get("validation"), dict) else {}
+        lessons.append({
+            "profile_id": ident,
+            "observations": int(summary.get("observations", 0) or 0),
+            "strategy": str(profile.get("last_validated_strategy", summary.get("strategy", "detected_table"))),
+            "headers": [str(header)[:80] for header in profile.get("header_signature", [])[:12]],
+            "mapped_fields": sorted(name for name in profile.get("columns", {}) if name in CANONICAL),
+            "challenge_history": list(profile.get("challenge_history", summary.get("challenge_history", [])))[:8],
+            "diagnostic_rules": list(profile.get("diagnostic_rules", summary.get("diagnostic_rules", [])))[:8],
+            "balance_chain_exception": bool(validation.get("balance_chain_exception", False)),
+            "self_healed_addendum": bool(profile.get("self_healed_addendum", False)),
+        })
+    return lessons
 
 def find_related_profile(headers: list[object]) -> tuple[str | None, dict[str, int]]:
     """Find a near-match without changing the original validated profile."""
@@ -712,7 +745,8 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
         }, "required": ["header_row", "columns"],
     }
     geometry = sampled_pdf_geometry_evidence(source_path) if source_path and source_path.suffix.lower() == ".pdf" else []
-    evidence = {"rows": rows[:35], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context}
+    evidence = {"rows": rows[:35], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context,
+                "certified_parser_lessons": certified_learning_context()}
     instruction = (PARSER_GENERATOR_POLICY + "\nYou are a bank-statement parser generator and controlled self-healing planner. First discard PDF furniture and non-transaction visual/text objects. Identify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
         "and balance. These are the only allowed transaction outputs. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
@@ -751,7 +785,7 @@ def ai_choose_text_strategy(raw: str) -> str | None:
     payload = {
         "model": AI_MODEL,
         "input": (PARSER_GENERATOR_POLICY + "\nClassify this bank statement layout. Choose running_balance_text when dated entries have Dr/Cr running balances. Choose unsigned_running_balance_text when dated entries have unsigned running balances whose changes can infer debit or credit; choose "
-            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported.\n\n" + raw[:50000]
+            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported. Learn only from the supplied certified parser lessons; they are reusable layout patterns, not proof that this statement has the same values.\nCertified parser lessons: " + json.dumps(certified_learning_context()) + "\n\n" + raw[:50000]
         ),
         "text": {"format": {"type": "json_schema", "name": "extraction_strategy", "strict": True, "schema": schema}},
     }
@@ -779,7 +813,7 @@ def ai_diagnose_failure(raw: str, failure: str) -> dict[str, object]:
         "failure_type": {"type": "string", "enum": ["column_geometry", "header_mapping", "date_order", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "novel_layout"]},
         "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "ai_addendum", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
-    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Diagnose the root cause from the source sample and failed validation evidence, then select one safe parser-profile action and a priority order of already-supported candidate strategies. A later generator will receive your diagnosis to create a materially different addendum. Do not write executable code, invent transactions, expose source data, replace source amounts, or weaken validation. If evidence is insufficient, choose novel_layout + ai_addendum; do not pretend a failed mapping is valid.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
+    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Diagnose the root cause from the source sample and failed validation evidence, then select one safe parser-profile action and a priority order of already-supported candidate strategies. Use certified parser lessons to recognize layouts and avoid known mistakes, but never copy values or accept a candidate without this statement passing all gates. A later generator will receive your diagnosis to create a materially different addendum. Do not write executable code, invent transactions, expose source data, replace source amounts, or weaken validation. If evidence is insufficient, choose novel_layout + ai_addendum; do not pretend a failed mapping is valid.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nCertified parser lessons: " + json.dumps(certified_learning_context()) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
     payload = {"model": AI_MODEL, "input": prompt, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
@@ -1953,6 +1987,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         },
                         bank_name=str(job_context.get("bank_name") or "Unknown"),
                         format_name=f"{path.suffix.lower().lstrip('.') or 'pdf'} statement".upper(),
+                        challenge_history=sorted(diagnostic_rules | {str(prior_investigation.get("failure_type", ""))}),
                     )
                     name = export_excel(tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_wd, declared_dp, statement_totals_valid, bool(columns.get("_source_balance_unreliable")))
                     with JOBS_LOCK:
