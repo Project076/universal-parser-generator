@@ -57,13 +57,17 @@ if DATA_ROOT != ROOT:
 
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.RLock()
-# Heavy PDF work is deliberately bounded. Extra requests remain queued instead
-# of starting dozens of competing OCR/PDF/AI jobs in a single Railway process.
-# A full geometry parse of a 200+ page PDF is memory-intensive. One worker is
-# the safe Railway default on a 1 GB container; additional requests remain
-# durably queued rather than causing an out-of-memory restart. Larger worker
-# fleets can opt in explicitly with UPG_WORKERS after being independently sized.
-JOB_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("UPG_WORKERS", "1"))))
+# Heavy PDF work is deliberately bounded.  The service accepts many requests
+# immediately, but only a sized number may run in this container at once.
+# Railway's 1 GB starter container must remain at one worker.  A larger service
+# can opt in to 2-4 workers with UPG_WORKERS; we cap the value to avoid a typo
+# turning 30 simultaneous uploads into an out-of-memory restart.
+try:
+    WORKER_CAPACITY = min(4, max(1, int(os.environ.get("UPG_WORKERS", "1"))))
+except ValueError:
+    WORKER_CAPACITY = 1
+JOB_EXECUTOR = ThreadPoolExecutor(max_workers=WORKER_CAPACITY, thread_name_prefix="upg-parser")
+ACTIVE_JOB_IDS: set[str] = set()
 # Per-upload, in-memory evidence cache. This speeds candidate retries without
 # persisting statement text or transactions as long-term learning data.
 EXTRACTION_CACHE: dict[tuple[str, str], tuple[list[list[object]], str]] = {}
@@ -104,6 +108,35 @@ def patch_job(job_id: str, **changes: object) -> dict:
         JOBS[job_id] = job
         persist_job_locked(job_id)
         return job
+
+def queue_snapshot_locked() -> tuple[int, int]:
+    """Return this job's FIFO position and the total queued depth.
+
+    The executor is intentionally bounded, so a truthful position is more
+    useful than showing every waiting tenant an unqualified "processing".
+    """
+    queued = sorted(
+        (item for item in JOBS.items() if item[1].get("status") == "queued"),
+        key=lambda item: (str(item[1].get("queued_at") or item[1].get("submitted_at") or ""), item[0]),
+    )
+    return len(queued), len(ACTIVE_JOB_IDS)
+
+def refresh_queue_positions_locked() -> None:
+    queued = sorted(
+        (item for item in JOBS.items() if item[1].get("status") == "queued"),
+        key=lambda item: (str(item[1].get("queued_at") or item[1].get("submitted_at") or ""), item[0]),
+    )
+    for position, (queued_id, job) in enumerate(queued, start=1):
+        job["queue_position"] = position
+        job["queue_depth"] = len(queued)
+        job["worker_capacity"] = WORKER_CAPACITY
+        JOBS[queued_id] = job
+        persist_job_locked(queued_id)
+
+def touch_worker(job_id: str, **changes: object) -> None:
+    """Persist a liveness heartbeat for long PDF and AI operations."""
+    changes["worker_heartbeat_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    patch_job(job_id, **changes)
 
 CANONICAL = ["date", "narration", "withdrawal", "deposit", "instrument_number", "balance"]
 FIVE_MINUTES_MS = 300000
@@ -1645,6 +1678,9 @@ def post_completion_webhook(job_id: str, status: str, profile_id: str | None = N
 
 def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close: str) -> None:
     """Keep the UPG working until a fully validated candidate is found."""
+    touch_worker(job_id, processing=True, valid=False, status="processing",
+                 started_at=datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                 message="UPG worker acquired the job and is preparing parser candidates.")
     round_number = 0
     failed_candidates: set[str] = set()
     attempted_candidates = 0
@@ -1670,6 +1706,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                 "retry_round": round_number,
                 "attempted_candidates": attempted_candidates,
                 "skipped_candidates": skipped_candidates,
+                "worker_heartbeat_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             })
             JOBS[job_id] = job
             persist_job_locked(job_id)
@@ -1730,6 +1767,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         "retry_round": round_number,
                         "attempted_candidates": attempted_candidates,
                         "skipped_candidates": skipped_candidates,
+                        "worker_heartbeat_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                     })
                     JOBS[job_id] = job
                     persist_job_locked(job_id)
@@ -1808,6 +1846,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         with JOBS_LOCK:
             job = JOBS.get(job_id, {})
             job.update({"processing": True, "valid": False, "status": "processing", "message": detail, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
+            job["worker_heartbeat_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             JOBS[job_id] = job
             persist_job_locked(job_id)
         # Do not terminate on a failed validation. This pause avoids a busy loop
@@ -1816,6 +1855,9 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
 
 def run_retry_job(job_id: str, path: Path, fallback_open: str, fallback_close: str) -> None:
     """Turn an unexpected worker exception into a durable, actionable status."""
+    with JOBS_LOCK:
+        ACTIVE_JOB_IDS.add(job_id)
+        refresh_queue_positions_locked()
     try:
         retry_parser_job(job_id, path, fallback_open, fallback_close)
     except Exception as error:
@@ -1827,11 +1869,19 @@ def run_retry_job(job_id: str, path: Path, fallback_open: str, fallback_close: s
         })
         post_completion_webhook(job_id, "failed", error=message)
         clear_pdf_password(path)
+    finally:
+        with JOBS_LOCK:
+            ACTIVE_JOB_IDS.discard(job_id)
+            refresh_queue_positions_locked()
 
 def submit_retry_job(job_id: str, path: Path, fallback_open: str, fallback_close: str) -> None:
     """Queue bounded background work; preserve the job before it starts."""
-    patch_job(job_id, processing=True, valid=False, status="queued",
+    queued_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    patch_job(job_id, processing=True, valid=False, status="queued", queued_at=queued_at,
+              worker_capacity=WORKER_CAPACITY,
               message="UPG job is queued for a parser-engine worker.")
+    with JOBS_LOCK:
+        refresh_queue_positions_locked()
     JOB_EXECUTOR.submit(run_retry_job, job_id, path, fallback_open, fallback_close)
 
 def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = "", fallback_close: str = "") -> dict:
@@ -1959,13 +2009,23 @@ class App(BaseHTTPRequestHandler):
         opening = fields.get("ob", fields.get("opening", ""))
         closing = fields.get("cb", fields.get("closing", ""))
         with JOBS_LOCK:
-            JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "bs_analyzer_statement_id": fields.get("bs_analyzer_statement_id"), "bank_name": fields.get("bank_name", "Unknown"), "source_format": fields.get("source_format", ""), "source_file": saved.name, "fallback_open": opening, "fallback_close": closing, "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
+            JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z", "bs_analyzer_statement_id": fields.get("bs_analyzer_statement_id"), "bank_name": fields.get("bank_name", "Unknown"), "source_format": fields.get("source_format", ""), "source_file": saved.name, "fallback_open": opening, "fallback_close": closing, "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
             persist_job_locked(job_id)
         submit_retry_job(job_id, saved, opening, closing)
         return job_id
     def do_GET(self):
         parsed_url = urlparse(self.path)
         path = parsed_url.path
+        if path == "/queue-status":
+            # Safe operational telemetry: no tenant names, files, or parser
+            # details are exposed.  This lets BS Analyzer distinguish a real
+            # queue from a stalled request without exposing job data.
+            with JOBS_LOCK:
+                queued_count, active_count = queue_snapshot_locked()
+            self.json({"queued_jobs": queued_count, "active_workers": active_count,
+                       "worker_capacity": WORKER_CAPACITY,
+                       "available_workers": max(0, WORKER_CAPACITY - active_count)})
+            return
         if path.startswith("/parser-jobs/"):
             if not self.api_authorized(): return
             job_id = Path(path).name
@@ -1982,6 +2042,11 @@ class App(BaseHTTPRequestHandler):
                 "retry_round": job.get("retry_round", 0),
                 "attempted_candidates": job.get("attempted_candidates", 0),
                 "skipped_candidates": job.get("skipped_candidates", 0),
+                "queue_position": job.get("queue_position"),
+                "queue_depth": job.get("queue_depth", 0),
+                "worker_capacity": job.get("worker_capacity", WORKER_CAPACITY),
+                "active_workers": len(ACTIVE_JOB_IDS),
+                "worker_heartbeat_at": job.get("worker_heartbeat_at"),
             }
             if job.get("profile_id"): response["profile_id"] = job["profile_id"]
             if status == "failed": response["error"] = job.get("message", "Parser generation failed")
@@ -2094,7 +2159,7 @@ class App(BaseHTTPRequestHandler):
             register_pdf_password(saved, str(fields.get("password", fields.get("pdf_password", ""))))
             job_id = uuid.uuid4().hex
             with JOBS_LOCK:
-                JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "source_file": saved.name, "fallback_open": fields.get("opening", ""), "fallback_close": fields.get("closing", ""), "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
+                JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z", "source_file": saved.name, "fallback_open": fields.get("opening", ""), "fallback_close": fields.get("closing", ""), "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
                 persist_job_locked(job_id)
             submit_retry_job(job_id, saved, fields.get("opening", ""), fields.get("closing", ""))
             self.json({"processing": True, "valid": False, "job": job_id, "message": "UPG is retrying parser candidates. Excel and profile creation remain locked until both validations pass."})
