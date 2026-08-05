@@ -88,6 +88,7 @@ EXTRACTION_CACHE: dict[tuple[str, str], tuple[list[list[object]], str]] = {}
 EXTRACTION_CACHE_LOCK = threading.Lock()
 PDF_TEXT_CACHE: dict[str, str] = {}
 PDF_SAMPLE_CACHE: dict[str, str] = {}
+PDF_GEOMETRY_PROFILE_CACHE: dict[str, tuple[list[object], list[tuple[float, float]]] | None] = {}
 # Passwords are request-scoped, held only in memory, and are never written to
 # profiles, learning, exports, logs, or webhook payloads.
 PDF_PASSWORD_CACHE: dict[str, str] = {}
@@ -731,6 +732,23 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         selected.append(ai_key)
     return selected
 
+def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: str | None,
+                              planned_strategies: list[str]) -> dict[str, object]:
+    """Create one evidence-led parser plan before any full-file extraction."""
+    geometry = sampled_geometry_profile(path) if path.suffix.lower() == ".pdf" else None
+    headers = geometry[0] if geometry else []
+    closest = closest_certified_lessons(path, headers)
+    candidates = evidence_first_candidates(path, large_pdf, bool(geometry), validated_strategy, planned_strategies, 1)
+    return {
+        "version": 1,
+        "measured_from": "original_pdf_geometry" if geometry else "source_text_structure",
+        "header_fields": sorted(map_headers(headers)) if headers else [],
+        "closest_profile_ids": [item["profile_id"] for item in closest],
+        "closest_challenges": sorted({challenge for item in closest for challenge in item.get("challenge_history", [])}),
+        "candidate_plan": ["ai_layout_addendum" if ai else (strategy or "detected_table") for strategy, ai in candidates],
+        "full_source_validation_required": True,
+    }
+
 def pdf_password(path: Path) -> str:
     with EXTRACTION_CACHE_LOCK:
         return PDF_PASSWORD_CACHE.get(str(path.resolve()), "")
@@ -1218,6 +1236,11 @@ def sampled_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float
     Prefer ruled-table cells, but also support borderless bank statements by
     deriving bands from the x-position of their printed header words.
     """
+    key = str(path.resolve())
+    with EXTRACTION_CACHE_LOCK:
+        if key in PDF_GEOMETRY_PROFILE_CACHE:
+            return PDF_GEOMETRY_PROFILE_CACHE[key]
+    discovered: tuple[list[object], list[tuple[float, float]]] | None = None
     with open_pdfplumber(path) as pdf:
         page_numbers = list(range(len(pdf.pages))) if len(pdf.pages) <= 60 else sampled_page_indices(len(pdf.pages))
         for number in page_numbers:
@@ -1228,7 +1251,12 @@ def sampled_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float
                     if row and len(map_headers(row)) >= 3 and index < len(table.rows):
                         cells = table.rows[index].cells
                         if cells and all(cell for cell in cells):
-                            return row, [(float(cell[0]), float(cell[2])) for cell in cells]
+                            discovered = row, [(float(cell[0]), float(cell[2])) for cell in cells]
+                            break
+                if discovered:
+                    break
+            if discovered:
+                break
             lines: dict[int, list[dict]] = {}
             for word in page.extract_words(x_tolerance=1, y_tolerance=2):
                 lines.setdefault(round(float(word["top"]) / 3), []).append(word)
@@ -1245,8 +1273,15 @@ def sampled_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float
                 bands = [(0.0 if index == 0 else starts[index] - 3.0,
                           (starts[index + 1] - 3.0) if index + 1 < len(starts) else float(page.width))
                          for index in range(len(starts))]
-                return labels, bands
-    return None
+                discovered = labels, bands
+                break
+            if discovered:
+                break
+    with EXTRACTION_CACHE_LOCK:
+        if len(PDF_GEOMETRY_PROFILE_CACHE) >= 12:
+            PDF_GEOMETRY_PROFILE_CACHE.pop(next(iter(PDF_GEOMETRY_PROFILE_CACHE)))
+        PDF_GEOMETRY_PROFILE_CACHE[key] = discovered
+    return discovered
 
 def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = None) -> list[list[object]]:
     """Apply sampled column bands without table rediscovery.
@@ -1999,6 +2034,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     # supported path.  Persist this across fair worker leases so an empty AI
     # diagnosis can never turn into an infinite queue-consuming loop.
     empty_ai_diagnoses = int(saved_state.get("empty_ai_diagnoses", 0) or 0)
+    preflight = saved_state.get("preflight_blueprint") if isinstance(saved_state.get("preflight_blueprint"), dict) else None
+    if not preflight:
+        preflight = build_preflight_blueprint(path, large_pdf, validated_strategy, planned_strategies)
+        patch_job(job_id, preflight_blueprint=preflight,
+                  message="UPG completed its preflight audit: measured source layout, compared certified profiles, and planned parser candidates before extraction.")
     rounds_this_lease = 0
     while True:
         round_number += 1
@@ -2029,7 +2069,9 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             f"UPG self-healing round {round_number}. No validated parser candidate has been found yet. "
             f"Prior expert diagnosis: {prior_investigation.get('failure_type', 'none')}; "
             f"safe corrective action: {prior_investigation.get('profile_action', 'none')}; "
-            f"validated layout rules to consider: {', '.join(diagnostic_rules) or 'none'}."
+            f"validated layout rules to consider: {', '.join(diagnostic_rules) or 'none'}. "
+            f"Preflight closest profiles: {', '.join(preflight.get('closest_profile_ids', [])) or 'none'}; "
+            f"measured fields: {', '.join(preflight.get('header_fields', [])) or 'unresolved'}."
         )
         # On a long statement, candidate parsing already works from cached
         # full-document evidence.  Diagnostic AI needs only representative
@@ -2044,7 +2086,14 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # The plan adapts after failure: once table candidates fail, prioritize
         # new AI addenda and page-aware text candidates over already-explored
         # layouts. Candidate memory below prevents duplicate validation work.
-        candidates = evidence_first_candidates(path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number)
+        if round_number == 1:
+            candidates = [(None, True) if name == "ai_layout_addendum" else ((None, False) if name == "detected_table" else (name, False))
+                          for name in preflight.get("candidate_plan", [])]
+        else:
+            # A retry is a re-measurement after the exact prior failure, not a
+            # replay of the initial plan. Existing signature memory below
+            # guarantees that only materially new candidates are tested.
+            candidates = evidence_first_candidates(path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number)
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
             try:
