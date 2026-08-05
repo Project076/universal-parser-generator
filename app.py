@@ -74,6 +74,12 @@ try:
     WORKER_LEASE_ROUNDS = min(3, max(1, int(os.environ.get("UPG_WORKER_LEASE_ROUNDS", "1"))))
 except ValueError:
     WORKER_LEASE_ROUNDS = 1
+try:
+    # A client that closes/cancels Fix with AI must not reserve a queue turn
+    # forever.  Normal browser/API polling refreshes this lease automatically.
+    JOB_CLIENT_LEASE_SECONDS = max(60, int(os.environ.get("UPG_CLIENT_LEASE_SECONDS", "300")))
+except ValueError:
+    JOB_CLIENT_LEASE_SECONDS = 300
 JOB_EXECUTOR = ThreadPoolExecutor(max_workers=WORKER_CAPACITY, thread_name_prefix="upg-parser")
 ACTIVE_JOB_IDS: set[str] = set()
 # Per-upload, in-memory evidence cache. This speeds candidate retries without
@@ -145,6 +151,76 @@ def touch_worker(job_id: str, **changes: object) -> None:
     """Persist a liveness heartbeat for long PDF and AI operations."""
     changes["worker_heartbeat_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     patch_job(job_id, **changes)
+
+def utc_now() -> datetime:
+    return datetime.utcnow()
+
+def timestamp_now() -> str:
+    return utc_now().isoformat(timespec="seconds") + "Z"
+
+def timestamp_age_seconds(value: object) -> float:
+    try:
+        return max(0.0, (utc_now() - datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)).total_seconds())
+    except (TypeError, ValueError):
+        return float("inf")
+
+def touch_client(job_id: str) -> None:
+    """Refresh a job lease, throttled to avoid writing on every poll."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job or job.get("status") in {"completed", "failed", "cancelled"}:
+            return
+        if timestamp_age_seconds(job.get("client_heartbeat_at")) < 30:
+            return
+        job["client_heartbeat_at"] = timestamp_now()
+        JOBS[job_id] = job
+        persist_job_locked(job_id)
+
+def cancel_job(job_id: str, reason: str = "Cancelled by the requesting client.") -> bool:
+    """Cancel queued work now, or request a safe stop between active steps."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return False
+        if job.get("status") in {"completed", "failed", "cancelled"}:
+            return True
+        job.update({"cancel_requested": True, "cancel_reason": reason,
+                    "client_heartbeat_at": timestamp_now()})
+        if job.get("status") == "queued":
+            job.update({"processing": False, "valid": False, "status": "cancelled",
+                        "message": "UPG job was cancelled before a worker started it."})
+        else:
+            job["message"] = "UPG cancellation requested; the active worker will stop safely after its current extraction step."
+        JOBS[job_id] = job
+        persist_job_locked(job_id)
+        refresh_queue_positions_locked()
+        return True
+
+def job_cancel_requested(job_id: str) -> bool:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id, {})
+        return bool(job.get("cancel_requested") or job.get("status") == "cancelled")
+
+def expire_abandoned_jobs() -> None:
+    """Remove work whose requesting browser/API client has stopped polling."""
+    candidates: list[str] = []
+    with JOBS_LOCK:
+        for job_id, job in JOBS.items():
+            if job.get("status") not in {"queued", "processing", "pending"}:
+                continue
+            last_seen = job.get("client_heartbeat_at") or job.get("submitted_at")
+            if timestamp_age_seconds(last_seen) > JOB_CLIENT_LEASE_SECONDS:
+                candidates.append(job_id)
+    for job_id in candidates:
+        cancel_job(job_id, "Cancelled automatically because the requesting client stopped monitoring this job.")
+
+def queue_supervisor() -> None:
+    while True:
+        try:
+            expire_abandoned_jobs()
+        except Exception:
+            pass
+        time.sleep(15)
 
 CANONICAL = ["date", "narration", "withdrawal", "deposit", "instrument_number", "balance"]
 FIVE_MINUTES_MS = 300000
@@ -1707,6 +1783,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     while True:
         round_number += 1
         rounds_this_lease += 1
+        if job_cancel_requested(job_id):
+            patch_job(job_id, processing=False, valid=False, status="cancelled",
+                      message="UPG job was cancelled before its next parser retry round.")
+            clear_pdf_password(path)
+            return
         # Keep API clients informed before starting expensive PDF work.
         with JOBS_LOCK:
             job = JOBS.get(job_id, {})
@@ -1764,6 +1845,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
             try:
+                if job_cancel_requested(job_id):
+                    patch_job(job_id, processing=False, valid=False, status="cancelled",
+                              message="UPG job was cancelled safely between parser candidates.")
+                    clear_pdf_password(path)
+                    return
                 candidate_name = "AI layout addendum" if force_ai_profile else (strategy or "detected transaction table")
                 if large_pdf and not force_ai_profile and not sample_candidate_plausible(path, strategy):
                     skipped_candidates += 1
@@ -1784,6 +1870,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     JOBS[job_id] = job
                     persist_job_locked(job_id)
                 candidate = parse_statement(path, fallback_open, fallback_close, strategy, force_ai_profile, repair_context)
+                if job_cancel_requested(job_id):
+                    patch_job(job_id, processing=False, valid=False, status="cancelled",
+                              message="UPG job was cancelled safely after the current extraction step.")
+                    clear_pdf_password(path)
+                    return
                 latest = candidate
                 # A failed mapping/strategy combination is never tested again
                 # within this UPG job. AI addenda must propose a materially new
@@ -1884,6 +1975,9 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
 def run_retry_job(job_id: str, path: Path, fallback_open: str, fallback_close: str) -> None:
     """Turn an unexpected worker exception into a durable, actionable status."""
     with JOBS_LOCK:
+        if JOBS.get(job_id, {}).get("status") == "cancelled":
+            refresh_queue_positions_locked()
+            return
         ACTIVE_JOB_IDS.add(job_id)
         refresh_queue_positions_locked()
     try:
@@ -2005,6 +2099,7 @@ def recover_persisted_jobs() -> None:
             continue
 
 recover_persisted_jobs()
+threading.Thread(target=queue_supervisor, name="upg-queue-supervisor", daemon=True).start()
 
 class App(BaseHTTPRequestHandler):
     def json(self, data, status=200):
@@ -2048,7 +2143,7 @@ class App(BaseHTTPRequestHandler):
         opening = fields.get("ob", fields.get("opening", ""))
         closing = fields.get("cb", fields.get("closing", ""))
         with JOBS_LOCK:
-            JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z", "bs_analyzer_statement_id": fields.get("bs_analyzer_statement_id"), "bank_name": fields.get("bank_name", "Unknown"), "source_format": fields.get("source_format", ""), "source_file": saved.name, "fallback_open": opening, "fallback_close": closing, "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
+            JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": timestamp_now(), "client_heartbeat_at": timestamp_now(), "bs_analyzer_statement_id": fields.get("bs_analyzer_statement_id"), "bank_name": fields.get("bank_name", "Unknown"), "source_format": fields.get("source_format", ""), "source_file": saved.name, "fallback_open": opening, "fallback_close": closing, "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
             persist_job_locked(job_id)
         submit_retry_job(job_id, saved, opening, closing)
         return job_id
@@ -2068,6 +2163,7 @@ class App(BaseHTTPRequestHandler):
         if path.startswith("/parser-jobs/"):
             if not self.api_authorized(): return
             job_id = Path(path).name
+            touch_client(job_id)
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
             if not job:
@@ -2122,8 +2218,10 @@ class App(BaseHTTPRequestHandler):
         if path == "/":
             data=HTML.encode(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data); return
         if path.startswith("/status/"):
+            job_id = Path(path).name
+            touch_client(job_id)
             with JOBS_LOCK:
-                status = JOBS.get(Path(path).name)
+                status = JOBS.get(job_id)
             if status is None: self.json({"processing": False, "interrupted": True, "valid": False, "message": "UPG was restarted while this retry job was running. The saved parser is unchanged; click Parse and validate to start a fresh job for this uploaded statement."}, 404)
             else: self.json(status)
             return
@@ -2134,6 +2232,15 @@ class App(BaseHTTPRequestHandler):
         self.send_error(404)
     def do_POST(self):
         path = urlparse(self.path).path
+        cancel_match = re.fullmatch(r"/parser-jobs/([^/]+)/cancel", path)
+        if cancel_match:
+            if not self.api_authorized(): return
+            job_id = cancel_match.group(1)
+            if not cancel_job(job_id):
+                self.json({"error": "Job not found"}, HTTPStatus.NOT_FOUND)
+            else:
+                self.json({"job_id": job_id, "status": "cancelled"})
+            return
         if path == "/parser-jobs":
             if not self.api_authorized(): return
             try:
@@ -2198,7 +2305,7 @@ class App(BaseHTTPRequestHandler):
             register_pdf_password(saved, str(fields.get("password", fields.get("pdf_password", ""))))
             job_id = uuid.uuid4().hex
             with JOBS_LOCK:
-                JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z", "source_file": saved.name, "fallback_open": fields.get("opening", ""), "fallback_close": fields.get("closing", ""), "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
+                JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": timestamp_now(), "client_heartbeat_at": timestamp_now(), "source_file": saved.name, "fallback_open": fields.get("opening", ""), "fallback_close": fields.get("closing", ""), "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
                 persist_job_locked(job_id)
             submit_retry_job(job_id, saved, fields.get("opening", ""), fields.get("closing", ""))
             self.json({"processing": True, "valid": False, "job": job_id, "message": "UPG is retrying parser candidates. Excel and profile creation remain locked until both validations pass."})
