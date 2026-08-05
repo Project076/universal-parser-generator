@@ -280,6 +280,7 @@ Bank statement extraction policy:
 - A printed-total mismatch may be reported as a warning only when it is small enough to plausibly be a source-summary error. A materially divergent parsed total is a hard failure: it indicates that references, dates, or other non-monetary text may have been read as money.
 - A partial extraction is never valid. A candidate must account for every detectable source transaction record; a shorter subset that happens to reconcile is a failure. Narration verification is one-to-one source coverage, not merely a loose text substring check.
 - Self-healing is constrained to parser-profile addenda: use failed validation evidence to propose a revised header/column layout, test it from the original source, and retain it only after every release gate passes. Never modify application code, invent transactions, or weaken a validation to make a result pass.
+- On every failed candidate, act as an evidence-led expert: classify the root cause (geometry, headers, date order, continuation, furniture, balance direction, endpoints, totals, narration, count, or novel layout), choose a materially different safe addendum action, and remember only that non-sensitive investigation result. Never retry a deterministic strategy that already failed the same statement.
 - For long PDFs, create or repair a layout profile from a representative sample: first seven pages, seven pages centered around the middle, and last seven pages, plus adjacent boundary pages so transactions split across sampled-page edges remain visible. Apply the resulting candidate to the complete statement and validate the whole source before learning or export.
 """
 ALIASES = {
@@ -758,16 +759,22 @@ def ai_choose_text_strategy(raw: str) -> str | None:
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
         return None
 
-def ai_diagnose_failure(raw: str, failure: str) -> dict[str, list[str]]:
-    """Create a privacy-safe, bounded investigation plan for the next retry."""
+def ai_diagnose_failure(raw: str, failure: str) -> dict[str, object]:
+    """Create a privacy-safe expert investigation plan for the next retry.
+
+    The model may choose a diagnosis and a parser-profile action, but never
+    transactions, balances, executable code, or a weaker validation standard.
+    """
     key = os.environ.get("OPENAI_API_KEY")
-    if not key: return {"rules": [], "strategies": []}
+    if not key: return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum"}
     safe_strategies = ["geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table", "ai_layout_addendum"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "rules": {"type": "array", "items": {"type": "string", "enum": list(DIAGNOSTIC_RULE_LIBRARY)}, "maxItems": 5},
         "strategies": {"type": "array", "items": {"type": "string", "enum": safe_strategies}, "maxItems": 4},
-    }, "required": ["rules", "strategies"]}
-    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Study the source sample and failed validation evidence. Select only safe rule IDs and a priority order of already-supported candidate strategies for the next retry. Do not write executable code, invent transactions, expose source data, or weaken any validation.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
+        "failure_type": {"type": "string", "enum": ["column_geometry", "header_mapping", "date_order", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "novel_layout"]},
+        "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "ai_addendum", "reject_unsafe"]},
+    }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
+    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Diagnose the root cause from the source sample and failed validation evidence, then select one safe parser-profile action and a priority order of already-supported candidate strategies. A later generator will receive your diagnosis to create a materially different addendum. Do not write executable code, invent transactions, expose source data, replace source amounts, or weaken validation. If evidence is insufficient, choose novel_layout + ai_addendum; do not pretend a failed mapping is valid.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:12000]
     payload = {"model": AI_MODEL, "input": prompt, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
@@ -777,9 +784,11 @@ def ai_diagnose_failure(raw: str, failure: str) -> dict[str, list[str]]:
         return {
             "rules": [rule for rule in plan["rules"] if rule in DIAGNOSTIC_RULE_LIBRARY],
             "strategies": [strategy for strategy in plan["strategies"] if strategy in safe_strategies],
+            "failure_type": str(plan["failure_type"]),
+            "profile_action": str(plan["profile_action"]),
         }
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
-        return {"rules": [], "strategies": []}
+        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum"}
 
 def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
     def find(kind):
@@ -1795,6 +1804,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     text_first = large_pdf and not geometry_ready and prefers_running_balance_text(path)
     diagnostic_rules: set[str] = {str(item) for item in saved_state.get("diagnostic_rules", [])}
     planned_strategies: list[str] = [str(item) for item in saved_state.get("planned_strategies", [])]
+    prior_investigation = saved_state.get("investigation") if isinstance(saved_state.get("investigation"), dict) else {}
     rounds_this_lease = 0
     while True:
         round_number += 1
@@ -1821,7 +1831,12 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             persist_job_locked(job_id)
         latest = None
         errors = []
-        repair_context = f"UPG self-healing round {round_number}. No validated parser candidate has been found yet."
+        repair_context = (
+            f"UPG self-healing round {round_number}. No validated parser candidate has been found yet. "
+            f"Prior expert diagnosis: {prior_investigation.get('failure_type', 'none')}; "
+            f"safe corrective action: {prior_investigation.get('profile_action', 'none')}; "
+            f"validated layout rules to consider: {', '.join(diagnostic_rules) or 'none'}."
+        )
         # On a long statement, candidate parsing already works from cached
         # full-document evidence.  Diagnostic AI needs only representative
         # layout evidence, not the entire 252-page text layer.  Keep this
@@ -1968,6 +1983,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         investigation = ai_diagnose_failure(diagnostic_evidence, repair_context)
         diagnostic_rules.update(investigation["rules"])
         planned_strategies = investigation["strategies"]
+        prior_investigation = {
+            "failure_type": investigation.get("failure_type", "novel_layout"),
+            "profile_action": investigation.get("profile_action", "ai_addendum"),
+        }
         if investigation["rules"] or planned_strategies:
             detail += " UPG recorded a new layout investigation plan for the next round."
         yield_to_queue = rounds_this_lease >= WORKER_LEASE_ROUNDS
@@ -1984,6 +2003,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         "failed_strategy_keys": sorted(failed_strategy_keys),
                         "diagnostic_rules": sorted(diagnostic_rules),
                         "planned_strategies": planned_strategies})
+            job["investigation"] = prior_investigation
             job["worker_heartbeat_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             JOBS[job_id] = job
             persist_job_locked(job_id)
