@@ -2230,8 +2230,9 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     f"financial={'PASS' if candidate[6] else 'FAIL'}, narration={'PASS' if candidate[7] else 'FAIL'}. "
                     "Propose a safe header/column addendum only; do not weaken validation.")
             except Exception as error:
-                errors.append(str(error))
-                if "OCR_REQUIRED:" in str(error) or "PASSWORD_REQUIRED:" in str(error):
+                safe_error = re.sub(r"\s+", " ", str(error)).strip()[:300]
+                errors.append(f"{candidate_name}: {safe_error}")
+                if "OCR_REQUIRED:" in safe_error or "PASSWORD_REQUIRED:" in safe_error:
                     message = ("Not validated. This is an image-only PDF, so UPG has locked parser creation and Excel export until OCR is available. The statement was not treated as a one-row parser."
                         if "OCR_REQUIRED:" in str(error)
                         else "Not validated. This PDF is password protected. Enter the correct PDF password and resubmit it; UPG has stopped instead of retrying unreadable encrypted content.")
@@ -2247,20 +2248,31 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             detail = f"UPG retry round {round_number}: tested {attempted_candidates} distinct candidates and skipped {skipped_candidates} duplicate failures. All known candidates were skipped; UPG is requesting a materially new AI layout addendum."
         else:
             detail = f"UPG retry round {round_number}: no safe candidate was produced yet; it is continuing with new layout attempts."
+        if errors:
+            # The model must diagnose the concrete failed extraction, never a
+            # vague 'novel layout' label. Keep this compact and free of source
+            # text; it is durable job telemetry for the next repair cycle.
+            error_summary = " | ".join(errors[-4:])
+            repair_context += " Candidate execution results: " + error_summary
+            patch_job(job_id, last_candidate_errors=errors[-8:])
         # A diagnosis is guidance for the *next* retry round. It must never
         # weaken validation or cause the same failed candidate to run again.
         # Calling this once rather than after each failed candidate is the
         # largest safe speed-up for long PDFs.
         investigation = ai_diagnose_failure(diagnostic_evidence, repair_context, path, job_id)
-        diagnostic_rules.update(investigation["rules"])
-        planned_strategies = investigation["strategies"]
+        proposed_rules = {str(rule) for rule in investigation["rules"]}
+        proposed_strategies = [str(strategy) for strategy in investigation["strategies"]]
+        materially_new_rules = proposed_rules - diagnostic_rules
+        materially_new_strategies = [strategy for strategy in proposed_strategies if strategy not in planned_strategies]
+        diagnostic_rules.update(proposed_rules)
+        planned_strategies = proposed_strategies
         diagnosis_error = str(investigation.get("diagnostic_error", "") or "")
         prior_investigation = {
             "failure_type": investigation.get("failure_type", "novel_layout"),
             "profile_action": investigation.get("profile_action", "ai_addendum"),
             "diagnostic_error": diagnosis_error,
         }
-        if investigation["rules"] or planned_strategies:
+        if materially_new_rules or materially_new_strategies:
             detail += " UPG recorded a new layout investigation plan for the next round."
             empty_ai_diagnoses = 0
         elif new_candidates_this_round == 0:
@@ -2280,7 +2292,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             "skipped_candidates": skipped_candidates, "failed_candidates": sorted(failed_candidates),
                             "failed_strategy_keys": sorted(failed_strategy_keys),
                             "diagnostic_rules": sorted(diagnostic_rules), "planned_strategies": planned_strategies,
-                            "empty_ai_diagnoses": empty_ai_diagnoses, "investigation": prior_investigation})
+                            "empty_ai_diagnoses": empty_ai_diagnoses, "investigation": prior_investigation,
+                            "last_candidate_errors": errors[-8:]})
                 JOBS[job_id] = job
                 persist_job_locked(job_id)
             post_completion_webhook(job_id, "failed", error=message)
@@ -2300,7 +2313,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         "failed_strategy_keys": sorted(failed_strategy_keys),
                         "diagnostic_rules": sorted(diagnostic_rules),
                         "planned_strategies": planned_strategies,
-                        "empty_ai_diagnoses": empty_ai_diagnoses})
+                        "empty_ai_diagnoses": empty_ai_diagnoses,
+                        "last_candidate_errors": errors[-8:]})
             job["investigation"] = prior_investigation
             job["worker_heartbeat_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             JOBS[job_id] = job
