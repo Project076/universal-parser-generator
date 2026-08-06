@@ -1096,7 +1096,20 @@ def source_transaction_totals(text: str) -> tuple[Decimal | None, Decimal | None
         # Some banks print cumulative debit and credit totals as a final
         # Grand Total rather than a labelled statement-summary grid.
         grand = re.search(r"(?is)\bgrand\s+total\s*:\s*([\d,]+(?:\.\d{1,2})?)\s+([\d,]+(?:\.\d{1,2})?)", text)
-        return (money(grand.group(1)), money(grand.group(2))) if grand else (None, None)
+        if grand:
+            return money(grand.group(1)), money(grand.group(2))
+        # ICICI-style statements end with a borderless `TOTAL` row.  The
+        # table order is Deposits, Withdrawals, Balance, so return debit then
+        # credit to match this function's public contract.  Use the final
+        # occurrence: an account-summary block may contain an earlier total.
+        totals = re.findall(
+            r"(?im)^\s*TOTAL\s+([\d,]+(?:\.\d{1,2})?)\s+([\d,]+(?:\.\d{1,2})?)\s+([\d,]+(?:\.\d{1,2})?)\s*$",
+            text,
+        )
+        if totals:
+            deposits, withdrawals, _balance = totals[-1]
+            return money(withdrawals), money(deposits)
+        return None, None
     return money(summary.group(1)), money(summary.group(2))
 
 def table_balances(rows: list[list[object]], header_at: int, columns: dict[str, int]) -> tuple[Decimal | None, Decimal | None]:
@@ -1116,6 +1129,10 @@ def table_balances(rows: list[list[object]], header_at: int, columns: dict[str, 
     return first, last
 
 def transaction_date_value(value: str) -> datetime | None:
+    # Text layers frequently split a date across adjacent words, e.g.
+    # `24-01 -2024`.  It is still one visual date cell, not a continuation
+    # line.  Normalise whitespace around separators before validation.
+    value = re.sub(r"\s*([/-])\s*", r"\1", str(value or "").strip())
     for pattern in ("%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y", "%d-%b-%Y", "%d/%b/%Y", "%Y-%m-%d"):
         try: return datetime.strptime(value.strip(), pattern)
         except ValueError: continue
@@ -1288,8 +1305,61 @@ def sampled_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float
     discovered: tuple[list[object], list[tuple[float, float]]] | None = None
     with open_pdfplumber(path) as pdf:
         page_numbers = list(range(len(pdf.pages))) if len(pdf.pages) <= 60 else sampled_page_indices(len(pdf.pages))
+        # First inspect header words on every representative page.  Do not
+        # run costly ruled-table discovery on a cover/summary page merely
+        # because the actual borderless transaction header begins on page 2.
         for number in page_numbers:
             page = pdf.pages[number]
+            lines: dict[int, list[dict]] = {}
+            for word in page.extract_words(x_tolerance=1, y_tolerance=2):
+                lines.setdefault(round(float(word["top"]) / 3), []).append(word)
+            for words in lines.values():
+                ordered = sorted(words, key=lambda item: float(item["x0"]))
+                labels = [str(word["text"]) for word in ordered]
+                mapped = map_headers(labels)
+                if not {"date", "narration", "withdrawal", "deposit", "balance"}.issubset(mapped):
+                    continue
+                starts = [float(word["x0"]) for word in ordered]
+                discovered = labels, [
+                    (0.0 if index == 0 else starts[index] - 3.0,
+                     (starts[index + 1] - 3.0) if index + 1 < len(starts) else float(page.width))
+                    for index in range(len(starts))
+                ]
+                break
+            if discovered:
+                break
+        if discovered:
+            with EXTRACTION_CACHE_LOCK:
+                if len(PDF_GEOMETRY_PROFILE_CACHE) >= 12:
+                    PDF_GEOMETRY_PROFILE_CACHE.pop(next(iter(PDF_GEOMETRY_PROFILE_CACHE)))
+                PDF_GEOMETRY_PROFILE_CACHE[key] = discovered
+            return discovered
+        for number in page_numbers:
+            page = pdf.pages[number]
+            # Many bank PDFs (including ICICI's DATE / MODE / PARTICULARS /
+            # DEPOSITS / WITHDRAWALS / BALANCE layout) draw light row guides
+            # but no extractable table borders.  Their printed header words
+            # are reliable geometry and far cheaper than `find_tables()`.
+            # Prefer this fast route only when it identifies the complete
+            # core transaction schema; partial headers still use ruled-table
+            # discovery below.
+            lines: dict[int, list[dict]] = {}
+            for word in page.extract_words(x_tolerance=1, y_tolerance=2):
+                lines.setdefault(round(float(word["top"]) / 3), []).append(word)
+            for words in lines.values():
+                ordered = sorted(words, key=lambda item: float(item["x0"]))
+                labels = [str(word["text"]) for word in ordered]
+                mapped = map_headers(labels)
+                if not {"date", "narration", "withdrawal", "deposit", "balance"}.issubset(mapped):
+                    continue
+                starts = [float(word["x0"]) for word in ordered]
+                bands = [(0.0 if index == 0 else starts[index] - 3.0,
+                          (starts[index + 1] - 3.0) if index + 1 < len(starts) else float(page.width))
+                         for index in range(len(starts))]
+                discovered = labels, bands
+                break
+            if discovered:
+                break
             for table in page.find_tables():
                 extracted = table.extract()
                 for index, row in enumerate(extracted):
@@ -1302,9 +1372,6 @@ def sampled_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float
                     break
             if discovered:
                 break
-            lines: dict[int, list[dict]] = {}
-            for word in page.extract_words(x_tolerance=1, y_tolerance=2):
-                lines.setdefault(round(float(word["top"]) / 3), []).append(word)
             for words in lines.values():
                 ordered = sorted(words, key=lambda item: float(item["x0"]))
                 labels = [str(word["text"]) for word in ordered]
@@ -1350,17 +1417,44 @@ def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = No
             footer_started = False
             for word in page.extract_words(x_tolerance=1, y_tolerance=2):
                 lines.setdefault(round(float(word["top"]) / 3), []).append(word)
+            # Buffer text fragments between dated anchors.  In many borderless
+            # bank layouts the particulars for a row are printed *above* its
+            # date/amount line.  Assign each fragment to the closer adjacent
+            # dated anchor instead of blindly appending it to the prior row.
+            current_top: float | None = None
+            pending_fragments: list[tuple[float, list[str]]] = []
+
+            def append_fragments(target: list[str], fragments: list[tuple[float, list[str]]]) -> None:
+                for _top, fragment in fragments:
+                    for index, value in enumerate(fragment):
+                        if value:
+                            target[index] = (target[index] + " " + value).strip()
+
             for words in lines.values():
                 if footer_started:
                     continue
                 line_text = " ".join(str(word["text"]) for word in words)
-                footer_on_line = bool(re.search(r"(?i)\b(?:page\s+total|grand\s+total|date/time|system\s+generated|page\s+\d+\s+of)\b", line_text))
+                line_top = min(float(word["top"]) for word in words)
+                page_number_header = bool(re.search(r"(?i)\bpage\s+\d+\s+of\s+\d+\b", line_text)) and line_top < float(page.height) * 0.25
+                # A page-number header is furniture, but it is not an end of
+                # page. Previously it set footer_started on page 2 onwards,
+                # causing UPG to discard every transaction below it.
+                if page_number_header:
+                    continue
+                footer_on_line = bool(re.search(
+                    r"(?i)\b(?:page\s+total|grand\s+total|date/time|system\s+generated|"
+                    r"account\s+related\s+other\s+information|legends\s+for\s+transactions|"
+                    r"this\s+is\s+an\s+authenticated|nominee\s+name|sincerely)\b",
+                    line_text,
+                ))
                 cells = ["" for _ in bands]
                 for word in sorted(words, key=lambda item: float(item["x0"])):
                     center = (float(word["x0"]) + float(word["x1"])) / 2
                     column = next((i for i, (left, right) in enumerate(bands) if left <= center <= right), None)
                     if column is not None:
                         cells[column] = (cells[column] + " " + word["text"]).strip()
+                standalone_total = bool(re.search(r"(?i)\bTOTAL\b", line_text)) and not transaction_date_value(cells[date_index])
+                footer_on_line = footer_on_line or (current is not None and standalone_total)
                 # A page footer can share the final transaction's y-band.
                 # Keep the transaction portion, never append page/grand
                 # totals or the generated-statement disclaimer to its cells.
@@ -1390,12 +1484,23 @@ def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = No
                     continue
                 if transaction_date_value(cells[date_index]):
                     if current is not None:
+                        # Split fragments at the midpoint between two dated
+                        # transaction anchors.  This preserves ordinary
+                        # continuation lines while putting above-date
+                        # particulars on their actual transaction.
+                        midpoint = ((current_top or line_top) + line_top) / 2
+                        prior = [(top, fragment) for top, fragment in pending_fragments if top <= midpoint]
+                        following = [(top, fragment) for top, fragment in pending_fragments if top > midpoint]
+                        append_fragments(current, prior)
                         rows.append(current)
+                        append_fragments(cells, following)
+                    elif pending_fragments:
+                        append_fragments(cells, pending_fragments)
                     current = cells
+                    current_top = line_top
+                    pending_fragments = []
                 elif current is not None:
-                    for i, value in enumerate(cells):
-                        if value:
-                            current[i] = (current[i] + " " + value).strip()
+                    pending_fragments.append((line_top, cells))
             # pdfplumber caches page character/word objects. Explicitly clear
             # each page after converting it to compact row strings so a 250+
             # page PDF does not retain all geometry in the 1 GB web container.
@@ -1407,6 +1512,10 @@ def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = No
             # header arrives. Keep only incomplete rows open so genuine
             # two-page narrations/amounts can still be merged on page N+1.
             if current is not None:
+                # A final line after the last dated anchor on a page is a
+                # continuation of that anchor unless it was identified as
+                # furniture above.
+                append_fragments(current, pending_fragments)
                 row_date = transaction_date_value(current[date_index] if date_index < len(current) else "")
                 withdrawal_index = column_map.get("withdrawal")
                 deposit_index = column_map.get("deposit")
