@@ -401,6 +401,42 @@ def normalize_narration(s: object) -> str:
     """Comparison form: ignores harmless whitespace/case/punctuation variations only."""
     return norm(s)
 
+def coordinate_narrations_traceable(transactions: list[dict], raw: str) -> bool:
+    """Validate PDF-coordinate narrations when the text layer changes order.
+
+    A borderless PDF can expose its Particulars words in a different reading
+    order to the visual source, even though each word came from the real
+    Particulars column.  Exact substring matching is then invalid evidence.
+    This narrow alternative is available only after original-PDF geometry has
+    already located the narration column: every meaningful narration token
+    must be traceable to the source text.  It is not a fallback for text-only
+    extraction and never accepts numeric or furniture-only narration.
+    """
+    source_tokens = set(re.findall(r"[a-z0-9]{4,}", str(raw or "").lower()))
+    if not source_tokens:
+        return False
+    strong_rows = 0
+    narrated_rows = 0
+    for transaction in transactions:
+        narration = str(transaction.get("narration") or "").strip()
+        if not narration:
+            continue
+        narrated_rows += 1
+        tokens = re.findall(r"[a-z0-9]{4,}", narration.lower())
+        if not tokens:
+            return False
+        matched = sum(token in source_tokens for token in tokens)
+        score = matched / len(tokens)
+        # One corrupted glyph in a scanned/searchable text layer must not
+        # invalidate a coordinate-proven row, but a made-up narration cannot
+        # pass.  Require every row to retain some source evidence and at
+        # least 95% of narrated rows to retain the normal 70% token match.
+        if not matched or score < 0.25:
+            return False
+        if score >= 0.70:
+            strong_rows += 1
+    return narrated_rows > 0 and strong_rows / narrated_rows >= 0.95
+
 def clean_narration(s: str) -> str:
     """Keep only the statement's Particulars, never amounts or page furniture."""
     lines = []
@@ -2077,7 +2113,19 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     normalized_source = normalize_narration(raw)
     unmatched = [x["narration"] for x in tx if normalize_narration(x["narration"]) and normalize_narration(x["narration"]) not in normalized_source]
     malformed_narrations = [x["narration"] for x in tx if re.fullmatch(r"\s*[\d,.]+\s*", x["narration"] or "")]
-    narration_valid = not unmatched and not malformed_narrations and coverage_valid
+    # The ordinary path requires exact normalized source order.  Original-PDF
+    # geometry has an additional, stricter-than-guessing route for statements
+    # whose embedded text layer serialises Particulars out of visual order.
+    # It remains gated by complete records, source amounts and the measured
+    # narration column; it never applies to generic text-layout parsing.
+    coordinate_trace_valid = (
+        strategy_override == "geometry_profile"
+        and path.suffix.lower() == ".pdf"
+        and coverage_valid
+        and source_amount_valid
+        and coordinate_narrations_traceable(tx, raw)
+    )
+    narration_valid = (not unmatched or coordinate_trace_valid) and not malformed_narrations and coverage_valid
     return tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_withdrawals, declared_deposits, statement_totals_valid
 
 def export_excel(tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_withdrawals=None, declared_deposits=None, statement_totals_valid=True, source_balance_unreliable=False):
