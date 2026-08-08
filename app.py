@@ -27,6 +27,13 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill
 import pdfplumber
 from pypdf import PdfReader
+try:
+    import pymupdf as fitz  # PyMuPDF: substantially faster text extraction for long PDFs.
+except ImportError:  # Keep local/development fallback usable until dependencies install.
+    try:
+        import fitz  # Compatibility with older PyMuPDF releases.
+    except ImportError:
+        fitz = None
 
 ROOT = Path(__file__).parent
 # Railway's container filesystem is replaced on a restart.  When a persistent
@@ -344,6 +351,7 @@ HISTORICAL_CHALLENGE_LESSONS = [
     "Statements may run newest-to-oldest. Detect direction before calculating endpoints or balance chains; reverse the chain logic only when source balances prove it.",
     "With a single unsigned amount column, determine withdrawal/deposit from signed running-balance movement, not from references or arbitrary numeric text.",
     "For a headerless or sparse-header PDF with multiple dated rows ending in explicit Dr/Cr balances, prefer the signed running-balance text strategy before table geometry. Use untouched source text for B/F and final endpoints, and remove only proven headers, footers, and address furniture from narration.",
+    "For a headerless signed cash-credit ledger, count a source transaction as one dated block that reaches an explicit Dr/Cr balance before the next date. A date-only count can include period labels or other dated furniture and must not reject an otherwise complete, balance-chained extract.",
     "When the source running-balance column is demonstrably unreliable, do not use it as ordinary evidence. Use the narrowly defined printed-totals exception only with exact totals, source coverage, count, narration checks, assumed endpoints, and a manual-review warning.",
     "Printed debit/credit summary totals can be wrong. They are an additional warning unless the unreliable-balance exception requires exact source-total equality; never change parsed rows merely to match a summary.",
     "A correct financial endpoint alone is insufficient. Require one-to-one narration/source coverage, transaction count, and a complete balance chain whenever the source balance is reliable.",
@@ -886,6 +894,31 @@ def open_pdf_reader(path: Path) -> PdfReader:
             raise ValueError("PASSWORD_REQUIRED: This PDF is password protected. Enter its password and submit it again; UPG will not retry unreadable encrypted files.")
     return reader
 
+
+def fast_pdf_text(path: Path, page_indices: list[int] | None = None) -> str:
+    """Read searchable-PDF text with PyMuPDF when available.
+
+    Long statements must still be fully parsed and validated, but they must not
+    pay the much slower pure-Python extraction cost once per retry.  PyMuPDF
+    reads the same original PDF text layer; it does not OCR, invent geometry,
+    or change the evidence used by validation.  Encrypted PDFs retain the
+    existing password-safe pypdf route.
+    """
+    if fitz is None:
+        reader = open_pdf_reader(path)
+        pages = page_indices if page_indices is not None else range(len(reader.pages))
+        return "\f".join(reader.pages[index].extract_text() or "" for index in pages)
+    document = fitz.open(str(path))
+    try:
+        if document.needs_pass:
+            password = pdf_password(path)
+            if not password or not document.authenticate(password):
+                raise ValueError("PASSWORD_REQUIRED: This PDF is password protected. Enter its password and submit it again; UPG will not retry unreadable encrypted files.")
+        pages = page_indices if page_indices is not None else range(document.page_count)
+        return "\f".join(document.load_page(index).get_text("text") for index in pages)
+    finally:
+        document.close()
+
 def open_pdfplumber(path: Path):
     password = pdf_password(path)
     try:
@@ -940,7 +973,12 @@ def sampled_pdf_text(path: Path) -> str:
     reader = open_pdf_reader(path)
     count = len(reader.pages)
     indices = sampled_page_indices(count)
-    sample = "\n".join(f"[PAGE {index + 1}]\n{reader.pages[index].extract_text() or ''}" for index in indices)
+    page_texts = fast_pdf_text(path, indices)
+    # Preserve page-boundary evidence for the planner while using the fast
+    # native extractor for the source text itself.
+    sample = "\n".join(f"[PAGE {index + 1}]\n{text}" for index, text in zip(indices, page_texts.split("\f")))
+    if not sample.strip():
+        sample = fast_pdf_text(path, indices)
     with EXTRACTION_CACHE_LOCK:
         if len(PDF_SAMPLE_CACHE) >= 12:
             PDF_SAMPLE_CACHE.pop(next(iter(PDF_SAMPLE_CACHE)))
@@ -1289,6 +1327,23 @@ def raw_transaction_record_count(raw: str) -> int | None:
             return len(numeric_primary)
     return None
 
+
+def signed_balance_source_count(raw: str) -> int | None:
+    """Count a headerless Dr/Cr ledger from its source-record shape.
+
+    A J&K cash-credit row can wrap its narration over multiple lines, so a
+    date-only count overstates the source by counting a handful of repeated
+    period/metadata lines.  A dated block that reaches one explicit signed
+    balance before the next dated block is the independent source record.
+    """
+    pattern = re.compile(
+        r"(?im)^\s*\d{2}-\d{2}-\d{4}\b"
+        r"(?:(?!^\s*\d{2}-\d{2}-\d{4}\b)[\s\S])*?"
+        r"\d[\d,]*\.\d{2}\s*(?:dr|cr)\b"
+    )
+    count = len(pattern.findall(raw or ""))
+    return count if count >= 3 else None
+
 def display_date(value: object) -> str:
     parsed = transaction_date_value(str(value))
     return parsed.strftime("%d/%m/%Y") if parsed else str(value or "")
@@ -1342,8 +1397,7 @@ def structured_source_count(path: Path) -> int | None:
         return None
 
 def read_pdf_text(path: Path) -> str:
-    reader = open_pdf_reader(path)
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    return fast_pdf_text(path)
 
 def cached_pdf_text(path: Path) -> str:
     key = str(path.resolve())
@@ -2146,10 +2200,24 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     long_date_records = len(re.findall(r"(?m)^\s*\d{2}-[A-Za-z]{3}-\d{4}\b", raw))
     if long_date_records:
         expected_source_count = max(expected_source_count, long_date_records)
-    independent_count = raw_transaction_record_count(raw)
-    if independent_count is not None:
+    independent_count = (
+        signed_balance_source_count(raw)
+        if strategy_override == "running_balance_text"
+        else raw_transaction_record_count(raw)
+    )
+    if strategy_override == "running_balance_text" and independent_count is not None:
+        # This source shape is stronger than a date-only count.  The latter
+        # also sees a small number of dated period/metadata lines, whereas a
+        # real ledger record is proved by its terminal signed balance.
+        expected_source_count = independent_count
+    elif independent_count is not None:
         expected_source_count = max(expected_source_count, independent_count)
-    if strategy_override is not None:
+    # Text-layout strategies already have a stronger, independent denominator:
+    # raw_transaction_record_count() reads every dated source row.  Calling the
+    # generic table discoverer here re-scans all 1,176 pages with pdfplumber,
+    # even though this J&K layout has no table borders or reusable headers.
+    # Reserve that expensive structural check for a geometry/table candidate.
+    if strategy_override in ("geometry_profile",):
         table_count = structured_source_count(path)
         if table_count is not None:
             expected_source_count = table_count
