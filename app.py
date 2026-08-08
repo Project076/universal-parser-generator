@@ -2013,10 +2013,9 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     page_total_withdrawals, page_total_deposits = source_page_total_sums(
         cached_pdf_text(path) if path.suffix.lower() == ".pdf" else raw
     )
-    # A matched Grand Total and sum of every printed Page Total are two
-    # independent statement controls.  In that situation they are a release
-    # gate, even though a lone Grand Total remains only a warning because some
-    # banks print it incorrectly.
+    # A matched Grand Total and sum of every printed Page Total are stronger
+    # discrepancy evidence than a lone summary, but still not absolute truth:
+    # some banks publish both from the same erroneous upstream summary.
     source_totals_independently_confirmed = (
         page_total_withdrawals is not None
         and page_total_deposits is not None
@@ -2092,10 +2091,6 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
                 coverage_valid = False
         except Exception:
             pass
-    # Printed debit/credit totals are useful independent evidence, but some
-    # banks issue statements with incorrect summary totals. They are reported
-    # as a warning; release still depends on transaction-level running-balance
-    # reconciliation, endpoints, coverage, and narration validation.
     # Printed debit/credit summary totals are useful cross-check evidence, but
     # some bank statements print them incorrectly. They must never override a
     # complete source-record count, transaction-level balance chain, and the
@@ -2133,19 +2128,26 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
             computed = opening - total_w + total_d
             total_reconciles = computed.quantize(Decimal(".01")) == closing.quantize(Decimal(".01"))
             source_balance_unreliable = total_reconciles
+    # Printed Grand/Page totals are a valuable independent discrepancy signal,
+    # but banks can publish an incorrect summary.  They therefore guide UPG's
+    # repair diagnosis and are reported to reviewers; they never override a
+    # complete transaction-level balance chain, endpoint reconciliation,
+    # narration traceability, and source-record count.  The unreliable-running
+    # balance exception above remains stricter and still requires exact totals.
+    source_totals_conflict = source_totals_independently_confirmed and not statement_totals_valid
     financial_valid = (
         total_reconciles
         and (running_balance_valid or source_balance_unreliable)
         and source_amount_valid
         and no_opening_as_transaction
         and coverage_valid
-        and (not source_totals_independently_confirmed or statement_totals_valid)
     )
     # Preserve this certified exception in the profile without changing any
     # actual column mapping.  Consumers must never present it as a normal
     # balance-chain pass.
     columns["_source_balance_unreliable"] = source_balance_unreliable
     columns["_balance_endpoint_derived"] = locals().get("endpoint_derived", "none")
+    columns["_source_totals_conflict"] = source_totals_conflict
     # The original source text is independent evidence.  A narration that cannot
     # be located there is not silently accepted just because amounts reconcile.
     # Build the normalized source once. Re-normalizing a 250-page statement
@@ -2406,6 +2408,12 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             "transaction_count": len(tx),
                             "source_transaction_count": expected_source_count,
                             "source_coverage_pass": bool(coverage_valid),
+                            "printed_totals_conflict": bool(columns.get("_source_totals_conflict")),
+                            "printed_totals_review_message": (
+                                "Printed Grand/Page totals differ from parsed totals. "
+                                "Transaction-level validation passed; review the statement summary."
+                                if columns.get("_source_totals_conflict") else ""
+                            ),
                         },
                         bank_name=str(job_context.get("bank_name") or "Unknown"),
                         format_name=f"{path.suffix.lower().lstrip('.') or 'pdf'} statement".upper(),
@@ -2414,7 +2422,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     name = export_excel(tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_wd, declared_dp, statement_totals_valid, bool(columns.get("_source_balance_unreliable")))
                     with JOBS_LOCK:
                         balance_note = " Running-balance column: SOURCE UNRELIABLE; parsed totals match printed totals and assumed opening/closing were used. Review the source statement." if columns.get("_source_balance_unreliable") else " Balance-chain validation: PASS."
-                        JOBS[job_id] = {"processing": False, "valid": True, "message": f"Validated after {round_number} UPG retry rounds. Parsed {len(tx)} transactions. Opening {indian_amount(op)} − withdrawals {indian_amount(wd)} + deposits {indian_amount(dp)} = {indian_amount(calculated)}; declared closing balance is {indian_amount(cl)}. Source coverage: PASS. Financial validation: PASS. Narration validation: PASS.{balance_note}", "download": "/download/" + name}
+                        totals_note = (" Printed Grand/Page totals differ from parsed totals: WARNING. "
+                            "Transaction-level checks passed, so UPG has not treated the printed summary as absolute truth."
+                            if columns.get("_source_totals_conflict") else "")
+                        JOBS[job_id] = {"processing": False, "valid": True, "message": f"Validated after {round_number} UPG retry rounds. Parsed {len(tx)} transactions. Opening {indian_amount(op)} − withdrawals {indian_amount(wd)} + deposits {indian_amount(dp)} = {indian_amount(calculated)}; declared closing balance is {indian_amount(cl)}. Source coverage: PASS. Financial validation: PASS. Narration validation: PASS.{balance_note}{totals_note}", "download": "/download/" + name}
                         JOBS[job_id].update({"status": "completed", "profile_id": profile_id, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
                         persist_job_locked(job_id)
                     post_completion_webhook(job_id, "completed", profile_id)
@@ -2423,9 +2434,13 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                 failed_candidates.add(signature)
                 if not force_ai_profile:
                     failed_strategy_keys.add(strategy_key)
+                totals_evidence = ("CONFLICT: Grand Total and summed Page Totals agree with each other but differ from parsed amounts; "
+                    "inspect duplicate rows, cross-page continuations, footer/header furniture, and amount-column mapping."
+                    if candidate[10].get("_source_totals_conflict") else "no independently confirmed printed-total conflict")
                 repair_context = (f"UPG self-healing round {round_number}: candidate extracted {len(candidate[0])} of "
                     f"{candidate[13]} source records; source coverage={'PASS' if candidate[12] else 'FAIL'}, "
-                    f"financial={'PASS' if candidate[6] else 'FAIL'}, narration={'PASS' if candidate[7] else 'FAIL'}. "
+                    f"financial={'PASS' if candidate[6] else 'FAIL'}, narration={'PASS' if candidate[7] else 'FAIL'}, "
+                    f"printed-total evidence={totals_evidence}. "
                     "Propose a safe header/column addendum only; do not weaken validation.")
             except Exception as error:
                 safe_error = re.sub(r"\s+", " ", str(error)).strip()[:300]
