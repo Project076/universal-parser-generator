@@ -2655,6 +2655,19 @@ def submit_retry_job(job_id: str, path: Path, fallback_open: str, fallback_close
         persist_job_locked(job_id)
     JOB_EXECUTOR.submit(run_retry_job, job_id, path, fallback_open, fallback_close)
 
+def defer_retry_job(job_id: str, path: Path, fallback_open: str, fallback_close: str) -> None:
+    """Dispatch parser work only after the HTTP caller receives its job ID.
+
+    PDF extraction is CPU intensive.  Starting it inline can let the worker
+    take the interpreter before the upload response is written, particularly
+    for a large statement on a single Railway container.  A tiny deferred
+    dispatch keeps the request responsive without changing queue order,
+    validation rules, or job persistence.
+    """
+    dispatch = threading.Timer(0.05, submit_retry_job, args=(job_id, path, fallback_open, fallback_close))
+    dispatch.daemon = True
+    dispatch.start()
+
 def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = "", fallback_close: str = "") -> dict:
     """Run UPG's native, certified extraction against the original source.
 
@@ -2793,7 +2806,8 @@ class App(BaseHTTPRequestHandler):
         with JOBS_LOCK:
             JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": timestamp_now(), "client_heartbeat_at": timestamp_now(), "bs_analyzer_statement_id": fields.get("bs_analyzer_statement_id"), "bank_name": fields.get("bank_name", "Unknown"), "source_format": fields.get("source_format", ""), "source_file": saved.name, "fallback_open": opening, "fallback_close": closing, "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
             persist_job_locked(job_id)
-        submit_retry_job(job_id, saved, opening, closing)
+        # Return the accepted job before CPU-heavy PDF work enters the queue.
+        defer_retry_job(job_id, saved, opening, closing)
         return job_id
     def do_GET(self):
         parsed_url = urlparse(self.path)
@@ -2993,8 +3007,11 @@ class App(BaseHTTPRequestHandler):
             with JOBS_LOCK:
                 JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": timestamp_now(), "client_heartbeat_at": timestamp_now(), "cancel_token": cancel_token, "source_file": saved.name, "fallback_open": fields.get("opening", ""), "fallback_close": fields.get("closing", ""), "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
                 persist_job_locked(job_id)
-            submit_retry_job(job_id, saved, fields.get("opening", ""), fields.get("closing", ""))
             self.json({"processing": True, "valid": False, "job": job_id, "cancel_token": cancel_token, "message": "UPG is retrying parser candidates. Excel and profile creation remain locked until both validations pass."})
+            # The browser must receive this response before a large document
+            # starts parser work; otherwise its fetch may time out while the
+            # worker holds the CPU.
+            defer_retry_job(job_id, saved, fields.get("opening", ""), fields.get("closing", ""))
             return
             # UPG retry loop: do not treat the first failed strategy as final.
             result = None
