@@ -2740,6 +2740,16 @@ recover_persisted_jobs()
 threading.Thread(target=queue_supervisor, name="upg-queue-supervisor", daemon=True).start()
 
 class App(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        """Keep normal HTTP access logs out of Railway's error stream.
+
+        ``BaseHTTPRequestHandler`` writes every access line to stderr. Railway
+        consequently labels even successful 200/201 responses as errors,
+        which hides real failures in the deployment log.  Access entries are
+        still retained, but go to stdout as ordinary operational logs.
+        """
+        print("HTTP " + (format % args), flush=True)
+
     def json(self, data, status=200):
         payload=json.dumps(data).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(payload))); self.end_headers(); self.wfile.write(payload)
     def api_authorized(self) -> bool:
@@ -2909,7 +2919,20 @@ class App(BaseHTTPRequestHandler):
                 job_id = self.start_api_job(self.multipart_fields())
                 self.json({"job_id": job_id}, HTTPStatus.ACCEPTED)
             except Exception as error:
-                self.json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
+                # Do not put request bodies, PDF data, or credentials into
+                # Railway logs.  The response remains actionable for the
+                # calling integration while the log gets a safe diagnostic.
+                detail = str(error)
+                if "multipart/form-data" in detail:
+                    code = "multipart_required"
+                elif "file is required" in detail:
+                    code = "file_required"
+                elif "Content-Length" in detail:
+                    code = "content_length_required"
+                else:
+                    code = "invalid_job_submission"
+                print(f"UPG parser-job rejected: {code}", flush=True)
+                self.json({"error": detail, "code": code}, HTTPStatus.BAD_REQUEST)
             return
         if path == "/parser-profiles/import":
             if not self.api_authorized(): return
