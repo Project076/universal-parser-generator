@@ -2751,11 +2751,14 @@ def recover_persisted_jobs() -> None:
             elif job.get("password_provided"):
                 patch_job(job_id, processing=False, valid=False, status="failed",
                           message="UPG restarted while this protected PDF was running. For security the password was not saved; enter it again to start a fresh validated job.")
-            elif source_file and source_path.exists():
-                submit_retry_job(job_id, source_path, str(job.get("fallback_open", "")), str(job.get("fallback_close", "")))
             else:
+                # Do not resume an old API job automatically.  A large
+                # extraction can monopolise the only container worker after a
+                # deploy while its original caller is no longer connected.
+                # The caller receives a durable failed status and may submit a
+                # fresh job; validated parser profiles are never affected.
                 patch_job(job_id, processing=False, valid=False, status="failed",
-                          message="UPG restarted and the temporary source file is unavailable. No parser was saved; upload the statement again.")
+                          message="UPG restarted before this job completed. The unfinished job was stopped so it cannot block new requests; submit it again to start a fresh validated job.")
         except Exception:
             # A malformed old job record must never prevent the service start.
             continue
