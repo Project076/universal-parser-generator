@@ -1148,6 +1148,25 @@ def source_transaction_totals(text: str) -> tuple[Decimal | None, Decimal | None
         return None, None
     return money(summary.group(1)), money(summary.group(2))
 
+def source_page_total_sums(text: str) -> tuple[Decimal | None, Decimal | None]:
+    """Sum printed page totals as an independent control over Grand Total.
+
+    Some source statements have an unreliable summary.  A Grand Total becomes
+    trustworthy only when the statement's own Page Total rows independently
+    sum to it.  This prevents an equal debit/credit duplication from cancelling
+    out in the opening-to-closing equation.
+    """
+    matches = re.findall(
+        r"(?is)\bpage\s+total\s*:\s*([\d,]+(?:\.\d{1,2})?)\s+"
+        r"([\d,]+(?:\.\d{1,2})?)\s+[-]?[\d,]+(?:\.\d{1,2})?\s*(?:dr|cr)?",
+        text or "",
+    )
+    if len(matches) < 2:
+        return None, None
+    first = sum((money(left) or Decimal("0")) for left, _right in matches)
+    second = sum((money(right) or Decimal("0")) for _left, right in matches)
+    return first, second
+
 def table_balances(rows: list[list[object]], header_at: int, columns: dict[str, int]) -> tuple[Decimal | None, Decimal | None]:
     """Extract declared balances from the source table, independent of computed totals."""
     balance_index = columns.get("balance")
@@ -1991,6 +2010,21 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # Footer cleaning removes page totals and may remove the final Grand Total;
     # inspect the original statement text for this optional source control.
     declared_withdrawals, declared_deposits = source_transaction_totals(cached_pdf_text(path) if path.suffix.lower() == ".pdf" else raw)
+    page_total_withdrawals, page_total_deposits = source_page_total_sums(
+        cached_pdf_text(path) if path.suffix.lower() == ".pdf" else raw
+    )
+    # A matched Grand Total and sum of every printed Page Total are two
+    # independent statement controls.  In that situation they are a release
+    # gate, even though a lone Grand Total remains only a warning because some
+    # banks print it incorrectly.
+    source_totals_independently_confirmed = (
+        page_total_withdrawals is not None
+        and page_total_deposits is not None
+        and declared_withdrawals is not None
+        and declared_deposits is not None
+        and page_total_withdrawals.quantize(Decimal(".01")) == declared_withdrawals.quantize(Decimal(".01"))
+        and page_total_deposits.quantize(Decimal(".01")) == declared_deposits.quantize(Decimal(".01"))
+    )
     statement_totals_valid = (
         (declared_withdrawals is None or total_w.quantize(Decimal(".01")) == declared_withdrawals.quantize(Decimal(".01")))
         and (declared_deposits is None or total_d.quantize(Decimal(".01")) == declared_deposits.quantize(Decimal(".01")))
@@ -2099,7 +2133,14 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
             computed = opening - total_w + total_d
             total_reconciles = computed.quantize(Decimal(".01")) == closing.quantize(Decimal(".01"))
             source_balance_unreliable = total_reconciles
-    financial_valid = total_reconciles and (running_balance_valid or source_balance_unreliable) and source_amount_valid and no_opening_as_transaction and coverage_valid
+    financial_valid = (
+        total_reconciles
+        and (running_balance_valid or source_balance_unreliable)
+        and source_amount_valid
+        and no_opening_as_transaction
+        and coverage_valid
+        and (not source_totals_independently_confirmed or statement_totals_valid)
+    )
     # Preserve this certified exception in the profile without changing any
     # actual column mapping.  Consumers must never present it as a normal
     # balance-chain pass.
