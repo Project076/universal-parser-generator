@@ -338,6 +338,7 @@ HISTORICAL_CHALLENGE_LESSONS = [
     "Use the original PDF geometry for layout decisions. For large PDFs, use first/middle/last samples with boundary pages to design the profile, then parse and validate all pages.",
     "Statements may run newest-to-oldest. Detect direction before calculating endpoints or balance chains; reverse the chain logic only when source balances prove it.",
     "With a single unsigned amount column, determine withdrawal/deposit from signed running-balance movement, not from references or arbitrary numeric text.",
+    "For a headerless or sparse-header PDF with multiple dated rows ending in explicit Dr/Cr balances, prefer the signed running-balance text strategy before table geometry. Use untouched source text for B/F and final endpoints, and remove only proven headers, footers, and address furniture from narration.",
     "When the source running-balance column is demonstrably unreliable, do not use it as ordinary evidence. Use the narrowly defined printed-totals exception only with exact totals, source coverage, count, narration checks, assumed endpoints, and a manual-review warning.",
     "Printed debit/credit summary totals can be wrong. They are an additional warning unless the unreliable-balance exception requires exact source-total equality; never change parsed rows merely to match a summary.",
     "A correct financial endpoint alone is insufficient. Require one-to-one narration/source coverage, transaction count, and a complete balance chain whenever the source balance is reliable.",
@@ -757,21 +758,28 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
     if validated_strategy:
         add(validated_strategy, False, 1_000)
     headers: list[object] = []
+    header_fields: dict[str, int] = {}
     if path.suffix.lower() == ".pdf":
         try:
             geometry = sampled_geometry_profile(path)
             if geometry:
                 headers = geometry[0]
+                header_fields = map_headers(headers)
                 exact = load_profile(headers)
                 related_id, related_columns = (None, {}) if exact else find_related_profile(headers)
                 if exact:
                     add(str(exact.get("last_validated_strategy", "detected_table")), False, 900)
                 elif related_id and related_columns:
                     add("geometry_profile" if large_pdf else "detected_table", False, 800)
-                add("geometry_profile", False, 750 if large_pdf else 650)
+                # A sparse, guessed header is not enough evidence to make a
+                # table-geometry parser the first choice.  Headerless J&K
+                # Bank layouts, for example, expose their transactions as
+                # dated text ending in signed Dr/Cr balances.
+                geometry_score = 750 if len(header_fields) >= 4 else 320
+                add("geometry_profile", False, geometry_score if large_pdf else min(650, geometry_score))
         except (OSError, ValueError, KeyError):
             pass
-    if geometry_ready:
+    if geometry_ready and len(header_fields) >= 4:
         add("geometry_profile", False, 780)
 
     for lesson in closest_certified_lessons(path, headers):
@@ -787,8 +795,18 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         sample = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
         if re.search(r"(?i)\bvalue\s+date\b", sample):
             add("value_date_unsigned", False, 520)
+        signed_balance_rows = len(re.findall(
+            r"(?im)^\s*\d{2}[-/]\d{2}[-/]\d{2,4}\b.*?\b\d[\d,]*\.\d{1,2}\s*(?:dr|cr)\b", sample
+        ))
         if re.search(r"(?i)\b(?:dr|cr)\b", sample):
-            add("running_balance_text", False, 500)
+            # For a headerless/sparse-header signed-balance layout this is
+            # direct original-source evidence, stronger than inferred column
+            # geometry.  Start with it rather than spending retries proving
+            # that a three-field table guess is unsuitable.
+            signed_score = 1_100 if signed_balance_rows >= 3 and len(header_fields) < 4 else 500
+            add("running_balance_text", False, signed_score)
+            if signed_balance_rows >= 3 and len(header_fields) < 4:
+                add("page_text_unsigned", False, 1_020)
         if re.search(r"(?i)\b(?:running|closing|available)\s+balance\b", sample):
             add("unsigned_running_balance_text", False, 460)
         if not headers:
@@ -886,7 +904,26 @@ def prefers_running_balance_text(path: Path) -> bool:
     heading = bool(re.search(r"(?i)(?:particulars|narration|description).*?(?:withdrawals?|debits?|deposits?|credits?).*?balance", raw[:6000]))
     dated_rows = len(re.findall(r"(?m)^\s*\d{2}[-/]\d{2}[-/]\d{2,4}\b", raw))
     signed_balances = bool(re.search(r"\b(?:cr|dr)\b", raw, re.I))
-    return heading and dated_rows >= 10 and signed_balances
+    signed_dated_rows = len(re.findall(
+        r"(?im)^\s*\d{2}[-/]\d{2}[-/]\d{2,4}\b.*?\b\d[\d,]*\.\d{1,2}\s*(?:dr|cr)\b", raw
+    ))
+    # Most banks have column labels, but some long J&K layouts do not.  Ten
+    # independently dated signed-balance lines are enough source evidence to
+    # select the deterministic signed-running-balance parser safely.
+    return signed_balances and ((heading and dated_rows >= 10) or signed_dated_rows >= 10)
+
+def sampled_geometry_is_structurally_ready(path: Path) -> bool:
+    """Only treat sampled geometry as first-choice evidence with real columns."""
+    if path.suffix.lower() != ".pdf":
+        return False
+    try:
+        geometry = sampled_geometry_profile(path)
+        if not geometry:
+            return False
+        fields = map_headers(geometry[0])
+        return len(fields) >= 4 and "date" in fields and "balance" in fields
+    except (OSError, ValueError, KeyError):
+        return False
 
 def sampled_pdf_text(path: Path) -> str:
     """Representative evidence for profile generation on very long PDFs."""
@@ -2302,9 +2339,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     skipped_candidates = int(saved_state.get("skipped_candidates", 0) or 0)
     validated_strategy = saved_text_strategy(path)
     large_pdf = is_large_pdf(path)
-    # A sampled original-PDF geometry profile is stronger than text order.
-    # Use it first whenever it exists, including for borderless statements.
-    geometry_ready = large_pdf and sampled_geometry_profile(path) is not None
+    # Original-PDF geometry is strongest only after it proves that it has a
+    # usable transaction header.  A sparse inferred header must not suppress
+    # the signed running-balance text parser.
+    geometry_ready = large_pdf and sampled_geometry_is_structurally_ready(path)
     text_first = large_pdf and not geometry_ready and prefers_running_balance_text(path)
     diagnostic_rules: set[str] = {str(item) for item in saved_state.get("diagnostic_rules", [])}
     planned_strategies: list[str] = [str(item) for item in saved_state.get("planned_strategies", [])]
