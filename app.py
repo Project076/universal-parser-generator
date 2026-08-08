@@ -1128,6 +1128,18 @@ def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
     if opening is None and bf:
         amount = money(bf.group(1))
         opening = -abs(amount) if amount is not None and bf.group(2).lower() == "dr" else amount
+    # J&K Bank cash-credit statements commonly place the final running
+    # balance as the third value on their last Grand Total line, without a
+    # separate "Closing Balance" label.  It is a statement-level endpoint,
+    # never a transaction or a total amount.
+    if closing is None:
+        grand_endpoint = re.findall(
+            r"(?is)\bgrand\s+total\s*:\s*[\d,]+(?:\.\d{1,2})?\s+"
+            r"[\d,]+(?:\.\d{1,2})?\s+(-?[\d,]+(?:\.\d{1,2})?\s*(?:dr|cr)?)",
+            text,
+        )
+        if grand_endpoint:
+            closing = money(grand_endpoint[-1])
     return opening, closing
 
 def source_transaction_totals(text: str) -> tuple[Decimal | None, Decimal | None]:
@@ -1953,7 +1965,12 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         if deposit is None: deposit = Decimal("0")
         if withdrawal or deposit:
             tx.append({"date": display_date(table_date), "narration": clean_narration(str(cell("narration") or "")), "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": money(cell("balance")), "source_amount": money(row[6]) if len(row) > 6 else None})
-    source_opening, source_closing = source_balances(raw)
+    # Transaction extraction uses the furniture-cleaned text, but statement
+    # endpoints must come from the original PDF text.  A repeated J&K Bank
+    # header block can sit before B/F and the final Grand Total; cleaning it is
+    # right for row parsing but must not erase those source-proven endpoints.
+    endpoint_text = cached_pdf_text(path) if path.suffix.lower() == ".pdf" else raw
+    source_opening, source_closing = source_balances(endpoint_text)
     opening, closing = source_opening, source_closing
     tab_opening, tab_closing = table_balances(rows, header_at, columns)
     if path.suffix.lower() == ".pdf":
