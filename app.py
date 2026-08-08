@@ -251,7 +251,12 @@ def expire_abandoned_jobs() -> None:
             if job.get("status") not in {"queued", "processing", "pending"}:
                 continue
             last_seen = job.get("client_heartbeat_at") or job.get("submitted_at")
-            if timestamp_age_seconds(last_seen) > JOB_CLIENT_LEASE_SECONDS:
+            # A direct browser page has no server-side caller that can resume
+            # it safely.  Release its worker sooner when the page was closed,
+            # refreshed, or lost network.  API jobs retain the normal lease
+            # because BS Analyzer continues polling them server-to-server.
+            lease_seconds = 90 if job.get("cancel_token") else JOB_CLIENT_LEASE_SECONDS
+            if timestamp_age_seconds(last_seen) > lease_seconds:
                 candidates.append(job_id)
     for job_id in candidates:
         cancel_job(job_id, "Cancelled automatically because the requesting client stopped monitoring this job.")
@@ -2737,7 +2742,13 @@ def recover_persisted_jobs() -> None:
                 continue
             source_file = str(job.get("source_file", ""))
             source_path = UPLOADS / source_file
-            if job.get("password_provided"):
+            if job.get("cancel_token"):
+                # A direct browser upload is tied to that browser tab.  Do not
+                # silently resurrect it after a deploy: it could occupy the
+                # sole worker even though the user has refreshed or left.
+                patch_job(job_id, processing=False, valid=False, status="cancelled",
+                          message="UPG restarted before this direct-browser job completed. The old job was cancelled so it cannot block the queue; upload the statement again to start a fresh validated job.")
+            elif job.get("password_provided"):
                 patch_job(job_id, processing=False, valid=False, status="failed",
                           message="UPG restarted while this protected PDF was running. For security the password was not saved; enter it again to start a fresh validated job.")
             elif source_file and source_path.exists():
