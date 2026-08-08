@@ -439,6 +439,19 @@ def coordinate_narrations_traceable(transactions: list[dict], raw: str) -> bool:
 
 def clean_narration(s: str) -> str:
     """Keep only the statement's Particulars, never amounts or page furniture."""
+    # A J&K Bank transaction can be split after its reference on page N and
+    # resume with the remaining Particulars on page N+1.  The repeated branch,
+    # account-holder and statement block sits between those two pieces.  Strip
+    # that *middle* block while preserving both the reference before it and the
+    # real continuation after it.  Dropping the whole cell would lose a valid
+    # narration; retaining it leaks furniture into Excel.
+    s = re.sub(
+        r"(?is)\b(?:jammu\s+and\s+kashmir\s+bank\s+ltd|"
+        r"k\.?\s*b\.?\s*adda\s*,\s*baramulla\s*-\s*\d{4}).*?"
+        r"\bjammu\s+and\s+kashmir\s*",
+        " ",
+        str(s or ""),
+    )
     lines = []
     furniture = ("jammu and kashmir bank", "statement of account", "page total", "grand total", "printed by", "ifsc code", "micr code", "unless the constituent", "customer id", "currency code", "a/c no", "interest rate", "no nomination", "c kyc", "ckyc")
     for line in s.splitlines():
@@ -1939,7 +1952,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         if withdrawal is None: withdrawal = Decimal("0")
         if deposit is None: deposit = Decimal("0")
         if withdrawal or deposit:
-            tx.append({"date": display_date(table_date), "narration": str(cell("narration") or ""), "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": money(cell("balance")), "source_amount": money(row[6]) if len(row) > 6 else None})
+            tx.append({"date": display_date(table_date), "narration": clean_narration(str(cell("narration") or "")), "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": money(cell("balance")), "source_amount": money(row[6]) if len(row) > 6 else None})
     source_opening, source_closing = source_balances(raw)
     opening, closing = source_opening, source_closing
     tab_opening, tab_closing = table_balances(rows, header_at, columns)
