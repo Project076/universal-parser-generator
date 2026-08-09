@@ -296,6 +296,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "reverse_order": "Reverse newest-first statements before reconciliation.",
     "source_coverage": "Reject partial extracts and require all detectable source records.",
     "truncated_table_date": "Repair a date cell only when the original source proves its missing final year digit; retain the row's actual amount and balance, never discard it.",
+    "bf_preperiod_artifact": "For a dated B/F-area OCR artifact, never delete a source-proven amount merely because its OCR date falls outside the statement period. Neutralize it only when source context proves the amount is included in printed Grand Totals: pin its date to the statement-period start, clear its non-transaction B/F balance, retain its actual amount/narration, and make the opening/closing anchors ignore that cleared balance.",
     "signed_balance_text": "Use dated text blocks with Dr/Cr running balances, then classify debit or credit from each balance movement.",
     "headerless_layout": "Treat a repeated or missing table header as layout evidence, not as a transaction; infer columns only from dated rows and running balances.",
     "multi_page_continuation": "Preserve a dated transaction whose narration or amount cells continue across a page boundary, excluding page headers and footers between its parts.",
@@ -310,7 +311,7 @@ Bank statement extraction policy:
 - Ignore logos, seals, images, QR codes, coloured banners, decorative lines, account-holder/address blocks, bank/branch contact information, page numbers, generated-on stamps, signatures, legal notices, repeated headings, and empty visual cells. Images and logos are never narration or an instrument number.
 - Particulars/Narration is source text from its own transaction cell only. Do not fill it using numbers, balances, dates, bank names, logos, headers, or nearby furniture. Keep it blank if the actual particulars cell is blank.
 - Use the original PDF's word coordinates, column x-ranges, and row y-ranges as the primary evidence for creating and reusing a parser profile. Use extracted text only to join narration continuations, provide validation evidence, or as a fallback when usable PDF geometry is absent.
-- B/F, opening balance, and brought-forward entries are statement metadata, never transactions.
+- B/F, opening balance, and brought-forward entries are statement metadata, never transactions. Narrow exception: an OCR-dated B/F-area artifact that has a source-proven transaction amount included in the printed Grand Total must not be deleted. Only when statement-period evidence, B/F context, and printed-total reconciliation jointly prove this case, pin its date to the period start and clear its B/F balance so it cannot become an opening/closing anchor; retain the source-proven amount and narration. Otherwise reject the ambiguity rather than guessing.
 - A row without a valid transaction date is statement furniture, a page/transaction total, or a balance label; never treat it as a transaction merely because it contains amounts.
 - Use the statement opening balance when printed. If it is absent, derive it from the first real transaction's signed running balance minus its deposit plus its withdrawal.
 - A printed statement-level opening or closing balance overrides any inferred value. Otherwise, the closing balance is the signed running balance of the last real transaction, never a page total, grand total, available amount, or other footer balance.
@@ -355,6 +356,7 @@ HISTORICAL_CHALLENGE_LESSONS = [
     "When the source running-balance column is demonstrably unreliable, do not use it as ordinary evidence. Use the narrowly defined printed-totals exception only with exact totals, source coverage, count, narration checks, assumed endpoints, and a manual-review warning.",
     "Printed debit/credit summary totals can be wrong. They are an additional warning unless the unreliable-balance exception requires exact source-total equality; never change parsed rows merely to match a summary.",
     "A correct financial endpoint alone is insufficient. Require one-to-one narration/source coverage, transaction count, and a complete balance chain whenever the source balance is reliable.",
+    "For a large multi-year statement, an OCR date near the B/F area can be an artifact even when its amount is real and included in the printed Grand Total. Do not delete that amount. With source proof of B/F context, statement period, and total inclusion, pin the date to the first day of the period and clear the non-transaction balance so endpoint selection ignores it. This is a narrow normalization, not a blanket early-row rule.",
     "Do not re-run a failed deterministic strategy. A repair must change a source-proven layout mapping or select a different supported strategy.",
 ]
 ALIASES = {
