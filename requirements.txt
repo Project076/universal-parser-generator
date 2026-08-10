@@ -2,3 +2,4 @@ openpyxl
 pdfplumber
 pypdf
 PyMuPDF
+python-docx

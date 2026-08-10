@@ -28,6 +28,10 @@ from openpyxl.styles import Font, PatternFill
 import pdfplumber
 from pypdf import PdfReader
 try:
+    from docx import Document
+except ImportError:  # Installed from requirements in production; retain a clear fallback error locally.
+    Document = None
+try:
     import pymupdf as fitz  # PyMuPDF: substantially faster text extraction for long PDFs.
 except ImportError:  # Keep local/development fallback usable until dependencies install.
     try:
@@ -311,6 +315,7 @@ Bank statement extraction policy:
 - Ignore logos, seals, images, QR codes, coloured banners, decorative lines, account-holder/address blocks, bank/branch contact information, page numbers, generated-on stamps, signatures, legal notices, repeated headings, and empty visual cells. Images and logos are never narration or an instrument number.
 - Particulars/Narration is source text from its own transaction cell only. Do not fill it using numbers, balances, dates, bank names, logos, headers, or nearby furniture. Keep it blank if the actual particulars cell is blank.
 - Use the original PDF's word coordinates, column x-ranges, and row y-ranges as the primary evidence for creating and reusing a parser profile. Use extracted text only to join narration continuations, provide validation evidence, or as a fallback when usable PDF geometry is absent.
+- For a DOCX statement that has no actual Word table or cell coordinates, preserve paragraph order and leading spaces exactly and treat it as a fixed-width text layout. Derive columns from the source heading and aligned amount/balance positions; merge wrapped continuation lines. Never claim PDF-style geometry for such a DOCX, and do not discard whitespace before extraction.
 - B/F, opening balance, and brought-forward entries are statement metadata, never transactions. Narrow exception: an OCR-dated B/F-area artifact that has a source-proven transaction amount included in the printed Grand Total must not be deleted. Only when statement-period evidence, B/F context, and printed-total reconciliation jointly prove this case, pin its date to the period start and clear its B/F balance so it cannot become an opening/closing anchor; retain the source-proven amount and narration. Otherwise reject the ambiguity rather than guessing.
 - A row without a valid transaction date is statement furniture, a page/transaction total, or a balance label; never treat it as a transaction merely because it contains amounts.
 - Use the statement opening balance when printed. If it is absent, derive it from the first real transaction's signed running balance minus its deposit plus its withdrawal.
@@ -349,6 +354,7 @@ HISTORICAL_CHALLENGE_LESSONS = [
     "Page headers, addresses, branch/account blocks, logos, QR codes, legal notes, print stamps, and repeated titles are furniture even when they sit between two parts of a transaction.",
     "A transaction may continue over a page boundary. Remove intervening furniture, then merge only source-proven narration/amount/balance fragments into the same dated transaction.",
     "Use the original PDF geometry for layout decisions. For large PDFs, use first/middle/last samples with boundary pages to design the profile, then parse and validate all pages.",
+    "A bank DOCX can contain an exact fixed-width statement text layer without Word tables, tabs, or coordinates. Preserve its paragraph order and leading spaces, parse it as fixed-width text, and merge its wrapped continuation lines. Do not treat it as PDF geometry or collapse its whitespace before measuring columns.",
     "Statements may run newest-to-oldest. Detect direction before calculating endpoints or balance chains; reverse the chain logic only when source balances prove it.",
     "With a single unsigned amount column, determine withdrawal/deposit from signed running-balance movement, not from references or arbitrary numeric text.",
     "For a headerless or sparse-header PDF with multiple dated rows ending in explicit Dr/Cr balances, prefer the signed running-balance text strategy before table geometry. Use untouched source text for B/F and final endpoints, and remove only proven headers, footers, and address furniture from narration.",
@@ -1948,15 +1954,29 @@ def load_rows(path: Path, strategy_override: str | None = None, job_id: str | No
     if ext == ".csv":
         raw = path.read_text(encoding="utf-8-sig", errors="replace")
         result = list(csv.reader(io.StringIO(raw))), raw
-    if ext in (".xlsx", ".xls"):
+    elif ext in (".xlsx", ".xls"):
         book = openpyxl.load_workbook(path, data_only=True, read_only=True)
         sheet = book.active
         rows = [list(row) for row in sheet.iter_rows(values_only=True)]
         result = rows, "\n".join(" ".join(map(str, row)) for row in rows)
-    if ext == ".txt":
+    elif ext == ".txt":
         raw = path.read_text(encoding="utf-8", errors="replace")
         dialect = csv.excel_tab if "\t" in raw.splitlines()[0] else csv.excel
         result = list(csv.reader(io.StringIO(raw), dialect=dialect)), raw
+    elif ext == ".docx":
+        if Document is None:
+            raise ValueError("DOCX extraction support is unavailable. Install the python-docx dependency and retry.")
+        # Bank DOCX exports can be visually columnar without containing actual
+        # Word tables. Preserve paragraph order and every leading space: this
+        # is fixed-width source evidence, not PDF geometry. The generic text
+        # layout reader handles wrapped narration and derives directions from
+        # the source running-balance chain before normal validation runs.
+        raw = "\n".join(paragraph.text.rstrip() for paragraph in Document(path).paragraphs)
+        result = extract_text_layout_rows(raw), raw
+        if not result:
+            raise ValueError("No readable fixed-width transaction rows were found in this DOCX statement.")
+    elif ext == ".doc":
+        raise ValueError("Legacy .doc requires conversion to DOCX or TXT before safe fixed-width extraction.")
     elif ext == ".pdf": result = extract_pdf_rows(path, strategy_override, job_id)
     else: raise ValueError("This file needs a document-text extraction profile before it can be parsed.")
     with EXTRACTION_CACHE_LOCK:
