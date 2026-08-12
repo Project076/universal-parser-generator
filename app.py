@@ -2114,7 +2114,14 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         if withdrawal is None: withdrawal = Decimal("0")
         if deposit is None: deposit = Decimal("0")
         if withdrawal or deposit:
-            tx.append({"date": display_date(table_date), "narration": clean_narration(str(cell("narration") or "")), "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": money(cell("balance")), "source_amount": money(row[6]) if len(row) > 6 else None})
+            # Preserve the amount printed in the source amount column as
+            # independent validation evidence.  It must be read through the
+            # detected column map: a fixed ``row[6]`` is the Balance column in
+            # this bank's PDF and falsely rejects an otherwise perfect parser.
+            # Prefer the non-zero movement, as the opposite column normally
+            # contains the literal source value ``0.0``.
+            source_amount = withdrawal if withdrawal else deposit
+            tx.append({"date": display_date(table_date), "narration": clean_narration(str(cell("narration") or "")), "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": money(cell("balance")), "source_amount": source_amount})
     # Transaction extraction uses the furniture-cleaned text, but statement
     # endpoints must come from the original PDF text.  A repeated J&K Bank
     # header block can sit before B/F and the final Grand Total; cleaning it is
