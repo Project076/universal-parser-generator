@@ -396,9 +396,17 @@ def money(value: object) -> Decimal | None:
     if token:
         s = token.group()
     suffix = re.search(r"(DR|CR)$", s, re.I)
-    neg = (s.startswith("(") and s.endswith(")")) or bool(suffix and suffix.group(1).upper() == "DR")
+    # A few exports print a debit balance as both `-123.45Dr` and
+    # `123.45Dr`.  DR is an accounting sign, not an instruction to negate an
+    # already signed decimal: calculate the magnitude first, then apply one
+    # final sign.  The previous implementation multiplied `-123.45` by -1
+    # when it saw DR and silently turned a debit balance into a credit.
+    explicit_negative = s.startswith("-") or (s.startswith("(") and s.endswith(")"))
+    debit_suffix = bool(suffix and suffix.group(1).upper() == "DR")
     s = re.sub(r"(?:DR|CR)$", "", s.strip("()"), flags=re.I).strip()
-    try: return (-1 if neg else 1) * Decimal(s)
+    try:
+        amount = abs(Decimal(s))
+        return -amount if explicit_negative or debit_suffix else amount
     except InvalidOperation: return None
 
 def indian_amount(value: Decimal | int | float) -> str:
