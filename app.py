@@ -825,7 +825,15 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
     # Lightweight source signals only rank supported alternatives; they never
     # create a parser or classify a transaction without validation.
     try:
-        sample = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
+        # These source signals must be read by the reader for the actual file
+        # type.  Previously this always called ``cached_pdf_text`` for a
+        # non-large upload, so an .xls job reached PyMuPDF before its Excel
+        # reader and failed with "Failed to open file ... as type xls".
+        if path.suffix.lower() == ".pdf":
+            sample = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
+        else:
+            _, sample = load_rows(path)
+            sample = sample[:60000]
         if re.search(r"(?i)\bvalue\s+date\b", sample):
             add("value_date_unsigned", False, 520)
         signed_balance_rows = len(re.findall(
