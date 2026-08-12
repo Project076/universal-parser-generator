@@ -1,4 +1,5 @@
 openpyxl
+xlrd
 pdfplumber
 pypdf
 PyMuPDF

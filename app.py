@@ -25,6 +25,10 @@ from urllib.parse import parse_qs, urlparse
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill
+try:
+    import xlrd
+except ImportError:
+    xlrd = None
 import pdfplumber
 from pypdf import PdfReader
 try:
@@ -1962,10 +1966,22 @@ def load_rows(path: Path, strategy_override: str | None = None, job_id: str | No
     if ext == ".csv":
         raw = path.read_text(encoding="utf-8-sig", errors="replace")
         result = list(csv.reader(io.StringIO(raw))), raw
-    elif ext in (".xlsx", ".xls"):
+    elif ext == ".xlsx":
         book = openpyxl.load_workbook(path, data_only=True, read_only=True)
         sheet = book.active
         rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+        result = rows, "\n".join(" ".join(map(str, row)) for row in rows)
+    elif ext == ".xls":
+        # `.xls` is the legacy binary Excel format.  openpyxl deliberately
+        # supports only OOXML `.xlsx`, which previously caused an otherwise
+        # structured bank export to fail before UPG could inspect its headers.
+        # xlrd preserves the original grid, including blank spacer columns
+        # that carry the bank's column geometry.
+        if xlrd is None:
+            raise ValueError("Legacy .xls support is unavailable. Install xlrd and retry.")
+        book = xlrd.open_workbook(path, on_demand=True)
+        sheet = book.sheet_by_index(0)
+        rows = [sheet.row_values(index) for index in range(sheet.nrows)]
         result = rows, "\n".join(" ".join(map(str, row)) for row in rows)
     elif ext == ".txt":
         raw = path.read_text(encoding="utf-8", errors="replace")
