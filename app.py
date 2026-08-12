@@ -2514,7 +2514,20 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # layout evidence, not the entire 252-page text layer.  Keep this
         # outside the per-candidate loop too: one controlled diagnosis per
         # round prevents seven serial API waits after seven failed candidates.
-        diagnostic_evidence = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
+        # PDF samples are meaningful only for PDFs.  Calling the PDF reader
+        # for a legacy Excel/DOCX/CSV upload made PyMuPDF try to open that
+        # binary source "as type xls", failing the job before its native
+        # structured-file reader had a chance to run.  Non-PDF sources keep
+        # their own extracted grid/text as the evidence supplied to the
+        # diagnostic agent.
+        if path.suffix.lower() == ".pdf":
+            diagnostic_evidence = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
+        else:
+            _, diagnostic_evidence = load_rows(path, job_id=job_id)
+            # A spreadsheet can contain tens of thousands of rows.  The
+            # parser receives the complete grid for validation; the AI only
+            # needs a compact representative layout sample for diagnosis.
+            diagnostic_evidence = diagnostic_evidence[:60000]
         # Each round includes a fresh AI-generated layout candidate. It is not
         # a hand-written parser for the uploaded bank; the model proposes a
         # header/column profile from the current source evidence, which must
