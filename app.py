@@ -285,6 +285,11 @@ def queue_supervisor() -> None:
         time.sleep(15)
 
 CANONICAL = ["date", "narration", "withdrawal", "deposit", "instrument_number", "balance"]
+# These five fields are mandatory for a usable bank-statement transaction.
+# Instrument/cheque number remains a useful optional source field: not every
+# bank prints one, but keeping it preserves the original product contract.
+MANDATORY_TRANSACTION_FIELDS = ("date", "narration", "withdrawal", "deposit", "balance")
+OPTIONAL_TRANSACTION_FIELDS = ("instrument_number",)
 FIVE_MINUTES_MS = 300000
 AI_MODEL = "gpt-5.6-sol"
 try:
@@ -314,7 +319,8 @@ DIAGNOSTIC_RULE_LIBRARY = {
 }
 PARSER_GENERATOR_POLICY = """
 Bank statement extraction policy:
-- Transaction output is a strict six-field whitelist only: Date, Particulars/Narration, Withdrawal, Deposit, Instrument/Cheque Number, and Running/Closing Balance. A parser profile may map only these fields; every other PDF object is non-transaction evidence unless it directly proves one of the six fields.
+- Transaction output is a strict whitelist only: Date, Particulars/Narration, Withdrawal, Deposit, Running/Closing Balance, and optional Instrument/Cheque Number. Date, Particulars/Narration, Withdrawal, Deposit, and Balance are the five mandatory transaction fields. A parser profile may map only these fields; every other PDF object is non-transaction evidence unless it directly proves one of the permitted fields.
+- When both Transaction/Posting Date and Value Date are printed, retain Transaction Date only as source evidence and always export Value Date. Normalize every exported date as DD/MM/YYYY. Never create a second transaction from the two date columns.
 - Treat a column headed Closing Balance, Balance, Available Balance, or Running Balance as the transaction running-balance field only when it is aligned with a dated transaction row. A statement-level Closing Balance label is endpoint evidence, never a transaction row.
 - Ignore logos, seals, images, QR codes, coloured banners, decorative lines, account-holder/address blocks, bank/branch contact information, page numbers, generated-on stamps, signatures, legal notices, repeated headings, and empty visual cells. Images and logos are never narration or an instrument number.
 - Particulars/Narration is source text from its own transaction cell only. Do not fill it using numbers, balances, dates, bank names, logos, headers, or nearby furniture. Keep it blank if the actual particulars cell is blank.
@@ -355,6 +361,8 @@ Bank statement extraction policy:
 HISTORICAL_CHALLENGE_LESSONS = [
     "B/F, opening balance, brought-forward, page total, and grand total are metadata, never transactions.",
     "A blank source Particulars remains blank; an amount, instrument number, balance, or nearby furniture must never fill it.",
+    "When both posting/transaction date and Value Date are present, use Value Date as the one exported DD/MM/YYYY date. The posting date proves the row boundary only; it is never a second transaction.",
+    "Every certified row has exactly the five mandatory concepts: date, source narration (which may be blank), one-sided movement, and running balance. Instrument/cheque number is optional. Keep validation-only evidence private and never export furniture as a field.",
     "Page headers, addresses, branch/account blocks, logos, QR codes, legal notes, print stamps, and repeated titles are furniture even when they sit between two parts of a transaction.",
     "A transaction may continue over a page boundary. Remove intervening furniture, then merge only source-proven narration/amount/balance fragments into the same dated transaction.",
     "Use the original PDF geometry for layout decisions. For large PDFs, use first/middle/last samples with boundary pages to design the profile, then parse and validate all pages.",
@@ -503,6 +511,45 @@ def clean_narration(s: str) -> str:
     result = re.sub(r"\s+-?[\d,]+(?:\.\d{1,2})?\s*$", "", result).strip()
     return "" if re.fullmatch(r"-?[\d,]+(?:\.\d{1,2})?", result) else result
 
+def narration_is_furniture(value: object) -> bool:
+    """Return True only for text that cannot be a transaction Particulars cell.
+
+    Blank Particulars are valid and deliberately return False: banks sometimes
+    print a genuine transaction with an empty narration.  This guard prevents
+    an AI/profile from passing a heading, total, address block, or a numeric
+    column value through as narration just because the balances reconcile.
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return False
+    compact = norm(text)
+    if re.fullmatch(r"[\d,.()\-+/]+", text):
+        return True
+    furniture_markers = (
+        "statementofaccount", "openingbalance", "closingbalance",
+        "pagetotal", "grandtotal", "transactiontotal", "accountnumber",
+        "customercare", "ifscode", "micrcode", "generatedon",
+        "thisisasystemgenerated", "doesnotrequireanysignature",
+    )
+    return any(marker in compact for marker in furniture_markers)
+
+def canonical_transaction_contract_valid(transaction: dict) -> bool:
+    """Enforce the output contract before a profile can be certified.
+
+    This is intentionally a release gate rather than a repair step.  It never
+    invents missing values or changes a source row merely to make it fit.
+    """
+    if not transaction_date_value(transaction.get("date")):
+        return False
+    withdrawal = transaction.get("withdrawal")
+    deposit = transaction.get("deposit")
+    balance = transaction.get("balance")
+    if withdrawal is None or deposit is None or balance is None:
+        return False
+    if withdrawal < 0 or deposit < 0 or (withdrawal and deposit):
+        return False
+    return not narration_is_furniture(transaction.get("narration"))
+
 def map_headers(headers: list[object]) -> dict[str, int]:
     mapped = {}
     for canonical, possibilities in ALIASES.items():
@@ -522,7 +569,10 @@ def map_headers(headers: list[object]) -> dict[str, int]:
         elif header in ("date", "trandate", "transactiondate", "valuedate"): mapped.setdefault("date", i)
         elif "amount" in header: mapped.setdefault("amount", i)
         elif header == "type": mapped.setdefault("transaction_type", i)
-    value_date = next((i for i, h in enumerate(headers) if norm(h) in {"valuedate", "valuedt"}), None)
+    # Value Date labels often include a parenthesised format or abbreviations
+    # (for example ``Value Date (DD/MM/YYYY)``).  It has priority over the
+    # posting-date column for the exported canonical date.
+    value_date = next((i for i, h in enumerate(headers) if norm(h).startswith("valuedate") or norm(h) in {"valuedt", "valdt"}), None)
     if value_date is not None:
         mapped["date"] = value_date
     return mapped
@@ -732,6 +782,12 @@ def closest_certified_lessons(path: Path | None, headers: list[object] | None = 
 def ai_learning_packet(path: Path | None = None, headers: list[object] | None = None) -> dict[str, object]:
     """The complete non-sensitive knowledge supplied to UPG's AI workers."""
     return {
+        "transaction_output_contract": {
+            "mandatory_fields": list(MANDATORY_TRANSACTION_FIELDS),
+            "optional_fields": list(OPTIONAL_TRANSACTION_FIELDS),
+            "date_rule": "Export Value Date in DD/MM/YYYY when both Value Date and posting/transaction date exist.",
+            "narration_rule": "Use only the source Particulars cell; blank is allowed; furniture and numeric cells are forbidden.",
+        },
         "permanent_historical_lessons": HISTORICAL_CHALLENGE_LESSONS,
         "closest_certified_layouts": closest_certified_lessons(path, headers),
         "certified_profile_lessons": certified_learning_context(),
@@ -887,9 +943,15 @@ def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: s
     closest = closest_certified_lessons(path, headers)
     candidates = evidence_first_candidates(path, large_pdf, bool(geometry), validated_strategy, planned_strategies, 1)
     return {
-        "version": 1,
+        "version": 2,
         "measured_from": "original_pdf_geometry" if geometry else "source_text_structure",
         "header_fields": sorted(map_headers(headers)) if headers else [],
+        "transaction_output_contract": {
+            "mandatory": list(MANDATORY_TRANSACTION_FIELDS),
+            "optional": list(OPTIONAL_TRANSACTION_FIELDS),
+            "value_date_priority": True,
+            "date_format": "DD/MM/YYYY",
+        },
         "closest_profile_ids": [item["profile_id"] for item in closest],
         "closest_challenges": sorted({challenge for item in closest for challenge in item.get("challenge_history", [])}),
         "candidate_plan": ["ai_layout_addendum" if ai else (strategy or "detected_table") for strategy, ai in candidates],
@@ -2336,12 +2398,18 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # narration traceability, and source-record count.  The unreliable-running
     # balance exception above remains stricter and still requires exact totals.
     source_totals_conflict = source_totals_independently_confirmed and not statement_totals_valid
+    # A reconciliation cannot certify a parser that has smuggled page
+    # furniture, a numeric amount, or a second date into a canonical row.  The
+    # contract check is independent of monetary validation and applies to every
+    # strategy, including a saved profile and an AI-generated addendum.
+    canonical_contract_valid = bool(tx) and all(canonical_transaction_contract_valid(item) for item in tx)
     financial_valid = (
         total_reconciles
         and (running_balance_valid or source_balance_unreliable)
         and source_amount_valid
         and no_opening_as_transaction
         and coverage_valid
+        and canonical_contract_valid
     )
     # Preserve this certified exception in the profile without changing any
     # actual column mapping.  Consumers must never present it as a normal
@@ -2349,6 +2417,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     columns["_source_balance_unreliable"] = source_balance_unreliable
     columns["_balance_endpoint_derived"] = locals().get("endpoint_derived", "none")
     columns["_source_totals_conflict"] = source_totals_conflict
+    columns["_canonical_contract_valid"] = canonical_contract_valid
     # The original source text is independent evidence.  A narration that cannot
     # be located there is not silently accepted just because amounts reconcile.
     # Build the normalized source once. Re-normalizing a 250-page statement
@@ -2369,7 +2438,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         and source_amount_valid
         and coordinate_narrations_traceable(tx, raw)
     )
-    narration_valid = (not unmatched or coordinate_trace_valid) and not malformed_narrations and coverage_valid
+    narration_valid = (not unmatched or coordinate_trace_valid) and not malformed_narrations and coverage_valid and canonical_contract_valid
     return tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_withdrawals, declared_deposits, statement_totals_valid
 
 def export_excel(tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_withdrawals=None, declared_deposits=None, statement_totals_valid=True, source_balance_unreliable=False):
@@ -2623,6 +2692,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             "transaction_count": len(tx),
                             "source_transaction_count": expected_source_count,
                             "source_coverage_pass": bool(coverage_valid),
+                            "canonical_output_contract_pass": bool(columns.get("_canonical_contract_valid")),
+                            "date_output_policy": "value_date_priority_dd_mm_yyyy",
                             "printed_totals_conflict": bool(columns.get("_source_totals_conflict")),
                             "printed_totals_review_message": (
                                 "Printed Grand/Page totals differ from parsed totals. "
