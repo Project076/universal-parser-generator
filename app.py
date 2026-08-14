@@ -1976,6 +1976,20 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
     known_header: list[object] | None = None
     if strategy_override == "geometry_profile":
         return extract_geometry_profile_rows(path), raw
+    # Some borderless statements expose two adjacent date columns.  Generic
+    # table extraction commonly merges their headers (for example,
+    # ``TXN DATE`` + ``VALUE DATE``), which prevents an otherwise exact saved
+    # geometry profile from being selected and needlessly starts AI repair.
+    # Route this measurable source pattern straight to original-PDF geometry.
+    # This is deliberately based on the complete transaction header contract,
+    # not on a bank name or a one-off statement fingerprint.
+    dual_date_geometry_header = bool(re.search(
+        r"(?is)\bTXN\s+DATE\b[\s\S]{0,80}\bVALUE\s+DATE\b[\s\S]{0,240}"
+        r"\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,80}\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,80}\bBALANCE\b",
+        raw,
+    ))
+    if strategy_override is None and dual_date_geometry_header:
+        return extract_geometry_profile_rows(path), raw
     if strategy_override == "page_text_unsigned":
         header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
         reader = open_pdf_reader(path)
@@ -2265,6 +2279,22 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
             raise ValueError("OCR_REQUIRED: This PDF is image-only and has no reliable machine-readable transaction text. OCR must recover the source before any parser can be validated.")
     rows, raw = load_rows(path, strategy_override, job_id)
     if not rows: raise ValueError("The statement contains no readable rows.")
+    # ``extract_pdf_rows`` may deterministically upgrade a generic request to
+    # original-PDF geometry for a complete dual-date header contract.  Carry
+    # that effective strategy through validation as well: otherwise the rows
+    # are correctly measured, but narration traceability is evaluated as if
+    # they came from the weaker generic table extractor.
+    effective_strategy = strategy_override
+    if (
+        effective_strategy is None
+        and path.suffix.lower() == ".pdf"
+        and re.search(
+            r"(?is)\bTXN\s+DATE\b[\s\S]{0,80}\bVALUE\s+DATE\b[\s\S]{0,240}"
+            r"\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,80}\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,80}\bBALANCE\b",
+            raw,
+        )
+    ):
+        effective_strategy = "geometry_profile"
     header_at = next((i for i, row in enumerate(rows[:20]) if len(map_headers(row)) >= 3), None)
     ai_columns = None
     if header_at is None or force_ai_profile:
@@ -2367,7 +2397,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # Certain bank exports visually group same-date rows rather than preserving
     # ledger order. Try a source-amount-preserving reconstruction before any
     # balance-delta fallback; it succeeds only for one complete, unique chain.
-    if strategy_override == "geometry_profile":
+    if effective_strategy == "geometry_profile":
         reconstructed = reconstruct_unordered_balance_chain(tx, opening, closing)
         # In an unordered statement, the first displayed row is not reliable
         # opening evidence. A printed Grand Total can instead derive opening,
@@ -2384,7 +2414,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
                     opening = total_derived_opening
         if reconstructed is not None:
             tx = reconstructed
-    if strategy_override in ("running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "page_text_unsigned"):
+    if effective_strategy in ("running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "page_text_unsigned"):
         # A page-level extraction may start a new page without the preceding
         # running balance. Recompute debit/credit from the joined balances so
         # the candidate is independent of page boundaries.
@@ -2468,10 +2498,10 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         expected_source_count = max(expected_source_count, long_date_records)
     independent_count = (
         signed_balance_source_count(raw)
-        if strategy_override == "running_balance_text"
+        if effective_strategy == "running_balance_text"
         else raw_transaction_record_count(raw)
     )
-    if strategy_override == "running_balance_text" and independent_count is not None:
+    if effective_strategy == "running_balance_text" and independent_count is not None:
         # This source shape is stronger than a date-only count.  The latter
         # also sees a small number of dated period/metadata lines, whereas a
         # real ledger record is proved by its terminal signed balance.
@@ -2483,7 +2513,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # generic table discoverer here re-scans all 1,176 pages with pdfplumber,
     # even though this J&K layout has no table borders or reusable headers.
     # Reserve that expensive structural check for a geometry/table candidate.
-    if strategy_override in ("geometry_profile",):
+    if effective_strategy in ("geometry_profile",):
         table_count = structured_source_count(path)
         if table_count is not None:
             expected_source_count = table_count
@@ -2586,7 +2616,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # It remains gated by complete records, source amounts and the measured
     # narration column; it never applies to generic text-layout parsing.
     coordinate_trace_valid = (
-        strategy_override == "geometry_profile"
+        effective_strategy == "geometry_profile"
         and path.suffix.lower() == ".pdf"
         and coverage_valid
         and source_amount_valid
