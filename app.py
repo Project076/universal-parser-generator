@@ -199,6 +199,21 @@ def reserve_ai_call(job_id: str | None, purpose: str) -> bool:
         persist_job_locked(job_id)
         return True
 
+def ai_call_purposes(job_id: str | None) -> set[str]:
+    """Return the durable AI decisions already used by one parser job."""
+    if not job_id:
+        return set()
+    with JOBS_LOCK:
+        return {str(item) for item in JOBS.get(job_id, {}).get("ai_call_purposes", [])}
+
+def ai_calls_remaining(job_id: str | None) -> int:
+    """Read remaining expert-AI budget without reserving another call."""
+    if not job_id:
+        return MAX_AI_CALLS_PER_JOB
+    with JOBS_LOCK:
+        used = int(JOBS.get(job_id, {}).get("ai_calls", 0) or 0)
+    return max(0, MAX_AI_CALLS_PER_JOB - used)
+
 def queue_snapshot_locked() -> tuple[int, int]:
     """Return this job's FIFO position and the total queued depth.
 
@@ -1175,7 +1190,8 @@ def saved_text_strategy(path: Path) -> str | None:
     return None
 
 def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool, validated_strategy: str | None,
-                              planned_strategies: list[str], retry_round: int) -> list[tuple[str | None, bool]]:
+                              planned_strategies: list[str], retry_round: int,
+                              include_ai_addendum: bool = True) -> list[tuple[str | None, bool]]:
     """Rank parser candidates from source evidence before parsing the full file.
 
     A candidate is never accepted by score alone.  The score only decides which
@@ -1271,10 +1287,12 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         if strategy in {"geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned"}:
             add(strategy, False, 350 + min(90, int(lesson.get("observations", 0) or 0) * 5))
 
-    # A controlled AI addendum is the main path for an unfamiliar layout. On a
-    # retry it outranks exhausted heuristics, but it must still be materially
-    # new (enforced by the candidate signature memory below).
-    add(None, True, 700 if retry_round == 1 else 850)
+    # A controlled AI layout blueprint is the first and only planning call for
+    # an unfamiliar layout. Once it has failed, the final AI call is reserved
+    # for a targeted repair plan; that plan must be applied through supported
+    # deterministic strategies rather than spending a dead third AI call.
+    if include_ai_addendum:
+        add(None, True, 700 if retry_round == 1 else 850)
     for index, name in enumerate(planned_strategies):
         strategy, ai_addendum = candidate_for(name)
         add(strategy, ai_addendum, 880 - index * 20)
@@ -1284,7 +1302,7 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
     # only for an unfamiliar layout, where it is the controlled AI addendum.
     selected = ordered[:2]
     ai_key = (None, True)
-    if ai_key not in selected and ai_key in scores and not validated_strategy:
+    if include_ai_addendum and ai_key not in selected and ai_key in scores and not validated_strategy:
         selected.append(ai_key)
     return selected
 
@@ -1774,24 +1792,24 @@ def safe_openai_error(error: Exception) -> str:
     return f"OpenAI response error: {type(error).__name__}."
 
 def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None, job_id: str | None = None) -> dict[str, object]:
-    """Create a privacy-safe expert investigation plan for the next retry.
+    """Use the final AI call for a concrete, safe repair plan.
 
     The model may choose a diagnosis and a parser-profile action, but never
     transactions, balances, executable code, or a weaker validation standard.
     """
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
-        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum", "diagnostic_error": "AI diagnosis unavailable: OPENAI_API_KEY is not configured."}
-    if not reserve_ai_call(job_id, "failure_diagnosis"):
+        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI diagnosis unavailable: OPENAI_API_KEY is not configured."}
+    if not reserve_ai_call(job_id, "targeted_repair_plan"):
         return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI call budget reached for this job; no new evidence-led repair remains."}
-    safe_strategies = ["geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table", "ai_layout_addendum"]
+    safe_strategies = ["geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "rules": {"type": "array", "items": {"type": "string", "enum": list(DIAGNOSTIC_RULE_LIBRARY)}, "maxItems": 5},
         "strategies": {"type": "array", "items": {"type": "string", "enum": safe_strategies}, "maxItems": 4},
         "failure_type": {"type": "string", "enum": ["column_geometry", "header_mapping", "date_order", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "novel_layout"]},
-        "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "ai_addendum", "reject_unsafe"]},
+        "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
-    prompt = AI_LAYOUT_CONTRACT + "\nDiagnose one failed parser candidate from the evidence. Select a materially different safe action and priority list of supported strategies. Do not write code or transactions. If evidence is insufficient, choose novel_layout + ai_addendum.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(compact_ai_learning_packet(source_path, raw=raw)) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
+    prompt = AI_LAYOUT_CONTRACT + "\nThis is the final AI decision for this job and it is being made AFTER the first source-layout extraction failed. Produce one targeted, evidence-led repair plan: select a materially different safe action and priority list of already-supported deterministic strategies. Do not write code or transactions, do not relax validation, and do not request another AI layout addendum. If evidence is insufficient, choose reject_unsafe.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(compact_ai_learning_packet(source_path, raw=raw)) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
     payload = {"model": AI_MODEL, "input": prompt, "max_output_tokens": AI_MAX_OUTPUT_TOKENS, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
@@ -1808,7 +1826,7 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError) as error:
         # Keep only a short, non-sensitive diagnostic.  This lets the retry
         # loop distinguish an AI/API failure from a genuine but empty plan.
-        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "ai_addendum", "diagnostic_error": "AI diagnosis unavailable: " + safe_openai_error(error)}
+        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI diagnosis unavailable: " + safe_openai_error(error)}
 
 def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
     def find(kind):
@@ -3764,7 +3782,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             # A retry is a re-measurement after the exact prior failure, not a
             # replay of the initial plan. Existing signature memory below
             # guarantees that only materially new candidates are tested.
-            candidates = evidence_first_candidates(path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number)
+            candidates = evidence_first_candidates(
+                path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number,
+                include_ai_addendum=("layout_blueprint" not in ai_call_purposes(job_id) and ai_calls_remaining(job_id) > 0),
+            )
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
             try:
@@ -3893,11 +3914,17 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             error_summary = " | ".join(errors[-4:])
             repair_context += " Candidate execution results: " + error_summary
             patch_job(job_id, last_candidate_errors=errors[-8:])
-        # A diagnosis is guidance for the *next* retry round. It must never
-        # weaken validation or cause the same failed candidate to run again.
-        # Calling this once rather than after each failed candidate is the
-        # largest safe speed-up for long PDFs.
-        investigation = ai_diagnose_failure(diagnostic_evidence, repair_context, path, job_id)
+        # The first AI call is the evidence-based layout blueprint. Reserve the
+        # second and final call until that proposed layout has actually failed,
+        # then use it only for a targeted repair plan. Deterministic candidates
+        # never spend API budget and may run before the first blueprint.
+        if "layout_blueprint" in ai_call_purposes(job_id):
+            investigation = ai_diagnose_failure(diagnostic_evidence, repair_context, path, job_id)
+        else:
+            investigation = {
+                "rules": [], "strategies": [], "failure_type": "preflight",
+                "profile_action": "reuse_geometry", "diagnostic_error": "",
+            }
         proposed_rules = {str(rule) for rule in investigation["rules"]}
         proposed_strategies = [str(strategy) for strategy in investigation["strategies"]]
         materially_new_rules = proposed_rules - diagnostic_rules
@@ -3907,7 +3934,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         diagnosis_error = str(investigation.get("diagnostic_error", "") or "")
         prior_investigation = {
             "failure_type": investigation.get("failure_type", "novel_layout"),
-            "profile_action": investigation.get("profile_action", "ai_addendum"),
+            "profile_action": investigation.get("profile_action", "reject_unsafe"),
             "diagnostic_error": diagnosis_error,
         }
         if materially_new_rules or materially_new_strategies:
