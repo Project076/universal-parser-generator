@@ -352,6 +352,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "summary_total_warning": "Keep inconsistent printed debit or credit totals as a warning when transaction count, balance chain, and endpoint reconciliation independently pass.",
     "amount_balance_consistency": "When a source row visibly prints its transaction amount, require that amount to agree with the running-balance movement; reject a layout that only reconciles after replacing source amounts.",
     "corrupt_balance_text_layer": "For a PDF whose visible balance is correct but whose searchable text corrupts its punctuation, keep the measured debit/credit amount authoritative. Repair a blanked balance only if the preceding movement and the next measured balance, or the independently printed final totals, prove exactly one balance; never invent the opposite movement to force reconciliation.",
+    "indian_money_punctuation": "Infer decimal precision only from normal monetary cells in the same source column. If a damaged token has multiple full stops, repair it only when its final fractional group has that credible precision and all earlier groups exactly form Indian comma grouping; never change digits, sign, direction, or column.",
     "unordered_balance_chain": "When a statement prints valid dated rows but their on-page order is not the running-balance order, reconstruct direction and order only from unique amount-and-balance links; reject ambiguity or any incomplete chain.",
 }
 PARSER_GENERATOR_POLICY = """
@@ -368,7 +369,7 @@ Bank statement extraction policy:
 - Use the statement opening balance when printed. If it is absent, derive it from the first real transaction's signed running balance minus its deposit plus its withdrawal.
 - A printed statement-level opening or closing balance overrides any inferred value. Otherwise, the closing balance is the signed running balance of the last real transaction, never a page total, grand total, available amount, or other footer balance.
 - Normalize Cr balances as positive and Dr balances as negative. A signed increase is a deposit; a signed decrease is a withdrawal.
-- Monetary format rule for Withdrawal, Deposit, and Balance: a valid amount has zero or one decimal point only; all Indian thousands/lakh/crore grouping must use commas. Reject a token with two or more points as malformed evidence. Do not replace its points, truncate it, or use it to infer an opposite-side amount.
+- Monetary format rule for Withdrawal, Deposit, and Balance: a valid amount has zero or one decimal point only; all Indian thousands/lakh/crore grouping must use commas. Infer the column's decimal precision only from normal single-decimal source cells. A token with multiple points may be restored only when the final group has that proven precision and every earlier group exactly fits Indian grouping (for example `-5.00.177.00` -> `-5,00,177.00`). Never change digits, sign, debit/credit direction, or the source column; otherwise reject it as malformed evidence.
 - If a PDF's visual balance is correctly printed but its searchable text has malformed punctuation (for example `-5,00,177.00` becoming `-5.00.177.00`), reject that damaged token rather than truncating it. Preserve the measured source withdrawal/deposit. Restore the balance only when the previous source balance plus that measured movement and either the next measured balance or independently printed final totals prove one unique value; record this as a text-layer repair, never as an invented amount.
 - Balance-chain validation is mandatory for every transaction with a running balance: previous balance = current balance + current withdrawal - current deposit. Equivalently, current balance = previous balance - withdrawal + deposit. Do not release a parser when any transaction balance is missing or breaks this chain.
 - Exception: if any transaction proves that the source running-balance chain is unreliable, do not use that column for a normal balance-chain pass or transaction classification. Certify only if parsed withdrawals and deposits exactly equal the printed statement totals, while narration coverage and transaction count pass. Form assumed endpoints from one available transaction balance and the verified totals, label them assumed, and require manual source review. If totals or independent evidence are inconsistent, withhold the parser.
@@ -489,6 +490,74 @@ def money(value: object) -> Decimal | None:
         amount = abs(Decimal(s))
         return -amount if explicit_negative or debit_suffix else amount
     except InvalidOperation: return None
+
+
+def inferred_column_decimal_places(rows: list[list[object]], header_at: int, columns: dict) -> dict[str, int]:
+    """Infer the trustworthy decimal width independently for each money column.
+
+    Corrupt PDF text layers can turn Indian grouping commas into full stops
+    (``5,00,177.00`` -> ``5.00.177.00``).  Only normal, single-decimal source
+    cells are allowed to teach this rule.  A damaged value is never evidence
+    for repairing itself or another value.
+    """
+    result: dict[str, int] = {}
+    for field in ("withdrawal", "deposit", "balance", "amount"):
+        index = columns.get(field)
+        if index is None:
+            continue
+        widths: list[int] = []
+        for row in rows[header_at + 1:]:
+            if index >= len(row):
+                continue
+            token = str(row[index] or "").strip().replace(",", "")
+            token = re.sub(r"(?:DR|CR)$", "", token, flags=re.I).strip().strip("()")
+            if not token or token.count(".") > 1:
+                continue
+            match = re.fullmatch(r"-?\d+(?:\.(\d{1,2}))?", token)
+            if match:
+                widths.append(len(match.group(1)) if match.group(1) else 0)
+        if widths:
+            # Mode, then the wider precision on a tie.  This keeps a mostly
+            # two-decimal bank column at two decimals even when a few cells
+            # omit trailing zeroes.
+            result[field] = max(set(widths), key=lambda width: (widths.count(width), width))
+    return result
+
+
+def repair_indian_grouping_decimal(value: object, decimal_places: int | None) -> Decimal | None:
+    """Repair only an exact, structurally valid dot-for-comma Indian amount.
+
+    No digit, sign, direction or column is changed.  The final full stop is
+    accepted only when it has the credible decimal width learned from valid
+    cells in that same column; preceding full stops must form a valid Indian
+    integer grouping (3 digits at the right, 2-digit lakh/crore groups).
+    """
+    if value is None or decimal_places is None or decimal_places < 1:
+        return None
+    source = str(value).strip().replace("â‚¹", "").replace("$", "")
+    source = re.sub(r"\s+", "", source)
+    suffix = re.search(r"(DR|CR)$", source, re.I)
+    debit_suffix = bool(suffix and suffix.group(1).upper() == "DR")
+    source = re.sub(r"(?:DR|CR)$", "", source, flags=re.I)
+    explicit_negative = source.startswith("-") or (source.startswith("(") and source.endswith(")"))
+    source = source.strip("-()")
+    if source.count(".") < 2 or "," in source:
+        return None
+    groups = source.split(".")
+    integer_groups, fraction = groups[:-1], groups[-1]
+    if len(fraction) != decimal_places or not fraction.isdigit() or not all(group.isdigit() for group in integer_groups):
+        return None
+    # Standard 3-digit grouping is valid for 1,234.56.  Longer Indian numbers
+    # have 2-digit groups before that final 3-digit group: 5,00,177.00.
+    if not (1 <= len(integer_groups[0]) <= 3 and len(integer_groups[-1]) == 3):
+        return None
+    if len(integer_groups) > 2 and any(len(group) != 2 for group in integer_groups[1:-1]):
+        return None
+    try:
+        amount = Decimal("".join(integer_groups) + "." + fraction)
+    except InvalidOperation:
+        return None
+    return -amount if explicit_negative or debit_suffix else amount
 
 def indian_amount(value: Decimal | int | float) -> str:
     """Format monetary values with Indian lakh/crore grouping."""
@@ -2670,9 +2739,14 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 trailing_amount = re.search(r"(\d[\d,]*\.\d{2})$", withdrawal_text)
                 if trailing_amount and not re.fullmatch(r"-?\d[\d,]*\.\d{2}", withdrawal_text):
                     withdrawal_text = trailing_amount.group(1)
-                withdrawal = money(withdrawal_text) or Decimal("0")
-                deposit = money(band(x_dp - 25, x_bal - 20).replace(" ", "")) or Decimal("0")
-                balance = money(band(x_bal - 30, float(page.width) + 5).replace(" ", ""))
+                deposit_text = band(x_dp - 25, x_bal - 20).replace(" ", "")
+                balance_text = band(x_bal - 30, float(page.width) + 5).replace(" ", "")
+                # Preserve raw monetary source cells.  The statement-level
+                # normalizer can infer the column's decimal precision from
+                # every valid row, then safely repair an isolated text-layer
+                # punctuation defect without changing the measured columns.
+                withdrawal = money(withdrawal_text) or repair_indian_grouping_decimal(withdrawal_text, 2) or Decimal("0")
+                deposit = money(deposit_text) or repair_indian_grouping_decimal(deposit_text, 2) or Decimal("0")
                 # Date + visibly measured source amount establishes a record;
                 # an unusable balance cannot erase it or change its direction.
                 if not withdrawal and not deposit:
@@ -2687,7 +2761,7 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 if re.search(r"(?i)^(?:opening\s+balance|b\s*/\s*f)\b", narration):
                     continue
                 refs = re.findall(r"\b\d{6,}\b", narration)
-                rows.append([display_date(date_text), narration, withdrawal, deposit, refs[-1] if refs else "", balance])
+                rows.append([display_date(date_text), narration, withdrawal_text, deposit_text, refs[-1] if refs else "", balance_text])
             try:
                 page.close()
             except Exception:
@@ -3085,8 +3159,26 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         columns = {**source_columns, **inherited_missing, **exact_missing, **(ai_columns or {})}
     else:
         columns = {**source_columns, **inherited_missing, **(ai_columns or {}), **exact_missing}
+    decimal_places = inferred_column_decimal_places(rows, header_at, columns)
+    punctuation_repairs = 0
+
+    def monetary_cell(key: str):
+        """Read one mapped money cell, repairing only proven dot grouping."""
+        nonlocal punctuation_repairs
+        i = columns.get(key)
+        value = rows[current_row_index][i] if i is not None and i < len(rows[current_row_index]) else ""
+        parsed = money(value)
+        if parsed is not None:
+            return parsed
+        repaired = repair_indian_grouping_decimal(value, decimal_places.get(key))
+        if repaired is not None:
+            punctuation_repairs += 1
+            return repaired
+        return None
+
     tx = []
-    for row in rows[header_at + 1:]:
+    for current_row_index in range(header_at + 1, len(rows)):
+        row = rows[current_row_index]
         def cell(key):
             i = columns.get(key); return row[i] if i is not None and i < len(row) else ""
         if not any(str(x or "").strip() for x in row): continue
@@ -3095,9 +3187,9 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         # and credit columns. A real transaction must carry a valid date.
         if not transaction_date_value(table_date):
             continue
-        withdrawal, deposit = money(cell("withdrawal")), money(cell("deposit"))
+        withdrawal, deposit = monetary_cell("withdrawal"), monetary_cell("deposit")
         if withdrawal is None and deposit is None and "amount" in columns and "transaction_type" in columns:
-            amount, kind = money(cell("amount")), str(cell("transaction_type")).upper()
+            amount, kind = monetary_cell("amount"), str(cell("transaction_type")).upper()
             if amount is not None:
                 withdrawal = amount if "DR" in kind else Decimal("0")
                 deposit = amount if "CR" in kind else Decimal("0")
@@ -3117,7 +3209,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
             # Prefer the non-zero movement, as the opposite column normally
             # contains the literal source value ``0.0``.
             source_amount = withdrawal if withdrawal else deposit
-            tx.append({"date": display_date(table_date), "narration": narration, "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": money(cell("balance")), "source_amount": source_amount})
+            tx.append({"date": display_date(table_date), "narration": narration, "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": monetary_cell("balance"), "source_amount": source_amount})
     # Transaction extraction uses the furniture-cleaned text, but statement
     # endpoints must come from the original PDF text.  A repeated J&K Bank
     # header block can sit before B/F and the final Grand Total; cleaning it is
@@ -3425,6 +3517,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     columns["_source_totals_conflict"] = source_totals_conflict
     columns["_canonical_contract_valid"] = canonical_contract_valid
     columns["_balance_repaired_from_chain"] = balance_repaired_from_chain
+    columns["_monetary_punctuation_repairs"] = punctuation_repairs
     # The original source text is independent evidence.  A narration that cannot
     # be located there is not silently accepted just because amounts reconcile.
     # Build the normalized source once. Re-normalizing a 250-page statement
