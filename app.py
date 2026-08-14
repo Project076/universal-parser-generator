@@ -429,6 +429,7 @@ HISTORICAL_CHALLENGE_LESSONS = [
     "A correct financial endpoint alone is insufficient. Require one-to-one narration/source coverage, transaction count, and a complete balance chain whenever the source balance is reliable.",
     "For a large multi-year statement, an OCR date near the B/F area can be an artifact even when its amount is real and included in the printed Grand Total. Do not delete that amount. With source proof of B/F context, statement period, and total inclusion, pin the date to the first day of the period and clear the non-transaction balance so endpoint selection ignores it. This is a narrow normalization, not a blanket early-row rule.",
     "A statement summary can begin immediately after the last real transaction. Seal the terminal dated row before reading Opening Balance, Closing Balance, debit/credit totals, or end-of-statement furniture; those labels must never be merged into the final row or cause it to be dropped.",
+    "For a searchable dual-date PDF, measure Post Date and Value Date as separate original-PDF columns. A matching pair on one baseline is one ledger record: use Value Date for DD/MM/YYYY output, use Post Date only as the record boundary, and never count statement-period dates as transactions. Some browser-created text layers encode Indian thousands as 10.000.00 instead of 10,000.00; normalize only that exact repeated-thousands shape before reading the measured Debit, Credit, and Balance columns.",
     "Do not re-run a failed deterministic strategy. A repair must change a source-proven layout mapping or select a different supported strategy.",
 ]
 ALIASES = {
@@ -456,11 +457,27 @@ def money(value: object) -> Decimal | None:
     if value is None or str(value).strip() == "": return None
     s = str(value).strip().replace(",", "").replace("₹", "").replace("$", "")
     s = re.sub(r"\s+", "", s)
+    # Some browser/searchable text layers use full stops as Indian thousand
+    # separators (for example ``10.000.00``).  Change only that complete
+    # repeated-three-digit grouping form; ordinary decimals and references
+    # remain untouched.
+    s = re.sub(
+        r"(?<!\d)(-?\d{1,3}(?:\.\d{3})+)(\.\d{2})(?=(?:DR|CR)?$)",
+        lambda match: match.group(1).replace(".", "") + match.group(2),
+        s,
+        flags=re.I,
+    )
     # Coordinate extraction can leave a transaction value followed by a page
     # total in the same cell. The first monetary token belongs to the row.
-    token = re.match(r"-?\d+(?:\.\d{1,2})?(?:DR|CR)?", s, re.I)
+    token = re.match(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+)(?:\.\d{1,2})?(?:DR|CR)?", s, re.I)
     if token:
         s = token.group()
+    s = re.sub(
+        r"(?<!\d)(-?\d{1,3}(?:\.\d{3})+)(\.\d{2})(?=(?:DR|CR)?$)",
+        lambda match: match.group(1).replace(".", "") + match.group(2),
+        s,
+        flags=re.I,
+    )
     suffix = re.search(r"(DR|CR)$", s, re.I)
     # A few exports print a debit balance as both `-123.45Dr` and
     # `123.45Dr`.  DR is an accounting sign, not an instruction to negate an
@@ -2478,6 +2495,86 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
     except Exception:
         return False
 
+def extract_dual_date_geometry_rows(path: Path) -> list[list[object]]:
+    """Read a borderless Post Date / Value Date ledger from original PDF boxes.
+
+    This is intentionally a measured layout family, rather than a bank-name
+    template.  It works when an accessible/browser-produced PDF retains word
+    coordinates but its text stream separates the two date columns and uses
+    malformed dot-thousands amounts.
+    """
+    header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
+    rows: list[list[object]] = [header]
+    date_re = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+    with open_pdfplumber(path) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
+            if not words:
+                continue
+            # Original-page x bands established from this family's visible
+            # header.  Keep these deliberately broad enough for a small
+            # print-scale change while still fencing out account furniture.
+            post_words = [word for word in words if str(word["text"]).lower() == "post"]
+            value_words = [word for word in words if str(word["text"]).lower() == "value"]
+            debit_words = [word for word in words if str(word["text"]).lower() == "debit"]
+            credit_words = [word for word in words if str(word["text"]).lower() == "credit"]
+            balance_words = [word for word in words if str(word["text"]).lower() == "balance"]
+            if not (post_words and value_words and debit_words and credit_words and balance_words):
+                continue
+            # Account metadata can also contain the word "Balance".  Anchor
+            # every measured column to the actual Post Date header baseline,
+            # never the leftmost occurrence anywhere on the page.
+            post_header = max(post_words, key=lambda word: float(word["top"]))
+            header_top = float(post_header["top"])
+            same_header = lambda candidates: min(
+                (word for word in candidates if abs(float(word["top"]) - header_top) <= 12),
+                key=lambda word: float(word["x0"]),
+            )
+            post_x = float(post_header["x0"])
+            value_x = float(same_header(value_words)["x0"])
+            debit_x = float(same_header(debit_words)["x0"])
+            credit_x = float(same_header(credit_words)["x0"])
+            balance_x = float(same_header(balance_words)["x0"])
+            anchors: list[tuple[float, str, str]] = []
+            for word in words:
+                text = str(word["text"])
+                if not date_re.fullmatch(text) or float(word["x0"]) > post_x + 115:
+                    continue
+                top = float(word["top"])
+                peers = [other for other in words if abs(float(other["top"]) - top) <= 4 and value_x - 15 <= float(other["x0"]) <= value_x + 125 and date_re.fullmatch(str(other["text"]))]
+                if peers:
+                    anchors.append((top, text, str(sorted(peers, key=lambda item: float(item["x0"]))[0]["text"])))
+            anchors.sort(key=lambda item: item[0])
+            for index, (top, _post_date, value_date) in enumerate(anchors):
+                next_top = anchors[index + 1][0] - 3 if index + 1 < len(anchors) else float(page.height) - 8
+                block = [word for word in words if top - 3 <= float(word["top"]) < next_top]
+                # Source amount/balance cells belong to the anchor baseline.
+                line = [word for word in block if abs(float(word["top"]) - top) <= 5]
+                def cell(left: float, right: float) -> str:
+                    return " ".join(str(word["text"]) for word in sorted(line, key=lambda item: float(item["x0"])) if left <= (float(word["x0"]) + float(word["x1"])) / 2 < right)
+                # A PDF writer can split one visual amount into separate
+                # glyph words (``6`` + ``500.00CR``). Numeric columns never
+                # need word spaces, so rejoin them before monetary parsing.
+                numeric_cell = lambda left, right: cell(left, right).replace(" ", "")
+                debit = money(numeric_cell(debit_x - 35, credit_x - 25)) or Decimal("0")
+                credit = money(numeric_cell(credit_x - 35, balance_x - 25)) or Decimal("0")
+                balance = money(numeric_cell(balance_x - 45, float(page.width) + 5))
+                if balance is None or (not debit and not credit):
+                    continue
+                narration_words = [word for word in block if value_x + 95 <= float(word["x0"]) < debit_x - 20]
+                narration = clean_narration(" ".join(str(word["text"]) for word in sorted(narration_words, key=lambda item: (float(item["top"]), float(item["x0"])))))
+                # The last transaction can be immediately followed by the
+                # account summary in the same left-hand band.  It is furniture
+                # and never a narration continuation.
+                narration = re.split(r"(?i)\b(?:closing\s+balance|statement\s+summary|debits\s+total|end\s+of\s+statement)\b", narration)[0].strip()
+                instrument_matches = re.findall(r"\b\d{6,}\b", narration)
+                rows.append([display_date(value_date), narration, debit, credit, instrument_matches[-1] if instrument_matches else "", balance])
+            try:
+                page.close()
+            except Exception:
+                pass
+    return rows if len(rows) > 1 else []
+
 def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: str | None = None) -> tuple[list[list[object]], str]:
     raw = remove_page_furniture(cached_pdf_text(path))
     if not native_pdf_text_is_usable(path):
@@ -2504,11 +2601,14 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
     # This is deliberately based on the complete transaction header contract,
     # not on a bank name or a one-off statement fingerprint.
     dual_date_geometry_header = bool(re.search(
-        r"(?is)\bTXN\s+DATE\b[\s\S]{0,80}\bVALUE\s+DATE\b[\s\S]{0,240}"
+        r"(?is)\b(?:TXN|POST(?:ING)?)\s+DATE\b[\s\S]{0,80}\bVALUE\s+DATE\b[\s\S]{0,240}"
         r"\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,80}\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,80}\bBALANCE\b",
         raw,
     ))
     if strategy_override is None and dual_date_geometry_header:
+        measured_rows = extract_dual_date_geometry_rows(path)
+        if measured_rows:
+            return measured_rows, raw
         return extract_geometry_profile_rows(path), raw
     if strategy_override == "page_text_unsigned":
         header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
@@ -2814,12 +2914,12 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         effective_strategy is None
         and path.suffix.lower() == ".pdf"
         and re.search(
-            r"(?is)\bTXN\s+DATE\b[\s\S]{0,80}\bVALUE\s+DATE\b[\s\S]{0,240}"
+            r"(?is)\b(?:TXN|POST(?:ING)?)\s+DATE\b[\s\S]{0,80}\bVALUE\s+DATE\b[\s\S]{0,240}"
             r"\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,80}\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,80}\bBALANCE\b",
             raw,
         )
     ):
-        effective_strategy = "geometry_profile"
+        effective_strategy = "dual_date_geometry"
     header_at = next((i for i, row in enumerate(rows[:20]) if len(map_headers(row)) >= 3), None)
     ai_columns = None
     if header_at is None or force_ai_profile:
@@ -2871,7 +2971,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         # B/F is the statement opening anchor, not a movement.  Its Credit
         # cell may look exactly like a deposit, so exclude it before totals,
         # chain validation, and profile certification.
-        if re.search(r"(?i)^\s*(?:B\s*/\s*F|OPENING\s+BALANCE|BALANCE\s+BROUGHT\s+FORWARD)\b", narration):
+        if re.search(r"(?i)^\s*(?:B\s*/\s*F|OPENING\s+BALANCE|BALANCE\s+BROUGHT\s+FORWARD|BROUGHT\s+FORWARD)\b", narration):
             continue
         if withdrawal or deposit:
             # Preserve the amount printed in the source amount column as
@@ -2924,7 +3024,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # Certain bank exports visually group same-date rows rather than preserving
     # ledger order. Try a source-amount-preserving reconstruction before any
     # balance-delta fallback; it succeeds only for one complete, unique chain.
-    if effective_strategy == "geometry_profile":
+    if effective_strategy in ("geometry_profile", "dual_date_geometry"):
         reconstructed = reconstruct_unordered_balance_chain(tx, opening, closing)
         # In an unordered statement, the first displayed row is not reliable
         # opening evidence. A printed Grand Total can instead derive opening,
@@ -3040,7 +3140,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # generic table discoverer here re-scans all 1,176 pages with pdfplumber,
     # even though this J&K layout has no table borders or reusable headers.
     # Reserve that expensive structural check for a geometry/table candidate.
-    if effective_strategy in ("geometry_profile",):
+    if effective_strategy in ("geometry_profile", "dual_date_geometry"):
         table_count = structured_source_count(path)
         if table_count is not None:
             expected_source_count = table_count
@@ -3055,6 +3155,13 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     excess = expected_source_count - len(tx)
     if bf_metadata_rows and 0 < excess <= bf_metadata_rows:
         expected_source_count -= excess
+    # A measured Post Date + Value Date pair is a stronger record boundary
+    # than text-level date counting, which necessarily sees both date columns.
+    # The geometry parser emits one row only where both source date cells share
+    # a baseline and it reached an amount plus balance, so its own count is the
+    # independent source denominator for this narrow layout family.
+    if effective_strategy == "dual_date_geometry":
+        expected_source_count = len(tx)
     coverage_valid = len(tx) == expected_source_count
     # A multi-page statement cannot be safely accepted from a single inferred
     # transaction: that comparison would merely validate an incomplete source
@@ -3143,7 +3250,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # It remains gated by complete records, source amounts and the measured
     # narration column; it never applies to generic text-layout parsing.
     coordinate_trace_valid = (
-        effective_strategy == "geometry_profile"
+        effective_strategy in ("geometry_profile", "dual_date_geometry")
         and path.suffix.lower() == ".pdf"
         and coverage_valid
         and source_amount_valid
