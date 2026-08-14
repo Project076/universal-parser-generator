@@ -351,6 +351,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "multi_page_continuation": "Preserve a dated transaction whose narration or amount cells continue across a page boundary, excluding page headers and footers between its parts.",
     "summary_total_warning": "Keep inconsistent printed debit or credit totals as a warning when transaction count, balance chain, and endpoint reconciliation independently pass.",
     "amount_balance_consistency": "When a source row visibly prints its transaction amount, require that amount to agree with the running-balance movement; reject a layout that only reconciles after replacing source amounts.",
+    "corrupt_balance_text_layer": "For a PDF whose visible balance is correct but whose searchable text corrupts its punctuation, keep the measured debit/credit amount authoritative. Repair a blanked balance only if the preceding movement and the next measured balance, or the independently printed final totals, prove exactly one balance; never invent the opposite movement to force reconciliation.",
     "unordered_balance_chain": "When a statement prints valid dated rows but their on-page order is not the running-balance order, reconstruct direction and order only from unique amount-and-balance links; reject ambiguity or any incomplete chain.",
 }
 PARSER_GENERATOR_POLICY = """
@@ -367,6 +368,7 @@ Bank statement extraction policy:
 - Use the statement opening balance when printed. If it is absent, derive it from the first real transaction's signed running balance minus its deposit plus its withdrawal.
 - A printed statement-level opening or closing balance overrides any inferred value. Otherwise, the closing balance is the signed running balance of the last real transaction, never a page total, grand total, available amount, or other footer balance.
 - Normalize Cr balances as positive and Dr balances as negative. A signed increase is a deposit; a signed decrease is a withdrawal.
+- If a PDF's visual balance is correctly printed but its searchable text has malformed punctuation (for example `-5,00,177.00` becoming `-5.00.177.00`), reject that damaged token rather than truncating it. Preserve the measured source withdrawal/deposit. Restore the balance only when the previous source balance plus that measured movement and either the next measured balance or independently printed final totals prove one unique value; record this as a text-layer repair, never as an invented amount.
 - Balance-chain validation is mandatory for every transaction with a running balance: previous balance = current balance + current withdrawal - current deposit. Equivalently, current balance = previous balance - withdrawal + deposit. Do not release a parser when any transaction balance is missing or breaks this chain.
 - Exception: if any transaction proves that the source running-balance chain is unreliable, do not use that column for a normal balance-chain pass or transaction classification. Certify only if parsed withdrawals and deposits exactly equal the printed statement totals, while narration coverage and transaction count pass. Form assumed endpoints from one available transaction balance and the verified totals, label them assumed, and require manual source review. If totals or independent evidence are inconsistent, withhold the parser.
 - Transaction-count validation is mandatory: independently count source records that have a transaction date plus amount/running-balance evidence, and require exactly that many parsed transactions. More or fewer parsed rows is a failure even if balances reconcile.
@@ -467,6 +469,13 @@ def money(value: object) -> Decimal | None:
         s,
         flags=re.I,
     )
+    # Never truncate a malformed balance such as ``-5.00.177.00`` to
+    # ``-5.00``.  That turns a source printing defect into a fake
+    # ₹5,00,000-scale balance movement and can make the parser manufacture an
+    # opposite-side deposit.  Proper Indian dot-grouping was normalized just
+    # above; any remaining second decimal point is unusable monetary evidence.
+    if s.count(".") > 1:
+        return None
     # Coordinate extraction can leave a transaction value followed by a page
     # total in the same cell. The first monetary token belongs to the row.
     token = re.match(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+)(?:\.\d{1,2})?(?:DR|CR)?", s, re.I)
@@ -621,6 +630,23 @@ def canonical_transaction_contract_valid(transaction: dict) -> bool:
     if withdrawal is None or deposit is None or balance is None:
         return False
     if withdrawal < 0 or deposit < 0 or (withdrawal and deposit):
+        return False
+    return not narration_is_furniture(transaction.get("narration"))
+
+def canonical_transaction_core_valid(transaction: dict) -> bool:
+    """The non-balance portion of the release contract.
+
+    This is used only for the documented unreliable-running-balance exception.
+    A malformed source balance may be blanked, but it must never relax the
+    requirements for a real date, one measured movement, and source narration.
+    """
+    if not transaction_date_value(transaction.get("date")):
+        return False
+    withdrawal = transaction.get("withdrawal")
+    deposit = transaction.get("deposit")
+    if withdrawal is None or deposit is None or withdrawal < 0 or deposit < 0:
+        return False
+    if withdrawal and deposit:
         return False
     return not narration_is_furniture(transaction.get("narration"))
 
@@ -1750,6 +1776,19 @@ def source_transaction_totals(text: str) -> tuple[Decimal | None, Decimal | None
         text,
     )
     if not summary:
+        # J&K Bank loan statements can serialize their visual final Total row
+        # as three vertical lines in the PDF text layer.  It is still printed
+        # source evidence: debit, credit and final balance, in that order.
+        # Keep this narrow to a labelled Total followed immediately by two
+        # money tokens, so transaction rows and page furniture cannot become
+        # a statement-total control.
+        stacked_total = re.findall(
+            r"(?im)^\s*total\s*$\s*^\s*([\d,]+(?:\.\d{1,2})?)\s*$\s*^\s*([\d,]+(?:\.\d{1,2})?)\s*$",
+            text,
+        )
+        if stacked_total:
+            withdrawals, deposits = stacked_total[-1]
+            return money(withdrawals), money(deposits)
         # YES Bank and similar statements use compact final-summary labels
         # rather than a grid headed "Statement Summary".  These are source
         # controls only; they never replace transaction-level validation.
@@ -2575,6 +2614,97 @@ def extract_dual_date_geometry_rows(path: Path) -> list[list[object]]:
                 pass
     return rows if len(rows) > 1 else []
 
+def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
+    """Extract a normal Date / Particulars / Debit / Credit / Balance ledger.
+
+    The source amount columns are read from their original PDF x-bands.  A
+    malformed balance is returned as blank evidence, never used to derive a
+    compensating movement.  This avoids an OCR/text-layer defect turning, for
+    example, a visible withdrawal of 9.00 into a fictional 5,00,345 deposit.
+    """
+    header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
+    rows: list[list[object]] = [header]
+    date_re = re.compile(r"^\d{2}-[A-Za-z]{3}-\d{4}$")
+    with open_pdfplumber(path) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
+            headers = {}
+            for word in words:
+                key = str(word["text"]).lower()
+                if key in {"date", "particulars", "withdrawals", "deposits", "balance"}:
+                    headers.setdefault(key, []).append(word)
+            if not all(headers.get(key) for key in ("date", "particulars", "withdrawals", "deposits", "balance")):
+                continue
+            # All five labels must share the actual table-header baseline.
+            candidates = [word for word in headers["date"] if all(
+                any(abs(float(other["top"]) - float(word["top"])) <= 10 for other in headers[key])
+                for key in ("particulars", "withdrawals", "deposits", "balance")
+            )]
+            if not candidates:
+                continue
+            date_header = max(candidates, key=lambda word: float(word["top"]))
+            header_top = float(date_header["top"])
+            def same_line(key: str):
+                return min((word for word in headers[key] if abs(float(word["top"]) - header_top) <= 10), key=lambda word: float(word["x0"]))
+            x_date = float(date_header["x0"])
+            x_part = float(same_line("particulars")["x0"])
+            x_wd = float(same_line("withdrawals")["x0"])
+            x_dp = float(same_line("deposits")["x0"])
+            x_bal = float(same_line("balance")["x0"])
+            anchors = sorted(
+                [(float(word["top"]), str(word["text"])) for word in words
+                 if date_re.fullmatch(str(word["text"])) and float(word["x0"]) < x_part - 20 and float(word["top"]) > header_top + 12],
+                key=lambda item: item[0],
+            )
+            for index, (top, date_text) in enumerate(anchors):
+                if index + 1 < len(anchors):
+                    next_top = anchors[index + 1][0] - 3
+                else:
+                    # The final transaction may be followed by a Total row
+                    # and legal/footer furniture.  Neither belongs to the
+                    # narration, even when the text layer puts it in the
+                    # same broad vertical block.
+                    footer_tops = [float(word["top"]) - 3 for word in words
+                                   if float(word["top"]) > top + 8
+                                   and str(word["text"]).strip().lower() in {"total", "grand", "page"}]
+                    next_top = min(footer_tops) if footer_tops else float(page.height) - 6
+                block = [word for word in words if top - 4 <= float(word["top"]) < next_top]
+                line = [word for word in block if abs(float(word["top"]) - top) <= 5]
+                def band(left: float, right: float, source=line) -> str:
+                    return " ".join(str(word["text"]) for word in sorted(source, key=lambda item: float(item["x0"])) if left <= (float(word["x0"]) + float(word["x1"])) / 2 < right)
+                withdrawal_text = band(x_wd - 50, x_dp - 20).replace(" ", "")
+                # Some original PDFs let the final word of a narration range
+                # overlap the debit column (``to17-3,894.00``).  The final
+                # currency token is still source text in the debit band; do
+                # not turn its leading narration fragment into amount 17.
+                withdrawal_text = re.sub(r"^\d{1,2}-(?=\d[\d,]*\.\d{2}$)", "", withdrawal_text)
+                trailing_amount = re.search(r"(\d[\d,]*\.\d{2})$", withdrawal_text)
+                if trailing_amount and not re.fullmatch(r"-?\d[\d,]*\.\d{2}", withdrawal_text):
+                    withdrawal_text = trailing_amount.group(1)
+                withdrawal = money(withdrawal_text) or Decimal("0")
+                deposit = money(band(x_dp - 25, x_bal - 20).replace(" ", "")) or Decimal("0")
+                balance = money(band(x_bal - 30, float(page.width) + 5).replace(" ", ""))
+                # Date + visibly measured source amount establishes a record;
+                # an unusable balance cannot erase it or change its direction.
+                if not withdrawal and not deposit:
+                    continue
+                narration_words = [word for word in block if x_part - 20 <= float(word["x0"]) < x_wd - 20]
+                narration = clean_narration(" ".join(str(word["text"]) for word in sorted(narration_words, key=lambda item: (float(item["top"]), float(item["x0"])))) )
+                narration = re.split(r"(?i)\b(?:opening\s+balance|total|grand\s+total|this\s+is\s+an\s+auto)\b", narration)[0].strip()
+                # A final narration word can visually overlap the debit x-band
+                # in borderless source PDFs.  A currency-shaped tail is not
+                # narration; it is the source movement already measured above.
+                narration = re.sub(r"(?:\s+|\b\d{1,2}-)\d[\d,]*\.\d{2}$", "", narration).strip()
+                if re.search(r"(?i)^(?:opening\s+balance|b\s*/\s*f)\b", narration):
+                    continue
+                refs = re.findall(r"\b\d{6,}\b", narration)
+                rows.append([display_date(date_text), narration, withdrawal, deposit, refs[-1] if refs else "", balance])
+            try:
+                page.close()
+            except Exception:
+                pass
+    return rows if len(rows) > 1 else []
+
 def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: str | None = None) -> tuple[list[list[object]], str]:
     raw = remove_page_furniture(cached_pdf_text(path))
     if not native_pdf_text_is_usable(path):
@@ -2593,6 +2723,14 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
     known_header: list[object] | None = None
     if strategy_override == "geometry_profile":
         return extract_geometry_profile_rows(path), raw
+    standard_geometry_header = bool(re.search(
+        r"(?is)\bdate\b[\s\S]{0,150}\bparticulars?\b[\s\S]{0,150}\bwithdrawals?\b[\s\S]{0,150}\bdeposits?\b[\s\S]{0,150}\bbalance\b",
+        raw,
+    ))
+    if strategy_override is None and standard_geometry_header:
+        measured_rows = extract_standard_column_geometry_rows(path)
+        if measured_rows:
+            return measured_rows, raw
     # Some borderless statements expose two adjacent date columns.  Generic
     # table extraction commonly merges their headers (for example,
     # ``TXN DATE`` + ``VALUE DATE``), which prevents an otherwise exact saved
@@ -2920,6 +3058,15 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         )
     ):
         effective_strategy = "dual_date_geometry"
+    elif (
+        effective_strategy is None
+        and path.suffix.lower() == ".pdf"
+        and re.search(
+            r"(?is)\bdate\b[\s\S]{0,150}\bparticulars?\b[\s\S]{0,150}\bwithdrawals?\b[\s\S]{0,150}\bdeposits?\b[\s\S]{0,150}\bbalance\b",
+            raw,
+        )
+    ):
+        effective_strategy = "standard_column_geometry"
     header_at = next((i for i, row in enumerate(rows[:20]) if len(map_headers(row)) >= 3), None)
     ai_columns = None
     if header_at is None or force_ai_profile:
@@ -3024,7 +3171,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # Certain bank exports visually group same-date rows rather than preserving
     # ledger order. Try a source-amount-preserving reconstruction before any
     # balance-delta fallback; it succeeds only for one complete, unique chain.
-    if effective_strategy in ("geometry_profile", "dual_date_geometry"):
+    if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry"):
         reconstructed = reconstruct_unordered_balance_chain(tx, opening, closing)
         # In an unordered statement, the first displayed row is not reliable
         # opening evidence. A printed Grand Total can instead derive opening,
@@ -3084,6 +3231,46 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         # it is strong evidence that the parser read reference IDs as amounts.
         return abs(parsed - declared) / abs(declared) > Decimal("0.05")
     statement_totals_plausible = not (materially_divergent(total_w, declared_withdrawals) or materially_divergent(total_d, declared_deposits))
+    # A searchable PDF may render a correct balance visually while its hidden
+    # text layer corrupts only that token (for example ``-5,00,177.00`` as
+    # ``-5.00.177.00``).  Restore a blanked balance only when it has one unique
+    # ledger value proved by the preceding source movement *and* either the
+    # next measured balance or the printed-total endpoint.  This never changes
+    # debit/credit values and never fills an ambiguous blank balance.
+    balance_repaired_from_chain = 0
+    if tx and declared_withdrawals is not None and declared_deposits is not None:
+        declared_endpoint = opening - declared_withdrawals + declared_deposits
+        for index, transaction in enumerate(tx):
+            if transaction.get("balance") is not None or index == 0:
+                continue
+            previous_balance = tx[index - 1].get("balance")
+            if previous_balance is None:
+                continue
+            candidate_balance = previous_balance - transaction["withdrawal"] + transaction["deposit"]
+            if index + 1 < len(tx):
+                following = tx[index + 1]
+                following_balance = following.get("balance")
+                proved = (
+                    following_balance is not None
+                    and (candidate_balance - following["withdrawal"] + following["deposit"]).quantize(Decimal(".01"))
+                    == following_balance.quantize(Decimal(".01"))
+                )
+            else:
+                proved = candidate_balance.quantize(Decimal(".01")) == declared_endpoint.quantize(Decimal(".01"))
+            if proved:
+                transaction["balance"] = candidate_balance
+                balance_repaired_from_chain += 1
+        # A repaired final row is stronger endpoint evidence than the prior
+        # readable balance in a damaged text layer.  Promote it only where the
+        # printed debit/credit totals independently prove the same endpoint.
+        if (
+            balance_repaired_from_chain
+            and tx[-1].get("balance") is not None
+            and tx[-1]["balance"].quantize(Decimal(".01")) == declared_endpoint.quantize(Decimal(".01"))
+        ):
+            closing = declared_endpoint
+            computed = opening - total_w + total_d
+            total_reconciles = computed.quantize(Decimal(".01"), rounding=ROUND_HALF_UP) == closing.quantize(Decimal(".01"), rounding=ROUND_HALF_UP)
     # Validate each movement against its source amount independently of the
     # running-balance chain.  A bad balance column must not hide an amount
     # mapping error simply because the chain stops at its first bad row.
@@ -3140,7 +3327,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # generic table discoverer here re-scans all 1,176 pages with pdfplumber,
     # even though this J&K layout has no table borders or reusable headers.
     # Reserve that expensive structural check for a geometry/table candidate.
-    if effective_strategy in ("geometry_profile", "dual_date_geometry"):
+    if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry"):
         table_count = structured_source_count(path)
         if table_count is not None:
             expected_source_count = table_count
@@ -3190,7 +3377,11 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         and statement_totals_valid
         and source_amount_valid
         and coverage_valid
-        and len(tx) >= 20
+        # A short loan statement can have the same objectively broken balance
+        # evidence as a long one.  Exact printed debit/credit totals, full
+        # source coverage, source amounts, and narration are the safeguards;
+        # an arbitrary row-count threshold must not force invented movements.
+        and len(tx) >= 2
     ):
         first_tx, last_tx = tx[0], tx[-1]
         inferred_opening = (first_tx["balance"] - first_tx["deposit"] + first_tx["withdrawal"] if first_tx.get("balance") is not None else None)
@@ -3221,6 +3412,14 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # contract check is independent of monetary validation and applies to every
     # strategy, including a saved profile and an AI-generated addendum.
     canonical_contract_valid = bool(tx) and all(canonical_transaction_contract_valid(item) for item in tx)
+    # A strict money parser deliberately blanks malformed values such as
+    # ``-5.00.177.00``.  For this narrowly proven source-balance exception,
+    # permit those blank balances only after exact printed debit/credit totals,
+    # full source coverage, measured source amounts, and derived endpoints have
+    # already established the financial result.  It is never a normal chain
+    # pass and is always surfaced as a warning to the downstream consumer.
+    if not canonical_contract_valid and source_balance_unreliable:
+        canonical_contract_valid = all(canonical_transaction_core_valid(item) for item in tx)
     financial_valid = (
         total_reconciles
         and (running_balance_valid or source_balance_unreliable)
@@ -3236,6 +3435,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     columns["_balance_endpoint_derived"] = locals().get("endpoint_derived", "none")
     columns["_source_totals_conflict"] = source_totals_conflict
     columns["_canonical_contract_valid"] = canonical_contract_valid
+    columns["_balance_repaired_from_chain"] = balance_repaired_from_chain
     # The original source text is independent evidence.  A narration that cannot
     # be located there is not silently accepted just because amounts reconcile.
     # Build the normalized source once. Re-normalizing a 250-page statement
@@ -3250,7 +3450,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # It remains gated by complete records, source amounts and the measured
     # narration column; it never applies to generic text-layout parsing.
     coordinate_trace_valid = (
-        effective_strategy in ("geometry_profile", "dual_date_geometry")
+        effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry")
         and path.suffix.lower() == ".pdf"
         and coverage_valid
         and source_amount_valid
