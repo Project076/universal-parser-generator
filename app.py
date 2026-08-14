@@ -774,7 +774,41 @@ def certified_javascript_code(headers: list[object], strategy: str | None) -> tu
 }"""
     return detection, parser
 
-def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None) -> str:
+def certified_feature_vector(headers: list[object], columns: dict[str, int], strategy: str | None,
+                             diagnostic_rules: list[str] | None = None,
+                             challenge_history: list[str] | None = None,
+                             capability_tags: list[str] | None = None) -> dict[str, object]:
+    """Persist a non-sensitive feature vector for retrieval and future ML evaluation.
+
+    No source text, account values, narration, transaction rows, or customer
+    identifiers are retained.  This is deliberately an explainable feature
+    record, not a model prediction and never a release decision.
+    """
+    header_words = " ".join(norm(item) for item in headers)
+    rules = {str(item) for item in (diagnostic_rules or [])}
+    challenges = {str(item) for item in (challenge_history or [])}
+    capabilities = {str(item) for item in (capability_tags or [])}
+    return {
+        "schema_version": 1,
+        "source_kind": "pdf_geometry" if strategy == "geometry_profile" else "structured_or_text",
+        "mapped_fields": sorted(name for name in columns if name in CANONICAL),
+        "strategy": strategy or "detected_table",
+        "signals": sorted({
+            *( ["dual_date"] if "value date" in header_words else [] ),
+            *( ["separate_debit_credit"] if "withdrawal" in header_words or "debit" in header_words else [] ),
+            *( ["running_balance"] if "balance" in header_words else [] ),
+            *( ["continuation"] if any("continuation" in item or "multi_page" in item for item in rules | challenges | capabilities) else [] ),
+            *( ["footer_furniture"] if any("footer" in item or "summary" in item or "terminal" in item for item in rules | challenges | capabilities) else [] ),
+            *( ["bf_metadata"] if any("bf_" in item or "preperiod" in item for item in rules | challenges | capabilities) else [] ),
+            *( ["reverse_order"] if any("reverse" in item or "date_order" in item for item in rules | challenges | capabilities) else [] ),
+            *( ["unreliable_balance"] if any("unreliable" in item for item in rules | challenges | capabilities) else [] ),
+        }),
+        "capabilities": sorted(capabilities),
+        "rule_ids": sorted(rules),
+        "challenge_ids": sorted(challenges),
+    }
+
+def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None, capability_tags: list[str] | None = None) -> str:
     """Persist only validated, privacy-safe layout learning; never source rows."""
     if generated_canonical_headers(headers) and not layout_fingerprint: return ""
     ident = profile_id(headers, layout_fingerprint)
@@ -784,13 +818,14 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     observations = int(prior.get("validated_observations", 0)) + 1
     detection_code, parser_code = certified_javascript_code(headers, strategy)
     challenges = sorted({str(item) for item in (challenge_history or []) if str(item) and str(item) != "none"})
-    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
+    features = certified_feature_vector(headers, columns, strategy, diagnostic_rules, challenges, capability_tags)
+    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "feature_vector": features, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
     try: ledger = json.loads(LEARNING_LEDGER.read_text(encoding="utf-8"))
     except (OSError, ValueError): ledger = {"validated_profiles": {}}
-    ledger.setdefault("validated_profiles", {})[ident] = {"observations": observations, "strategy": data["last_validated_strategy"], "self_healed_addendum": data["self_healed_addendum"], "diagnostic_rules": data["diagnostic_rules"], "challenge_history": challenges, "parent_profile": parent_profile}
+    ledger.setdefault("validated_profiles", {})[ident] = {"observations": observations, "strategy": data["last_validated_strategy"], "self_healed_addendum": data["self_healed_addendum"], "diagnostic_rules": data["diagnostic_rules"], "challenge_history": challenges, "feature_vector": features, "parent_profile": parent_profile}
     LEARNING_LEDGER.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     return ident
 
@@ -2962,6 +2997,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         bank_name=str(job_context.get("bank_name") or "Unknown"),
                         format_name=f"{path.suffix.lower().lstrip('.') or 'pdf'} statement".upper(),
                         challenge_history=sorted(diagnostic_rules | {str(prior_investigation.get("failure_type", ""))}),
+                        capability_tags=[str(item.get("capability")) for item in job_context.get("preflight_blueprint", {}).get("source_matched_capabilities", []) if isinstance(item, dict) and item.get("capability")],
                     )
                     name = export_excel(tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_wd, declared_dp, statement_totals_valid, bool(columns.get("_source_balance_unreliable")))
                     with JOBS_LOCK:
