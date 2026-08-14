@@ -2079,6 +2079,12 @@ def ocr_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float, fl
         for line in ordered_lines:
             ordered = sorted(line, key=lambda item: float(item["x0"]))
             labels = [str(word["text"]) for word in ordered]
+            # ``Post Date`` + ``Value Date`` is a two-column header.  Treat
+            # it as composite even when the other labels happen to be on the
+            # same OCR line; the raw one-line path would otherwise create two
+            # generic Date bands and collapse source dates at parse time.
+            if {"post", "value"}.issubset({norm(label) for label in labels}):
+                continue
             mapped = map_headers(labels)
             if not {"date", "narration", "withdrawal", "deposit", "balance"}.issubset(mapped):
                 continue
@@ -2113,7 +2119,11 @@ def ocr_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float, fl
                 x = float(word["x0"])
                 canonical = None
                 if label in {"description", "narration", "particular", "particulars", "details", "remarks"}:
-                    canonical = "Description"
+                    # OCR headings are often centred while their narrative
+                    # data begins at the left edge of a much wider column.
+                    # Preserve a small measured lead-in so the first words of
+                    # a narration never spill into Value Date.
+                    canonical, x = "Description", max(0.0, x - 80.0)
                 elif label.startswith("cheque") or label.startswith("check") or label.startswith("instrument") or label.startswith("reference"):
                     canonical = "Cheque No/Reference"
                 elif label.startswith("debit") or label.startswith("withdraw"):
@@ -2123,13 +2133,24 @@ def ocr_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float, fl
                 elif label.startswith("balance"):
                     canonical = "Balance"
                 elif label == "date":
-                    # Prefer a neighbouring "Value" heading where both dates
-                    # appear; otherwise retain the ordinary Date column.
-                    peers = [candidate for candidate in window
-                             if abs(float(candidate["top"]) - float(word["top"])) < 12
-                             and abs(float(candidate["x0"]) - x) < 90]
-                    peer_labels = {norm(candidate["text"]) for candidate in peers}
-                    canonical = "Value Date" if "value" in peer_labels else "Post Date" if "post" in peer_labels else "Date"
+                    # A scan commonly prints ``Post Date`` and ``Value Date``
+                    # on the same line.  Only the word immediately *to the
+                    # left* names this Date column.  Looking both ways used
+                    # to label both date columns as Value Date, putting two
+                    # dates into one extracted cell and making every row
+                    # fail the date-anchor test.
+                    left_peers = [candidate for candidate in window
+                                  if abs(float(candidate["top"]) - float(word["top"])) < 12
+                                  and float(candidate["x1"]) <= x
+                                  and x - float(candidate["x1"]) < 80]
+                    peer = max(left_peers, key=lambda candidate: float(candidate["x1"]), default=None)
+                    peer_label = norm(peer["text"]) if peer else ""
+                    if peer_label == "value":
+                        canonical, x = "Value Date", float(peer["x0"])
+                    elif peer_label == "post":
+                        canonical, x = "Post Date", float(peer["x0"])
+                    else:
+                        canonical = "Date"
                 if canonical is None:
                     continue
                 key = (canonical, round(x))
@@ -2174,11 +2195,34 @@ def extract_ocr_geometry_rows(path: Path, page_numbers: set[int] | None = None) 
         lines: dict[int, list[dict]] = {}
         for word in words:
             lines.setdefault(round(float(word["top"]) / 3), []).append(word)
+        # Do not let statement identity fields above the transaction table
+        # become fake rows merely because they contain a report/statement date.
+        # OCR table pages repeat the native header; use its measured words as
+        # a page-local fence and only accept material below it.
+        header_terms = {"post", "value", "date", "description", "narration", "debit", "credit", "balance", "cheque", "reference"}
+        header_words = [word for word in words if norm(str(word["text"])) in header_terms]
+        header_bottom = None
+        for word in header_words:
+            nearby = [candidate for candidate in header_words
+                      if abs(float(candidate["top"]) - float(word["top"])) < 42]
+            if len({norm(str(candidate["text"])) for candidate in nearby}) >= 5:
+                header_bottom = max(float(candidate["bottom"]) for candidate in nearby)
+                break
         pending: list[list[str]] = []
+        footer_started = False
         for line_words in lines.values():
             ordered = sorted(line_words, key=lambda item: float(item["x0"]))
             line_text = " ".join(str(word["text"]) for word in ordered)
-            if re.search(r"(?i)\b(?:page\s+total|grand\s+total|statement\s+summary|opening\s+balance|closing\s+balance|end\s+of\s+statement)\b", line_text):
+            line_top = min(float(word["top"]) for word in ordered)
+            if header_bottom is not None and line_top <= header_bottom + 10:
+                continue
+            if footer_started or re.search(r"(?i)\b(?:page\s+total|grand\s+total|statement\s+summary|opening\s+balance|closing\s+balance|end\s+of\s+statement|page\s*(?:no\.?|number)?\s*\d+|scanned\s+with|brought\s+forward|dr\s+count|cr\s+count|total\s+(?:debits?|credits?))\b", line_text):
+                # ``Brought Forward`` at the beginning of a page is opening
+                # metadata, not the end-of-statement summary.  It must be
+                # ignored without closing the page's transaction stream.
+                is_summary = bool(re.search(r"(?i)\b(?:statement\s+summary|dr\s+count|cr\s+count|total\s+(?:debits?|credits?))\b", line_text))
+                if is_summary or (current is not None and re.search(r"(?i)\b(?:brought\s+forward|closing\s+balance)\b", line_text)):
+                    footer_started = True
                 continue
             cells = ["" for _ in bands]
             for word in ordered:
@@ -2188,14 +2232,25 @@ def extract_ocr_geometry_rows(path: Path, page_numbers: set[int] | None = None) 
                     cells[column] = (cells[column] + " " + str(word["text"])).strip()
             if not any(cells) or len(map_headers(cells)) >= 3:
                 continue
-            if transaction_date_value(cells[date_index]):
+            # The Value Date cell must be one concrete source date.  This
+            # avoids accepting a page heading or a merged OCR band containing
+            # two dates as a transaction anchor.
+            date_match = re.fullmatch(r"\s*(\d{2}[-/]\d{2}[-/]\d{2,4})(?:\s*[^\w\s]+\s*)?", cells[date_index] or "")
+            is_dated_row = bool(date_match)
+            if is_dated_row:
+                cells[date_index] = date_match.group(1)
+                # In scanned statements particulars are often printed one
+                # visual line *above* the date/amount/balance line.  Those
+                # fragments belong to this newly found transaction, not the
+                # preceding dated transaction.
+                new_current = cells
+                for fragment in pending:
+                    for index, value in enumerate(fragment):
+                        if value:
+                            new_current[index] = (new_current[index] + " " + value).strip()
                 if current is not None:
-                    for fragment in pending:
-                        for index, value in enumerate(fragment):
-                            if value:
-                                current[index] = (current[index] + " " + value).strip()
                     rows.append(current)
-                current, pending = cells, []
+                current, pending = new_current, []
             elif current is not None:
                 # Narrative fragments between dated anchors remain attached to
                 # their transaction.  Furniture was excluded above.
@@ -2705,7 +2760,12 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     if path.suffix.lower() == ".pdf":
         source_text = remove_page_furniture(cached_pdf_text(path))
         if len(re.sub(r"\W", "", source_text)) < 80:
-            raise ValueError("OCR_REQUIRED: This PDF is image-only and has no reliable machine-readable transaction text. OCR must recover the source before any parser can be validated.")
+            if not ocr_is_available():
+                raise ValueError("OCR_REQUIRED: This PDF is image-only and has no reliable machine-readable transaction text. OCR must recover the source before any parser can be validated.")
+            # Image-only statements are validated from OCR recovered from the
+            # original source pages.  Geometry remains the parser input; this
+            # text is only supporting evidence for narration and endpoints.
+            source_text = remove_page_furniture(ocr_pdf_text(path))
     rows, raw = load_rows(path, strategy_override, job_id)
     if not rows: raise ValueError("The statement contains no readable rows.")
     # ``extract_pdf_rows`` may deterministically upgrade a generic request to
@@ -2791,6 +2851,8 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # header block can sit before B/F and the final Grand Total; cleaning it is
     # right for row parsing but must not erase those source-proven endpoints.
     endpoint_text = cached_pdf_text(path) if path.suffix.lower() == ".pdf" else raw
+    if path.suffix.lower() == ".pdf" and len(re.sub(r"\W", "", endpoint_text)) < 80:
+        endpoint_text = raw or source_text
     source_opening, source_closing = source_balances(endpoint_text)
     opening, closing = source_opening, source_closing
     tab_opening, tab_closing = table_balances(rows, header_at, columns)
