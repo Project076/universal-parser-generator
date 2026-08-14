@@ -23,6 +23,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+try:
+    from PIL import Image
+    import pytesseract
+    from pytesseract import Output as TesseractOutput
+except ImportError:
+    Image = None
+    pytesseract = None
+    TesseractOutput = None
+
 import openpyxl
 from openpyxl.styles import Font, PatternFill
 try:
@@ -104,6 +113,7 @@ EXTRACTION_CACHE_LOCK = threading.Lock()
 PDF_TEXT_CACHE: dict[str, str] = {}
 PDF_SAMPLE_CACHE: dict[str, str] = {}
 PDF_GEOMETRY_PROFILE_CACHE: dict[str, tuple[list[object], list[tuple[float, float]]] | None] = {}
+OCR_WORD_PAGE_CACHE: dict[tuple[str, int], list[dict]] = {}
 # Passwords are request-scoped, held only in memory, and are never written to
 # profiles, learning, exports, logs, or webhook payloads.
 PDF_PASSWORD_CACHE: dict[str, str] = {}
@@ -1225,6 +1235,99 @@ def open_pdfplumber(path: Path):
             raise ValueError("PASSWORD_REQUIRED: This PDF is password protected. Enter its password and submit it again; UPG will not retry unreadable encrypted files.") from error
         raise
 
+
+def ocr_is_available() -> bool:
+    """Return whether this deployment can read image-only PDFs with word boxes."""
+    return bool(fitz is not None and Image is not None and pytesseract is not None and shutil.which("tesseract"))
+
+
+def ocr_pdf_page_words(path: Path, page_number: int) -> list[dict]:
+    """OCR one original PDF page and preserve its coordinates in PDF points.
+
+    We deliberately do not flatten a scan into plain text and then guess its
+    columns.  Tesseract's pixel boxes are scaled back to the source PDF page
+    size, so the normal header/band parser can learn a reusable layout.
+    """
+    key = (str(path.resolve()), page_number)
+    with EXTRACTION_CACHE_LOCK:
+        cached = OCR_WORD_PAGE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if not ocr_is_available():
+        raise ValueError(
+            "OCR_UNAVAILABLE: This PDF has no text layer. The UPG server needs "
+            "Tesseract OCR installed before it can measure this scanned statement."
+        )
+    document = fitz.open(str(path))
+    try:
+        if document.needs_pass:
+            password = pdf_password(path)
+            if not password or not document.authenticate(password):
+                raise ValueError("PASSWORD_REQUIRED: This PDF is password protected. Enter its password and submit it again; UPG will not retry unreadable encrypted files.")
+        page = document.load_page(page_number)
+        # 240 DPI is sufficient for transaction fonts while retaining a small
+        # enough image for multi-page statements.  PDF coordinates are restored
+        # below, so a saved profile remains portable to another statement.
+        scale = max(1.5, min(4.0, float(os.environ.get("UPG_OCR_SCALE", "3.333"))))
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csRGB, alpha=False)
+        image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        data = pytesseract.image_to_data(
+            image, output_type=TesseractOutput.DICT,
+            config=os.environ.get("UPG_TESSERACT_CONFIG", "--oem 1 --psm 6"),
+            lang=os.environ.get("UPG_OCR_LANGUAGE", "eng"),
+        )
+        words: list[dict] = []
+        page_width, page_height = float(page.rect.width), float(page.rect.height)
+        for index, value in enumerate(data.get("text", [])):
+            text = str(value or "").strip()
+            try:
+                confidence = float(data["conf"][index])
+            except (KeyError, ValueError, TypeError):
+                confidence = -1.0
+            if not text or confidence < 20:
+                continue
+            left = float(data["left"][index])
+            top = float(data["top"][index])
+            width = float(data["width"][index])
+            height = float(data["height"][index])
+            words.append({
+                "text": text,
+                "x0": left * page_width / pix.width,
+                "x1": (left + width) * page_width / pix.width,
+                "top": top * page_height / pix.height,
+                "bottom": (top + height) * page_height / pix.height,
+            })
+    finally:
+        document.close()
+    with EXTRACTION_CACHE_LOCK:
+        if len(OCR_WORD_PAGE_CACHE) >= 180:
+            OCR_WORD_PAGE_CACHE.pop(next(iter(OCR_WORD_PAGE_CACHE)))
+        OCR_WORD_PAGE_CACHE[key] = words
+    return words
+
+
+def ocr_pdf_text(path: Path, page_indices: list[int] | None = None) -> str:
+    """Return OCR text only as support evidence; parsing uses word geometry."""
+    if fitz is None:
+        raise ValueError("OCR_UNAVAILABLE: PyMuPDF is required for image-only PDFs.")
+    document = fitz.open(str(path))
+    try:
+        if document.needs_pass:
+            password = pdf_password(path)
+            if not password or not document.authenticate(password):
+                raise ValueError("PASSWORD_REQUIRED: This PDF is password protected. Enter its password and submit it again; UPG will not retry unreadable encrypted files.")
+        indices = page_indices if page_indices is not None else list(range(document.page_count))
+    finally:
+        document.close()
+    return "\f".join(" ".join(str(word["text"]) for word in ocr_pdf_page_words(path, index)) for index in indices)
+
+
+def native_pdf_text_is_usable(path: Path) -> bool:
+    try:
+        return len(re.sub(r"\W", "", read_pdf_text(path))) >= 80
+    except (OSError, ValueError):
+        return False
+
 def is_large_pdf(path: Path) -> bool:
     try:
         return path.suffix.lower() == ".pdf" and len(open_pdf_reader(path).pages) > 60
@@ -1275,7 +1378,13 @@ def sampled_pdf_text(path: Path) -> str:
     # native extractor for the source text itself.
     sample = "\n".join(f"[PAGE {index + 1}]\n{text}" for index, text in zip(indices, page_texts.split("\f")))
     if not sample.strip():
-        sample = fast_pdf_text(path, indices)
+        # Image-only scans have no native text.  OCR only representative pages
+        # during planning; a full OCR pass is deferred until a measured
+        # candidate is actually tested.
+        sample = "\n".join(
+            f"[PAGE {index + 1}]\n{text}"
+            for index, text in zip(indices, ocr_pdf_text(path, indices).split("\f"))
+        )
     with EXTRACTION_CACHE_LOCK:
         if len(PDF_SAMPLE_CACHE) >= 12:
             PDF_SAMPLE_CACHE.pop(next(iter(PDF_SAMPLE_CACHE)))
@@ -1289,6 +1398,41 @@ def sampled_pdf_geometry_evidence(path: Path) -> list[dict]:
     PDFs contribute every page; large PDFs contribute representative first,
     middle, and last page groups (including boundary pages).
     """
+    if not native_pdf_text_is_usable(path):
+        document = fitz.open(str(path)) if fitz is not None else None
+        if document is None:
+            return []
+        try:
+            page_count = document.page_count
+        finally:
+            document.close()
+        evidence: list[dict] = []
+        for page_number in (list(range(page_count)) if page_count <= 60 else sampled_page_indices(page_count)):
+            words = ocr_pdf_page_words(path, page_number)
+            lines: dict[int, list[dict]] = {}
+            for word in words:
+                lines.setdefault(round(float(word["top"]) / 3), []).append(word)
+            header_words: list[dict] = []
+            for line in lines.values():
+                labels = " ".join(str(word["text"]) for word in line).lower()
+                if "date" in labels and "balance" in labels and any(label in labels for label in ("particular", "narration", "description")):
+                    header_words = [{"label": str(word["text"]), "x0": round(float(word["x0"]), 1), "x1": round(float(word["x1"]), 1)} for word in sorted(line, key=lambda item: float(item["x0"]))]
+                    break
+            numeric_bands: dict[int, int] = {}
+            for word in words:
+                if re.fullmatch(r"-?[\d,]+(?:\.\d{1,2})?(?:Cr|Dr)?", str(word["text"]), re.I):
+                    band = round(float(word["x0"]) / 10) * 10
+                    numeric_bands[band] = numeric_bands.get(band, 0) + 1
+            evidence.append({
+                "page": page_number + 1,
+                "ocr_geometry": True,
+                "tables": [],
+                "borderless_coordinate_evidence": {
+                    "header_word_positions": header_words,
+                    "numeric_column_x_ranges": [{"x0": x0, "x1": x0 + 10, "observations": count} for x0, count in sorted(numeric_bands.items(), key=lambda item: item[1], reverse=True)[:10]],
+                },
+            })
+        return evidence
     evidence: list[dict] = []
     with open_pdfplumber(path) as pdf:
         page_numbers = list(range(len(pdf.pages))) if len(pdf.pages) <= 60 else sampled_page_indices(len(pdf.pages))
@@ -1736,6 +1880,14 @@ def cached_pdf_text(path: Path) -> str:
     if cached is not None:
         return cached
     text = read_pdf_text(path)
+    if len(re.sub(r"\W", "", text)) < 80:
+        # Small scanned statements can be OCRed once as evidence.  Long scans
+        # use their representative geometry during planning and their complete
+        # geometry only in the chosen parser candidate.
+        if is_large_pdf(path):
+            text = sampled_pdf_text(path)
+        else:
+            text = ocr_pdf_text(path)
     with EXTRACTION_CACHE_LOCK:
         if len(PDF_TEXT_CACHE) >= 12:
             PDF_TEXT_CACHE.pop(next(iter(PDF_TEXT_CACHE)))
@@ -1808,6 +1960,11 @@ def sampled_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float
     with EXTRACTION_CACHE_LOCK:
         if key in PDF_GEOMETRY_PROFILE_CACHE:
             return PDF_GEOMETRY_PROFILE_CACHE[key]
+    if not native_pdf_text_is_usable(path):
+        discovered = ocr_geometry_profile(path)
+        with EXTRACTION_CACHE_LOCK:
+            PDF_GEOMETRY_PROFILE_CACHE[key] = discovered
+        return discovered
     discovered: tuple[list[object], list[tuple[float, float]]] | None = None
     with open_pdfplumber(path) as pdf:
         page_numbers = list(range(len(pdf.pages))) if len(pdf.pages) <= 60 else sampled_page_indices(len(pdf.pages))
@@ -1900,6 +2057,94 @@ def sampled_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float
             PDF_GEOMETRY_PROFILE_CACHE.pop(next(iter(PDF_GEOMETRY_PROFILE_CACHE)))
         PDF_GEOMETRY_PROFILE_CACHE[key] = discovered
     return discovered
+
+def ocr_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float, float]]] | None:
+    """Discover transaction headers from OCR word coordinates on a scan."""
+    document = fitz.open(str(path)) if fitz is not None else None
+    if document is None:
+        return None
+    try:
+        page_count = document.page_count
+    finally:
+        document.close()
+    for page_number in (list(range(page_count)) if page_count <= 60 else sampled_page_indices(page_count)):
+        words = ocr_pdf_page_words(path, page_number)
+        lines: dict[int, list[dict]] = {}
+        for word in words:
+            lines.setdefault(round(float(word["top"]) / 3), []).append(word)
+        for line in lines.values():
+            ordered = sorted(line, key=lambda item: float(item["x0"]))
+            labels = [str(word["text"]) for word in ordered]
+            mapped = map_headers(labels)
+            if not {"date", "narration", "withdrawal", "deposit", "balance"}.issubset(mapped):
+                continue
+            starts = [float(word["x0"]) for word in ordered]
+            width = max(float(word["x1"]) for word in ordered) + 12.0
+            return labels, [
+                (0.0 if index == 0 else starts[index] - 3.0,
+                 (starts[index + 1] - 3.0) if index + 1 < len(starts) else width)
+                for index in range(len(starts))
+            ]
+    return None
+
+
+def extract_ocr_geometry_rows(path: Path, page_numbers: set[int] | None = None) -> list[list[object]]:
+    """Parse an image-only PDF using OCR word boxes, never flattened OCR text."""
+    profile = ocr_geometry_profile(path)
+    if not profile:
+        return []
+    header, bands = profile
+    column_map = map_headers(header)
+    date_index = column_map.get("date", 0)
+    rows: list[list[object]] = [header]
+    current: list[str] | None = None
+    document = fitz.open(str(path)) if fitz is not None else None
+    if document is None:
+        return []
+    try:
+        selected = page_numbers if page_numbers is not None else set(range(document.page_count))
+    finally:
+        document.close()
+    for page_number in sorted(selected):
+        words = ocr_pdf_page_words(path, page_number)
+        lines: dict[int, list[dict]] = {}
+        for word in words:
+            lines.setdefault(round(float(word["top"]) / 3), []).append(word)
+        pending: list[list[str]] = []
+        for line_words in lines.values():
+            ordered = sorted(line_words, key=lambda item: float(item["x0"]))
+            line_text = " ".join(str(word["text"]) for word in ordered)
+            if re.search(r"(?i)\b(?:page\s+total|grand\s+total|statement\s+summary|opening\s+balance|closing\s+balance|end\s+of\s+statement)\b", line_text):
+                continue
+            cells = ["" for _ in bands]
+            for word in ordered:
+                center = (float(word["x0"]) + float(word["x1"])) / 2
+                column = next((i for i, (left, right) in enumerate(bands) if left <= center <= right), None)
+                if column is not None:
+                    cells[column] = (cells[column] + " " + str(word["text"])).strip()
+            if not any(cells) or len(map_headers(cells)) >= 3:
+                continue
+            if transaction_date_value(cells[date_index]):
+                if current is not None:
+                    for fragment in pending:
+                        for index, value in enumerate(fragment):
+                            if value:
+                                current[index] = (current[index] + " " + value).strip()
+                    rows.append(current)
+                current, pending = cells, []
+            elif current is not None:
+                # Narrative fragments between dated anchors remain attached to
+                # their transaction.  Furniture was excluded above.
+                pending.append(cells)
+        if current is not None:
+            for fragment in pending:
+                for index, value in enumerate(fragment):
+                    if value:
+                        current[index] = (current[index] + " " + value).strip()
+            rows.append(current)
+            current = None
+    return rows
+
 
 def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = None) -> list[list[object]]:
     """Apply sampled column bands without table rediscovery.
@@ -2080,6 +2325,17 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
 
 def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: str | None = None) -> tuple[list[list[object]], str]:
     raw = remove_page_furniture(cached_pdf_text(path))
+    if not native_pdf_text_is_usable(path):
+        # Rows come from original-page OCR word boxes and learned x-bands.
+        # Full OCR text is retained only for the existing validation evidence.
+        raw = remove_page_furniture(ocr_pdf_text(path))
+        rows = extract_ocr_geometry_rows(path)
+        if not rows or len(rows) < 2:
+            raise ValueError(
+                "OCR_NO_TABLE: OCR could read the scan but could not measure a complete "
+                "Date / Particulars / Withdrawal / Deposit / Balance transaction header."
+            )
+        return rows, raw
     dual_date_time_layout = bool(re.search(r"\d{2}-[A-Za-z]{3}-\d{4}[\s\S]{0,180}\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", raw))
     merged: list[list[object]] = []
     known_header: list[object] | None = None
