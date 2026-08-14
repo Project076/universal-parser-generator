@@ -328,6 +328,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "balance_delta": "Classify a single unsigned amount column from running-balance movement.",
     "continuation_merge": "Join narration and transaction fragments across rows or pages.",
     "footer_exclusion": "Exclude totals, closing labels, disclaimers, and page furniture.",
+    "terminal_row_before_summary": "When statement-summary labels begin after the final dated row, seal that dated row before ignoring summary/footer text; never let a later opening/closing/total label contaminate its date or narration.",
     "reverse_order": "Reverse newest-first statements before reconciliation.",
     "source_coverage": "Reject partial extracts and require all detectable source records.",
     "truncated_table_date": "Repair a date cell only when the original source proves its missing final year digit; retain the row's actual amount and balance, never discard it.",
@@ -410,6 +411,7 @@ HISTORICAL_CHALLENGE_LESSONS = [
     "Printed debit/credit summary totals can be wrong. They are an additional warning unless the unreliable-balance exception requires exact source-total equality; never change parsed rows merely to match a summary.",
     "A correct financial endpoint alone is insufficient. Require one-to-one narration/source coverage, transaction count, and a complete balance chain whenever the source balance is reliable.",
     "For a large multi-year statement, an OCR date near the B/F area can be an artifact even when its amount is real and included in the printed Grand Total. Do not delete that amount. With source proof of B/F context, statement period, and total inclusion, pin the date to the first day of the period and clear the non-transaction balance so endpoint selection ignores it. This is a narrow normalization, not a blanket early-row rule.",
+    "A statement summary can begin immediately after the last real transaction. Seal the terminal dated row before reading Opening Balance, Closing Balance, debit/credit totals, or end-of-statement furniture; those labels must never be merged into the final row or cause it to be dropped.",
     "Do not re-run a failed deterministic strategy. A repair must change a source-proven layout mapping or select a different supported strategy.",
 ]
 ALIASES = {
@@ -489,7 +491,10 @@ def coordinate_narrations_traceable(transactions: list[dict], raw: str) -> bool:
     must be traceable to the source text.  It is not a fallback for text-only
     extraction and never accepts numeric or furniture-only narration.
     """
-    source_tokens = set(re.findall(r"[a-z0-9]{4,}", str(raw or "").lower()))
+    # Short source narrations such as GST, ATM, UPI and NEFT are valid
+    # particulars.  Require alphabetic three-character tokens rather than
+    # silently rejecting them simply because they are shorter than four.
+    source_tokens = set(re.findall(r"[a-z][a-z0-9]{2,}", str(raw or "").lower()))
     if not source_tokens:
         return False
     strong_rows = 0
@@ -499,7 +504,7 @@ def coordinate_narrations_traceable(transactions: list[dict], raw: str) -> bool:
         if not narration:
             continue
         narrated_rows += 1
-        tokens = re.findall(r"[a-z0-9]{4,}", narration.lower())
+        tokens = re.findall(r"[a-z][a-z0-9]{2,}", narration.lower())
         if not tokens:
             return False
         matched = sum(token in source_tokens for token in tokens)
@@ -672,7 +677,8 @@ def certified_javascript_code(headers: list[object], strategy: str | None) -> tu
     if strategy in {"running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "page_text_unsigned"}:
         parser = """function parse(text, options) {
   const blocks = String(text || '').split(/(?=^\\s*\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}\\b)/m);
-  const dateRe = /^\\s*(\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4})\\b/;
+  const dateToken = '\\d{1,2}[\\/-](?:\\d{1,2}|[A-Za-z]{3})[\\/-]\\d{2,4}';
+  const dateRe = new RegExp('^\\s*(' + dateToken + ')(?:\\s+(' + dateToken + '))?\\b');
   const moneyRe = /-?\\d[\\d,]*\\.\\d{2}/g;
   const asNumber = (value) => Number(String(value).replace(/,/g, ''));
   const rows = []; let previous = Number(options && options.openingBalance); if (!Number.isFinite(previous)) previous = null;
@@ -689,21 +695,53 @@ def certified_javascript_code(headers: list[object], strategy: str | None) -> tu
   } return rows;
 }"""
         return detection, parser
+    if strategy == "geometry_profile":
+        # Borderless PDF profiles are measured from original-PDF coordinates
+        # by UPG.  Their portable counterpart must still handle the common
+        # text layer: two date columns, wrapped narration, and three terminal
+        # numeric cells.  It deliberately keeps B/F and summary labels out of
+        # transaction rows.
+        parser = """function parse(text, options) {
+  const source = String(text || '');
+  const token = '\\d{1,2}[\\/-](?:\\d{1,2}|[A-Za-z]{3})[\\/-]\\d{2,4}';
+  const blocks = source.split(new RegExp('(?=^\\\\s*' + token + '\\\\s+' + token + '\\\\b)', 'm'));
+  const rowRe = new RegExp('^\\\\s*(' + token + ')\\\\s+(' + token + ')\\\\s*');
+  const moneyRe = /-?\\d[\\d,]*\\.\\d{2}\\b/g;
+  const months = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+  const date = value => { const p=String(value).split(/[\\/-]/), y=p[2].length===2?'20'+p[2]:p[2], m=months[String(p[1]).toLowerCase()]||p[1]; return p.length===3 ? p[0].padStart(2,'0')+'/'+String(m).padStart(2,'0')+'/'+y : String(value); };
+  const n = value => Number(String(value).replace(/,/g,''));
+  const rows = [];
+  for (const block of blocks) {
+    const match = block.match(rowRe); if (!match) continue;
+    if (/^\\s*(?:B\\s*\\/\\s*F|OPENING\\s+BALANCE)\\b/i.test(block.slice(match[0].length)) || /\\b(?:closing balance|total debit amt|total credit amt|end of statement)\\b/i.test(block)) continue;
+    const values = [...block.matchAll(moneyRe)]; if (values.length < 3) continue;
+    const tail = values.slice(-3), first = tail[0].index;
+    const debit = Math.abs(n(tail[0][0])) || 0, credit = Math.abs(n(tail[1][0])) || 0, balance = n(tail[2][0]);
+    if (!Number.isFinite(balance) || (!debit && !credit)) continue;
+    let particulars = block.slice(match[0].length, first).replace(/\\s+/g,' ').trim();
+    const refs = particulars.match(/\\b[A-Z0-9]{8,}\\b/g) || [], chqNo = refs.length ? refs[refs.length-1] : '';
+    if (chqNo) particulars = particulars.replace(chqNo,' ').replace(/\\s+/g,' ').trim();
+    rows.push({date:date(match[2]), particulars, withdrawal:debit, deposit:credit, balance, chqNo});
+  }
+  return rows;
+}"""
+        return detection, parser
     parser = """function parse(text, options) {
   const lines = String(text || '').split(/\\r?\\n/);
   const dateRe = /^\\s*(\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4})\\b/;
   const moneyRe = /-?\\d[\\d,]*\\.\\d{2}\\b/g;
-  const ignored = /^(page\\s+\\d+|generation date|hdfc bank|statement summary|\\*\\*end of statement|date\\s+.*(?:balance|deposit|credit)|account branch|address\\s*:|contents of this statement)/i;
+  const ignored = /^(page\\s+\\d+|generation date|hdfc bank|statement summary|\\*\\*end of statement|date\\s+.*(?:balance|deposit|credit)|account branch|address\\s*:|contents of this statement|opening balance|closing balance|total (?:debit|credit) amt)/i;
   const amount = (value) => {
     if (value == null) return null;
     const n = Number(String(value).replace(/,/g, ''));
     return Number.isFinite(n) && n !== 0 ? Math.abs(n) : null;
   };
   const date = (value) => {
-    const p = String(value).split(/[\\/-]/);
+    const p = String(value).split(/[\\/-]/), months = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
     if (p.length !== 3) return String(value);
     const year = p[2].length === 2 ? `20${p[2]}` : p[2];
-    return `${p[0].padStart(2, '0')}/${p[1].padStart(2, '0')}/${year}`;
+    const month = months[String(p[1]).toLowerCase()] || p[1];
+    return `${p[0].padStart(2, '0')}/${String(month).padStart(2, '0')}/${year}`;
   };
   const rows = [];
   let prefix = [];
@@ -716,6 +754,7 @@ def certified_javascript_code(headers: list[object], strategy: str | None) -> tu
       if (/^(RTGS|NEFT|IMPS|UPI|CHQ|CASH|ADHOC|EMP|EVP|POS|CARD)/i.test(line)) prefix.push(line);
       continue;
     }
+    if (/^\\s*(?:B\\s*\\/\\s*F|OPENING\\s+BALANCE)\\b/i.test(line.slice(match[0].length))) { prefix = []; continue; }
     const rest = line.slice(match[0].length);
     const money = [...rest.matchAll(moneyRe)];
     if (money.length < 3) { prefix = []; continue; }
@@ -728,7 +767,7 @@ def certified_javascript_code(headers: list[object], strategy: str | None) -> tu
     const chqNo = refs.length ? refs[refs.length - 1] : '';
     if (chqNo) detail = detail.replace(chqNo, ' ').replace(/\\s+/g, ' ').trim();
     const particulars = [...prefix, detail].join(' ').replace(/\\s+/g, ' ').trim();
-    rows.push({ date: date(match[1]), particulars, withdrawal: values[0], deposit: values[1], balance: values[2], chqNo });
+    rows.push({ date: date(match[2] || match[1]), particulars, withdrawal: values[0], deposit: values[1], balance: values[2], chqNo });
     prefix = [];
   }
   return rows;
@@ -1406,6 +1445,16 @@ def source_transaction_totals(text: str) -> tuple[Decimal | None, Decimal | None
         text,
     )
     if not summary:
+        # YES Bank and similar statements use compact final-summary labels
+        # rather than a grid headed "Statement Summary".  These are source
+        # controls only; they never replace transaction-level validation.
+        compact_summary = re.search(
+            r"(?is)\btotal\s+debit\s+amt\s*:\s*([\d,]+(?:\.\d{1,2})?).{0,160}?"
+            r"\btotal\s+credit\s+amt\s*:\s*([\d,]+(?:\.\d{1,2})?)",
+            text,
+        )
+        if compact_summary:
+            return money(compact_summary.group(1)), money(compact_summary.group(2))
         # Some banks print cumulative debit and credit totals as a final
         # Grand Total rather than a labelled statement-summary grid.
         grand = re.search(r"(?is)\bgrand\s+total\s*:\s*([\d,]+(?:\.\d{1,2})?)\s+([\d,]+(?:\.\d{1,2})?)", text)
@@ -1792,7 +1841,9 @@ def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = No
                 footer_on_line = bool(re.search(
                     r"(?i)\b(?:page\s+total|grand\s+total|date/time|system\s+generated|"
                     r"account\s+related\s+other\s+information|legends\s+for\s+transactions|"
-                    r"this\s+is\s+an\s+authenticated|nominee\s+name|sincerely)\b",
+                    r"this\s+is\s+an\s+authenticated|nominee\s+name|sincerely|"
+                    r"opening\s+balance|closing\s+balance|total\s+(?:debit|credit)\s+amt|"
+                    r"end\s+of\s+statement)\b",
                     line_text,
                 ))
                 cells = ["" for _ in bands]
@@ -1827,6 +1878,10 @@ def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = No
                     # the final transaction. If a transaction and footer share
                     # one band, its valid date keeps the transaction portion.
                     if not transaction_date_value(cells[date_index]):
+                        # Discard fragments collected from the statement
+                        # summary before they can be joined to the terminal
+                        # dated transaction at page close.
+                        pending_fragments = []
                         continue
                 if not any(cells) or len(map_headers(cells)) >= 3:
                     continue
@@ -2257,6 +2312,12 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
                 deposit = amount if "CR" in kind else Decimal("0")
         if withdrawal is None: withdrawal = Decimal("0")
         if deposit is None: deposit = Decimal("0")
+        narration = clean_narration(str(cell("narration") or ""))
+        # B/F is the statement opening anchor, not a movement.  Its Credit
+        # cell may look exactly like a deposit, so exclude it before totals,
+        # chain validation, and profile certification.
+        if re.search(r"(?i)^\s*(?:B\s*/\s*F|OPENING\s+BALANCE|BALANCE\s+BROUGHT\s+FORWARD)\b", narration):
+            continue
         if withdrawal or deposit:
             # Preserve the amount printed in the source amount column as
             # independent validation evidence.  It must be read through the
@@ -2265,7 +2326,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
             # Prefer the non-zero movement, as the opposite column normally
             # contains the literal source value ``0.0``.
             source_amount = withdrawal if withdrawal else deposit
-            tx.append({"date": display_date(table_date), "narration": clean_narration(str(cell("narration") or "")), "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": money(cell("balance")), "source_amount": source_amount})
+            tx.append({"date": display_date(table_date), "narration": narration, "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": money(cell("balance")), "source_amount": source_amount})
     # Transaction extraction uses the furniture-cleaned text, but statement
     # endpoints must come from the original PDF text.  A repeated J&K Bank
     # header block can sit before B/F and the final Grand Total; cleaning it is
@@ -2426,6 +2487,17 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         table_count = structured_source_count(path)
         if table_count is not None:
             expected_source_count = table_count
+    # B/F is an opening anchor, not a movement.  Some independent date-only
+    # source counts include it even though the stricter table count excludes
+    # it.  Correct only the exact one-row discrepancy that this metadata can
+    # explain; never use it to hide a genuine missing transaction.
+    bf_metadata_rows = len(re.findall(
+        r"(?im)^\s*\d{2}-[A-Za-z]{3}-\d{4}\s+\d{2}-[A-Za-z]{3}-\d{4}\s+B\s*/\s*F\b",
+        raw,
+    ))
+    excess = expected_source_count - len(tx)
+    if bf_metadata_rows and 0 < excess <= bf_metadata_rows:
+        expected_source_count -= excess
     coverage_valid = len(tx) == expected_source_count
     # A multi-page statement cannot be safely accepted from a single inferred
     # transaction: that comparison would merely validate an incomplete source

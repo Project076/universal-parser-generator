@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "header_signature": [
+    "TXN",
+    "DATE",
+    "VALUE",
+    "DATE",
+    "DESCRIPTION",
+    "REFERENCE",
+    "DEBITS",
+    "CREDITS",
+    "BALANCE"
+  ],
+  "layout_fingerprint": "",
+  "columns": {
+    "date": 1,
+    "narration": 4,
+    "balance": 8,
+    "withdrawal": 6,
+    "deposit": 7,
+    "_source_balance_unreliable": false,
+    "_balance_endpoint_derived": "none",
+    "_source_totals_conflict": false,
+    "_canonical_contract_valid": true
+  },
+  "parent_profile": null,
+  "validated_observations": 1,
+  "last_validated_strategy": "geometry_profile",
+  "self_healed_addendum": false,
+  "diagnostic_rules": [
+    "summary_endpoints",
+    "footer_exclusion",
+    "source_coverage",
+    "terminal_row_before_summary",
+    "value_date_preferred",
+    "bf_metadata_exclusion"
+  ],
+  "challenge_history": [
+    "bf_metadata_exclusion",
+    "borderless_pdf_geometry",
+    "dual_date_value_date",
+    "terminal_summary_row_sealing"
+  ],
+  "bank_name": "YES BANK",
+  "format_name": "YES Bank Statement of Account",
+  "detection_code": "function detect(text) {\n  const normalized = String(text || '').toLowerCase().replace(/\\s+/g, ' ');\n  const anchors = [\"date\", \"description\", \"balance\", \"debit\", \"credit\"];\n  const hasNarration = normalized.includes('narration') || normalized.includes('particular') || normalized.includes('description');\n  const hasDebit = normalized.includes('withdrawal') || normalized.includes('debit') || normalized.includes('dr');\n  const hasCredit = normalized.includes('deposit') || normalized.includes('credit') || normalized.includes('cr');\n  return normalized.includes('date') && normalized.includes('balance') && hasNarration && hasDebit && hasCredit && anchors.length >= 2;\n}",
+  "parser_code": "function parse(text, options) {\n  const source = String(text || '');\n  const token = '\\d{1,2}[\\/-](?:\\d{1,2}|[A-Za-z]{3})[\\/-]\\d{2,4}';\n  const blocks = source.split(new RegExp('(?=^\\\\s*' + token + '\\\\s+' + token + '\\\\b)', 'm'));\n  const rowRe = new RegExp('^\\\\s*(' + token + ')\\\\s+(' + token + ')\\\\s*');\n  const moneyRe = /-?\\d[\\d,]*\\.\\d{2}\\b/g;\n  const months = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};\n  const date = value => { const p=String(value).split(/[\\/-]/), y=p[2].length===2?'20'+p[2]:p[2], m=months[String(p[1]).toLowerCase()]||p[1]; return p.length===3 ? p[0].padStart(2,'0')+'/'+String(m).padStart(2,'0')+'/'+y : String(value); };\n  const n = value => Number(String(value).replace(/,/g,''));\n  const rows = [];\n  for (const block of blocks) {\n    const match = block.match(rowRe); if (!match) continue;\n    if (/^\\s*(?:B\\s*\\/\\s*F|OPENING\\s+BALANCE)\\b/i.test(block.slice(match[0].length)) || /\\b(?:closing balance|total debit amt|total credit amt|end of statement)\\b/i.test(block)) continue;\n    const values = [...block.matchAll(moneyRe)]; if (values.length < 3) continue;\n    const tail = values.slice(-3), first = tail[0].index;\n    const debit = Math.abs(n(tail[0][0])) || 0, credit = Math.abs(n(tail[1][0])) || 0, balance = n(tail[2][0]);\n    if (!Number.isFinite(balance) || (!debit && !credit)) continue;\n    let particulars = block.slice(match[0].length, first).replace(/\\s+/g,' ').trim();\n    const refs = particulars.match(/\\b[A-Z0-9]{8,}\\b/g) || [], chqNo = refs.length ? refs[refs.length-1] : '';\n    if (chqNo) particulars = particulars.replace(chqNo,' ').replace(/\\s+/g,' ').trim();\n    rows.push({date:date(match[2]), particulars, withdrawal:debit, deposit:credit, balance, chqNo});\n  }\n  return rows;\n}",
+  "validation": {
+    "status": "pass",
+    "financial_pass": true,
+    "narration_pass": true,
+    "balance_chain_pass": true,
+    "source_coverage_pass": true,
+    "transaction_count": 2179,
+    "declared_withdrawals_match": true,
+    "declared_deposits_match": true,
+    "statement_totals_match": true
+  },
+  "certification": {
+    "status": "certified",
+    "source": "upg_native",
+    "certified_at": "2026-08-14T07:36:05Z"
+  }
+}

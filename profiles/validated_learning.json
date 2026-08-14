@@ -40,6 +40,26 @@
       "self_healed_addendum": false,
       "diagnostic_rules": [],
       "parent_profile": "cd02cb200d0ed9e9"
+    },
+    "00122675caad7a99": {
+      "observations": 1,
+      "strategy": "geometry_profile",
+      "self_healed_addendum": false,
+      "diagnostic_rules": [
+        "summary_endpoints",
+        "footer_exclusion",
+        "source_coverage",
+        "terminal_row_before_summary",
+        "value_date_preferred",
+        "bf_metadata_exclusion"
+      ],
+      "challenge_history": [
+        "bf_metadata_exclusion",
+        "borderless_pdf_geometry",
+        "dual_date_value_date",
+        "terminal_summary_row_sealing"
+      ],
+      "parent_profile": null
     }
   }
 }
