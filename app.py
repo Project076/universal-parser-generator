@@ -867,7 +867,63 @@ def ai_learning_packet(path: Path | None = None, headers: list[object] | None = 
         "certified_profile_lessons": certified_learning_context(),
     }
 
-def compact_ai_learning_packet(path: Path | None = None, headers: list[object] | None = None) -> dict[str, object]:
+def source_capability_plan(raw: str = "", headers: list[object] | None = None) -> list[dict[str, object]]:
+    """Select reusable *capabilities*, never a foreign parser, from source evidence.
+
+    An unfamiliar bank is rarely an entirely unfamiliar problem.  Its headers
+    may be new while its layout still has a Value Date, fixed-width narration
+    continuations, repeated page furniture, B/F metadata, or a signed running
+    balance.  This stage deliberately transfers only those independently
+    certified behaviours.  It never copies another bank's coordinates, header
+    indexes, detection code, or parser code.
+    """
+    text = str(raw or "")
+    header_text = " ".join(str(item) for item in (headers or []))
+    evidence = (text[:120000] + "\n" + header_text).lower()
+    signals: list[tuple[str, str, str | None]] = []
+    if re.search(r"\b(?:value\s+date|val\.?\s*date)\b", evidence):
+        signals.append(("value_date", "Source prints both transaction/posting and Value Date evidence; export Value Date only.", "value_date_unsigned"))
+    if re.search(r"\b(?:b\s*/?\s*f|brought\s+forward|opening\s+balance)\b", evidence):
+        signals.append(("bf_preperiod_artifact", "Source contains B/F or opening-balance metadata; prevent it becoming a transaction.", None))
+    if re.search(r"\b(?:grand\s+total|page\s+total|statement\s+summary|total\s+(?:debits?|credits?))\b", evidence):
+        signals.append(("footer_exclusion", "Source contains summary/page-total furniture; seal the last dated row before it.", None))
+    if len(re.findall(r"(?im)^\s*(?:page\s*)?\d+\s*(?:of\s*\d+)?\s*$", text)) >= 2 or len(re.findall(r"(?i)\bpage\s+\d+\b", text)) >= 2:
+        signals.append(("multi_page_continuation", "Repeated page markers indicate page furniture and possible cross-page continuations.", None))
+    if re.search(r"\b\d[\d,]*\.\d{1,2}\s*(?:dr|cr)\b", evidence):
+        signals.append(("signed_balance_text", "Dated source text contains explicit Dr/Cr balances.", "running_balance_text"))
+    elif re.search(r"\b(?:running|available|closing)\s+balance\b", evidence):
+        signals.append(("balance_delta", "Source exposes an unsigned running-balance column; infer direction only from balance movement.", "unsigned_running_balance_text"))
+
+    certified = certified_learning_context(limit=64)
+    selected: list[dict[str, object]] = []
+    for capability, reason, strategy in signals:
+        providers: list[str] = []
+        for lesson in certified:
+            vocabulary = " ".join([
+                str(lesson.get("strategy", "")),
+                *[str(item) for item in lesson.get("challenge_history", [])],
+                *[str(item) for item in lesson.get("diagnostic_rules", [])],
+            ]).lower()
+            aliases = {
+                "value_date": ("value_date", "dual_date"),
+                "bf_preperiod_artifact": ("bf_", "opening", "preperiod"),
+                "footer_exclusion": ("footer", "summary", "terminal_row"),
+                "multi_page_continuation": ("continuation", "multi_page", "page_furniture"),
+                "signed_balance_text": ("signed_balance", "running_balance_text", "headerless"),
+                "balance_delta": ("balance_delta", "unsigned_running_balance", "value_date_unsigned"),
+            }.get(capability, (capability,))
+            if any(alias in vocabulary for alias in aliases):
+                providers.append(str(lesson.get("profile_id")))
+        selected.append({
+            "capability": capability,
+            "reason": reason,
+            "preferred_strategy": strategy,
+            "certified_profile_ids": providers[:4],
+            "instruction": DIAGNOSTIC_RULE_LIBRARY.get(capability, capability),
+        })
+    return selected
+
+def compact_ai_learning_packet(path: Path | None = None, headers: list[object] | None = None, raw: str = "") -> dict[str, object]:
     """Small, reusable AI context for a single constrained layout decision.
 
     Full profile history is useful to deterministic matching, but repeatedly
@@ -889,6 +945,7 @@ def compact_ai_learning_packet(path: Path | None = None, headers: list[object] |
             "mapped_fields": item.get("mapped_fields", []),
             "challenge_history": item.get("challenge_history", [])[:4],
         } for item in closest],
+        "source_matched_certified_capabilities": source_capability_plan(raw, headers),
     }
 
 def find_related_profile(headers: list[object]) -> tuple[str | None, dict[str, int]]:
@@ -1006,6 +1063,13 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
             add("unsigned_running_balance_text", False, 460)
         if not headers:
             add("page_text_unsigned", False, 300)
+        # A related source need not share headers with a certified profile.
+        # Promote only the extraction family proved by this source's features;
+        # never borrow another bank's offsets or executable parser code.
+        for capability in source_capability_plan(sample, headers):
+            strategy = capability.get("preferred_strategy")
+            if isinstance(strategy, str) and strategy:
+                add(strategy, False, 760)
     except (OSError, ValueError):
         pass
 
@@ -1038,7 +1102,16 @@ def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: s
     """Create one evidence-led parser plan before any full-file extraction."""
     geometry = sampled_geometry_profile(path) if path.suffix.lower() == ".pdf" else None
     headers = geometry[0] if geometry else []
+    try:
+        if path.suffix.lower() == ".pdf":
+            source_sample = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
+        else:
+            _, source_sample = load_rows(path)
+            source_sample = source_sample[:60000]
+    except (OSError, ValueError):
+        source_sample = ""
     closest = closest_certified_lessons(path, headers)
+    capabilities = source_capability_plan(source_sample, headers)
     candidates = evidence_first_candidates(path, large_pdf, bool(geometry), validated_strategy, planned_strategies, 1)
     return {
         "version": 2,
@@ -1052,6 +1125,7 @@ def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: s
         },
         "closest_profile_ids": [item["profile_id"] for item in closest],
         "closest_challenges": sorted({challenge for item in closest for challenge in item.get("challenge_history", [])}),
+        "source_matched_capabilities": capabilities,
         "candidate_plan": ["ai_layout_addendum" if ai else (strategy or "detected_table") for strategy, ai in candidates],
         "full_source_validation_required": True,
     }
@@ -1276,10 +1350,10 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     }
     geometry = compact_geometry_for_ai(sampled_pdf_geometry_evidence(source_path)) if source_path and source_path.suffix.lower() == ".pdf" else []
     evidence = {"rows": rows[:18], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context[-1800:],
-                "upg_learning": compact_ai_learning_packet(source_path, rows[0] if rows else None)}
+                "upg_learning": compact_ai_learning_packet(source_path, rows[0] if rows else None, raw)}
     instruction = (AI_LAYOUT_CONTRACT + "\nIdentify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
-        "and balance. These are the only allowed transaction outputs. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
+        "and balance. These are the only allowed transaction outputs. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. The source_matched_certified_capabilities are reusable behaviours only: apply one only when the supplied source evidence proves it, and never copy another profile's coordinates, code, or field indexes. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
     )
     payload = {
         "model": AI_MODEL,
@@ -1318,7 +1392,7 @@ def ai_choose_text_strategy(raw: str, job_id: str | None = None) -> str | None:
     payload = {
         "model": AI_MODEL,
         "input": (AI_LAYOUT_CONTRACT + "\nClassify this bank statement layout. Choose running_balance_text when dated entries have Dr/Cr running balances. Choose unsigned_running_balance_text when dated entries have unsigned running balances whose changes can infer debit or credit; choose "
-            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported.\nUPG learning: " + json.dumps(compact_ai_learning_packet()) + "\n\n" + raw[:3500]
+            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported.\nUPG learning: " + json.dumps(compact_ai_learning_packet(raw=raw)) + "\n\n" + raw[:3500]
         ),
         "max_output_tokens": AI_MAX_OUTPUT_TOKENS,
         "text": {"format": {"type": "json_schema", "name": "extraction_strategy", "strict": True, "schema": schema}},
@@ -1364,7 +1438,7 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
         "failure_type": {"type": "string", "enum": ["column_geometry", "header_mapping", "date_order", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "novel_layout"]},
         "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "ai_addendum", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
-    prompt = AI_LAYOUT_CONTRACT + "\nDiagnose one failed parser candidate from the evidence. Select a materially different safe action and priority list of supported strategies. Do not write code or transactions. If evidence is insufficient, choose novel_layout + ai_addendum.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(compact_ai_learning_packet(source_path)) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
+    prompt = AI_LAYOUT_CONTRACT + "\nDiagnose one failed parser candidate from the evidence. Select a materially different safe action and priority list of supported strategies. Do not write code or transactions. If evidence is insufficient, choose novel_layout + ai_addendum.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(compact_ai_learning_packet(source_path, raw=raw)) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
     payload = {"model": AI_MODEL, "input": prompt, "max_output_tokens": AI_MAX_OUTPUT_TOKENS, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
