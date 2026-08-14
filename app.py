@@ -292,9 +292,10 @@ MANDATORY_TRANSACTION_FIELDS = ("date", "narration", "withdrawal", "deposit", "b
 OPTIONAL_TRANSACTION_FIELDS = ("instrument_number",)
 FIVE_MINUTES_MS = 300000
 # AI is used to plan a source-layout mapping, never to extract every
-# transaction.  A fast, economical model is sufficient for this constrained
-# JSON task; deployments can explicitly override it for exceptional layouts.
-AI_MODEL = os.environ.get("UPG_AI_MODEL", "gpt-5-mini")
+# transaction. Keep the expert model as the quality default. Cost control is
+# achieved by eliminating repeated, low-evidence calls below—not by lowering
+# the reasoning capability available for unfamiliar layouts.
+AI_MODEL = os.environ.get("UPG_AI_MODEL", "gpt-5.6-sol")
 try:
     AI_MAX_OUTPUT_TOKENS = min(1_200, max(250, int(os.environ.get("UPG_AI_MAX_OUTPUT_TOKENS", "550"))))
 except ValueError:
