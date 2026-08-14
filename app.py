@@ -368,6 +368,7 @@ Bank statement extraction policy:
 - Use the statement opening balance when printed. If it is absent, derive it from the first real transaction's signed running balance minus its deposit plus its withdrawal.
 - A printed statement-level opening or closing balance overrides any inferred value. Otherwise, the closing balance is the signed running balance of the last real transaction, never a page total, grand total, available amount, or other footer balance.
 - Normalize Cr balances as positive and Dr balances as negative. A signed increase is a deposit; a signed decrease is a withdrawal.
+- Monetary format rule for Withdrawal, Deposit, and Balance: a valid amount has zero or one decimal point only; all Indian thousands/lakh/crore grouping must use commas. Reject a token with two or more points as malformed evidence. Do not replace its points, truncate it, or use it to infer an opposite-side amount.
 - If a PDF's visual balance is correctly printed but its searchable text has malformed punctuation (for example `-5,00,177.00` becoming `-5.00.177.00`), reject that damaged token rather than truncating it. Preserve the measured source withdrawal/deposit. Restore the balance only when the previous source balance plus that measured movement and either the next measured balance or independently printed final totals prove one unique value; record this as a text-layer repair, never as an invented amount.
 - Balance-chain validation is mandatory for every transaction with a running balance: previous balance = current balance + current withdrawal - current deposit. Equivalently, current balance = previous balance - withdrawal + deposit. Do not release a parser when any transaction balance is missing or breaks this chain.
 - Exception: if any transaction proves that the source running-balance chain is unreliable, do not use that column for a normal balance-chain pass or transaction classification. Certify only if parsed withdrawals and deposits exactly equal the printed statement totals, while narration coverage and transaction count pass. Form assumed endpoints from one available transaction balance and the verified totals, label them assumed, and require manual source review. If totals or independent evidence are inconsistent, withhold the parser.
@@ -459,17 +460,11 @@ def money(value: object) -> Decimal | None:
     if value is None or str(value).strip() == "": return None
     s = str(value).strip().replace(",", "").replace("₹", "").replace("$", "")
     s = re.sub(r"\s+", "", s)
-    # Some browser/searchable text layers use full stops as Indian thousand
-    # separators (for example ``10.000.00``).  Change only that complete
-    # repeated-three-digit grouping form; ordinary decimals and references
-    # remain untouched.
-    s = re.sub(
-        r"(?<!\d)(-?\d{1,3}(?:\.\d{3})+)(\.\d{2})(?=(?:DR|CR)?$)",
-        lambda match: match.group(1).replace(".", "") + match.group(2),
-        s,
-        flags=re.I,
-    )
-    # Never truncate a malformed balance such as ``-5.00.177.00`` to
+    # A monetary value has one decimal point at most.  Indian digit grouping
+    # must use commas, not additional full stops: ``-5,00,177.00`` is valid,
+    # while ``-5.00.177.00`` is invalid.  This rule applies equally to debit,
+    # credit and balance cells.
+    # Never truncate a malformed value such as ``-5.00.177.00`` to
     # ``-5.00``.  That turns a source printing defect into a fake
     # ₹5,00,000-scale balance movement and can make the parser manufacture an
     # opposite-side deposit.  Proper Indian dot-grouping was normalized just
@@ -481,12 +476,6 @@ def money(value: object) -> Decimal | None:
     token = re.match(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+)(?:\.\d{1,2})?(?:DR|CR)?", s, re.I)
     if token:
         s = token.group()
-    s = re.sub(
-        r"(?<!\d)(-?\d{1,3}(?:\.\d{3})+)(\.\d{2})(?=(?:DR|CR)?$)",
-        lambda match: match.group(1).replace(".", "") + match.group(2),
-        s,
-        flags=re.I,
-    )
     suffix = re.search(r"(DR|CR)$", s, re.I)
     # A few exports print a debit balance as both `-123.45Dr` and
     # `123.45Dr`.  DR is an accounting sign, not an instruction to negate an
