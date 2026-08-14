@@ -108,6 +108,21 @@ PDF_GEOMETRY_PROFILE_CACHE: dict[str, tuple[list[object], list[tuple[float, floa
 # profiles, learning, exports, logs, or webhook payloads.
 PDF_PASSWORD_CACHE: dict[str, str] = {}
 
+def _retention_seconds(setting: str, default: int, minimum: int) -> int:
+    """Read a safe retention setting without allowing accidental immediate deletion."""
+    try:
+        return max(minimum, int(os.environ.get(setting, str(default))))
+    except ValueError:
+        return default
+
+# Source uploads are only required while an active job is parsing.  Retain them
+# briefly for diagnostics, then remove them so Railway's persistent volume is
+# reserved for durable parser knowledge rather than customer statements.
+UPLOAD_RETENTION_SECONDS = _retention_seconds("UPG_UPLOAD_RETENTION_SECONDS", 6 * 60 * 60, 30 * 60)
+EXPORT_RETENTION_SECONDS = _retention_seconds("UPG_EXPORT_RETENTION_SECONDS", 24 * 60 * 60, 60 * 60)
+JOB_RETENTION_SECONDS = _retention_seconds("UPG_JOB_RETENTION_SECONDS", 7 * 24 * 60 * 60, 24 * 60 * 60)
+STORAGE_SWEEP_SECONDS = _retention_seconds("UPG_STORAGE_SWEEP_SECONDS", 15 * 60, 5 * 60)
+
 def job_file(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.json"
 
@@ -3005,6 +3020,54 @@ def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = 
         "validation": execution_validation,
     }
 
+def sweep_expired_storage() -> None:
+    """Remove only expired transient files; certified parser knowledge stays forever.
+
+    Uploads belonging to an active job are explicitly protected. Completed job
+    records and Excel downloads receive longer, separate retention windows.
+    Any cleanup error is ignored so a temporary volume issue can never affect
+    parsing or certification.
+    """
+    now = time.time()
+    with JOBS_LOCK:
+        active_sources = {
+            str(job.get("source_file", ""))
+            for job in JOBS.values()
+            if job.get("processing") and job.get("source_file")
+        }
+
+    for folder, retention, protected in (
+        (UPLOADS, UPLOAD_RETENTION_SECONDS, active_sources),
+        (EXPORTS, EXPORT_RETENTION_SECONDS, set()),
+    ):
+        try:
+            for item in folder.iterdir():
+                if not item.is_file() or item.name in protected:
+                    continue
+                if now - item.stat().st_mtime >= retention:
+                    item.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    try:
+        for record in JOBS_DIR.glob("*.json"):
+            if now - record.stat().st_mtime < JOB_RETENTION_SECONDS:
+                continue
+            job_id = record.stem
+            with JOBS_LOCK:
+                job = JOBS.get(job_id, {})
+                if job.get("processing"):
+                    continue
+                JOBS.pop(job_id, None)
+            record.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+def storage_housekeeper() -> None:
+    while True:
+        sweep_expired_storage()
+        time.sleep(STORAGE_SWEEP_SECONDS)
+
 def recover_persisted_jobs() -> None:
     """Recover safe unprotected jobs after a Railway restart.
 
@@ -3045,6 +3108,7 @@ def recover_persisted_jobs() -> None:
 
 recover_persisted_jobs()
 threading.Thread(target=queue_supervisor, name="upg-queue-supervisor", daemon=True).start()
+threading.Thread(target=storage_housekeeper, name="upg-storage-housekeeper", daemon=True).start()
 
 class App(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
