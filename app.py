@@ -291,14 +291,20 @@ CANONICAL = ["date", "narration", "withdrawal", "deposit", "instrument_number", 
 MANDATORY_TRANSACTION_FIELDS = ("date", "narration", "withdrawal", "deposit", "balance")
 OPTIONAL_TRANSACTION_FIELDS = ("instrument_number",)
 FIVE_MINUTES_MS = 300000
-AI_MODEL = "gpt-5.6-sol"
+# AI is used to plan a source-layout mapping, never to extract every
+# transaction.  A fast, economical model is sufficient for this constrained
+# JSON task; deployments can explicitly override it for exceptional layouts.
+AI_MODEL = os.environ.get("UPG_AI_MODEL", "gpt-5-mini")
 try:
-    # Four decisions preserve an expert plan → build → diagnose → material
-    # repair workflow, without allowing a difficult PDF to make dozens of
-    # repeated API calls. Railway can explicitly tune this between 2 and 6.
-    MAX_AI_CALLS_PER_JOB = min(6, max(2, int(os.environ.get("UPG_MAX_AI_CALLS_PER_JOB", "4"))))
+    AI_MAX_OUTPUT_TOKENS = min(1_200, max(250, int(os.environ.get("UPG_AI_MAX_OUTPUT_TOKENS", "550"))))
 except ValueError:
-    MAX_AI_CALLS_PER_JOB = 4
+    AI_MAX_OUTPUT_TOKENS = 550
+try:
+    # One layout plan and, only if needed, one evidence-led repair diagnosis.
+    # Deterministic profiles/validation do not consume this allowance.
+    MAX_AI_CALLS_PER_JOB = min(3, max(1, int(os.environ.get("UPG_MAX_AI_CALLS_PER_JOB", "2"))))
+except ValueError:
+    MAX_AI_CALLS_PER_JOB = 2
 DIAGNOSTIC_RULE_LIBRARY = {
     "value_date": "Use Value Date as the output date when both posting and value dates exist.",
     "dual_date_running_balance": "For layouts with both posting and Value Date, begin records only at the posting-date column but export the Value Date and infer amounts from running-balance changes.",
@@ -355,6 +361,19 @@ Bank statement extraction policy:
 - On every failed candidate, act as an evidence-led expert: classify the root cause (geometry, headers, date order, continuation, furniture, balance direction, endpoints, totals, narration, count, or novel layout), choose a materially different safe addendum action, and remember only that non-sensitive investigation result. Never retry a deterministic strategy that already failed the same statement.
 - For long PDFs, create or repair a layout profile from a representative sample: first seven pages, seven pages centered around the middle, and last seven pages, plus adjacent boundary pages so transactions split across sampled-page edges remain visible. Apply the resulting candidate to the complete statement and validate the whole source before learning or export.
 """
+# The API receives this compact contract for planning/diagnosis.  The complete
+# policy above is enforced locally by deterministic extraction and validation;
+# repeating it in every model prompt wastes tokens without adding protection.
+AI_LAYOUT_CONTRACT = (
+    "You plan a bank-statement layout only. Output no transactions and never "
+    "weaken validation. Keep only date, source narration, withdrawal, deposit, "
+    "running balance, and optional instrument number. Ignore furniture such as "
+    "headers, totals, logos, addresses, notices, and page labels. If both dates "
+    "exist, use Value Date for output DD/MM/YYYY and posting date only for row "
+    "boundaries. Use original PDF geometry when supplied; return -1 for absent "
+    "columns. A candidate is saved only after local financial, source-coverage, "
+    "narration, transaction-count, and balance-chain gates pass."
+)
 # Historical lessons captured from previously resolved statement layouts.  This
 # is deliberately generic: it teaches recognition and safe handling, never
 # any customer's statement text, balances, account numbers, or transactions.
@@ -793,6 +812,30 @@ def ai_learning_packet(path: Path | None = None, headers: list[object] | None = 
         "certified_profile_lessons": certified_learning_context(),
     }
 
+def compact_ai_learning_packet(path: Path | None = None, headers: list[object] | None = None) -> dict[str, object]:
+    """Small, reusable AI context for a single constrained layout decision.
+
+    Full profile history is useful to deterministic matching, but repeatedly
+    sending it to a model is costly and does not improve a header-map decision.
+    This retains only the closest layouts and concise rule names.
+    """
+    closest = closest_certified_lessons(path, headers, limit=3)
+    return {
+        "output_contract": {
+            "required": list(MANDATORY_TRANSACTION_FIELDS),
+            "optional": list(OPTIONAL_TRANSACTION_FIELDS),
+            "value_date_priority": True,
+            "date_format": "DD/MM/YYYY",
+        },
+        "key_lessons": HISTORICAL_CHALLENGE_LESSONS[:8],
+        "closest_layouts": [{
+            "profile_id": item.get("profile_id"),
+            "strategy": item.get("strategy"),
+            "mapped_fields": item.get("mapped_fields", []),
+            "challenge_history": item.get("challenge_history", [])[:4],
+        } for item in closest],
+    }
+
 def find_related_profile(headers: list[object]) -> tuple[str | None, dict[str, int]]:
     """Find a near-match without changing the original validated profile."""
     if generated_canonical_headers(headers): return None, {}
@@ -1128,6 +1171,27 @@ def sampled_pdf_geometry_evidence(path: Path) -> list[dict]:
             evidence.append({"page": page_number + 1, "width": round(float(page.width), 1), "height": round(float(page.height), 1), "tables": page_tables, "borderless_coordinate_evidence": coordinate_fallback})
     return evidence
 
+def compact_geometry_for_ai(evidence: list[dict]) -> list[dict]:
+    """Keep representative geometry, not a costly page-by-page dump."""
+    if len(evidence) <= 5:
+        selected = evidence
+    else:
+        selected = [evidence[0], evidence[len(evidence) // 2], evidence[-1]]
+    return [{
+        "page": item.get("page"),
+        "width": item.get("width"),
+        "height": item.get("height"),
+        "tables": [{
+            "header": table.get("header", [])[:12],
+            "column_x_ranges": table.get("column_x_ranges", [])[:12],
+            "row_count": table.get("row_count"),
+        } for table in item.get("tables", [])[:2]],
+        "borderless_coordinate_evidence": {
+            "header_word_positions": item.get("borderless_coordinate_evidence", {}).get("header_word_positions", [])[:12],
+            "numeric_column_x_ranges": item.get("borderless_coordinate_evidence", {}).get("numeric_column_x_ranges", [])[:6],
+        },
+    } for item in selected]
+
 def sampled_page_indices(count: int) -> list[int]:
     """Seven-page regions plus boundary context for large PDF layout learning."""
     if count <= 21:
@@ -1155,10 +1219,10 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
             },
         }, "required": ["header_row", "columns"],
     }
-    geometry = sampled_pdf_geometry_evidence(source_path) if source_path and source_path.suffix.lower() == ".pdf" else []
-    evidence = {"rows": rows[:35], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context,
-                "upg_learning": ai_learning_packet(source_path, rows[0] if rows else None)}
-    instruction = (PARSER_GENERATOR_POLICY + "\nYou are a bank-statement parser generator and controlled self-healing planner. First discard PDF furniture and non-transaction visual/text objects. Identify one transaction-table header row and map "
+    geometry = compact_geometry_for_ai(sampled_pdf_geometry_evidence(source_path)) if source_path and source_path.suffix.lower() == ".pdf" else []
+    evidence = {"rows": rows[:18], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context[-1800:],
+                "upg_learning": compact_ai_learning_packet(source_path, rows[0] if rows else None)}
+    instruction = (AI_LAYOUT_CONTRACT + "\nIdentify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
         "and balance. These are the only allowed transaction outputs. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
     )
@@ -1166,6 +1230,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
         "model": AI_MODEL,
         "input": [{"role": "system", "content": [{"type": "input_text", "text": instruction}]},
                   {"role": "user", "content": [{"type": "input_text", "text": json.dumps(evidence)}]}],
+        "max_output_tokens": AI_MAX_OUTPUT_TOKENS,
         "text": {"format": {"type": "json_schema", "name": "bank_layout", "strict": True, "schema": schema}},
     }
     request = urllib.request.Request(
@@ -1197,9 +1262,10 @@ def ai_choose_text_strategy(raw: str, job_id: str | None = None) -> str | None:
     }
     payload = {
         "model": AI_MODEL,
-        "input": (PARSER_GENERATOR_POLICY + "\nClassify this bank statement layout. Choose running_balance_text when dated entries have Dr/Cr running balances. Choose unsigned_running_balance_text when dated entries have unsigned running balances whose changes can infer debit or credit; choose "
-            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported. Learn only from the supplied UPG learning packet; it provides reusable layout patterns and historical failure lessons, not proof that this statement has the same values.\nUPG learning: " + json.dumps(ai_learning_packet()) + "\n\n" + raw[:12000]
+        "input": (AI_LAYOUT_CONTRACT + "\nClassify this bank statement layout. Choose running_balance_text when dated entries have Dr/Cr running balances. Choose unsigned_running_balance_text when dated entries have unsigned running balances whose changes can infer debit or credit; choose "
+            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported.\nUPG learning: " + json.dumps(compact_ai_learning_packet()) + "\n\n" + raw[:3500]
         ),
+        "max_output_tokens": AI_MAX_OUTPUT_TOKENS,
         "text": {"format": {"type": "json_schema", "name": "extraction_strategy", "strict": True, "schema": schema}},
     }
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
@@ -1243,8 +1309,8 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
         "failure_type": {"type": "string", "enum": ["column_geometry", "header_mapping", "date_order", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "novel_layout"]},
         "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "ai_addendum", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
-    prompt = PARSER_GENERATOR_POLICY + "\nAct as a senior bank-statement parser investigator. Diagnose the root cause from the source sample and failed validation evidence, then select one safe parser-profile action and a priority order of already-supported candidate strategies. First compare this statement against the closest certified layouts in the UPG learning packet; identify what changed before proposing an addendum. Use the learning packet to recognize layouts and avoid known mistakes, but never copy values or accept a candidate without this statement passing all gates. A later generator will receive your diagnosis to create a materially different addendum. Do not write executable code, invent transactions, expose source data, replace source amounts, or weaken validation. If evidence is insufficient, choose novel_layout + ai_addendum; do not pretend a failed mapping is valid.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(ai_learning_packet(source_path)) + "\nFailure evidence: " + failure + "\nSource excerpt: " + raw[:8000]
-    payload = {"model": AI_MODEL, "input": prompt, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
+    prompt = AI_LAYOUT_CONTRACT + "\nDiagnose one failed parser candidate from the evidence. Select a materially different safe action and priority list of supported strategies. Do not write code or transactions. If evidence is insufficient, choose novel_layout + ai_addendum.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(compact_ai_learning_packet(source_path)) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
+    payload = {"model": AI_MODEL, "input": prompt, "max_output_tokens": AI_MAX_OUTPUT_TOKENS, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=90) as response: result = json.loads(response.read().decode())
