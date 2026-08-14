@@ -113,7 +113,10 @@ EXTRACTION_CACHE_LOCK = threading.Lock()
 PDF_TEXT_CACHE: dict[str, str] = {}
 PDF_SAMPLE_CACHE: dict[str, str] = {}
 PDF_GEOMETRY_PROFILE_CACHE: dict[str, tuple[list[object], list[tuple[float, float]]] | None] = {}
-OCR_WORD_PAGE_CACHE: dict[tuple[str, int], list[dict]] = {}
+# The same source page may be measured with a secondary Tesseract layout mode
+# when the normal table mode misses date anchors.  Include the mode in the
+# cache key so a recovery pass can never overwrite the primary geometry.
+OCR_WORD_PAGE_CACHE: dict[tuple[str, int, str], list[dict]] = {}
 # Passwords are request-scoped, held only in memory, and are never written to
 # profiles, learning, exports, logs, or webhook payloads.
 PDF_PASSWORD_CACHE: dict[str, str] = {}
@@ -1245,14 +1248,15 @@ def ocr_is_available() -> bool:
     return bool(fitz is not None and Image is not None and pytesseract is not None and shutil.which("tesseract"))
 
 
-def ocr_pdf_page_words(path: Path, page_number: int) -> list[dict]:
+def ocr_pdf_page_words(path: Path, page_number: int, config: str | None = None) -> list[dict]:
     """OCR one original PDF page and preserve its coordinates in PDF points.
 
     We deliberately do not flatten a scan into plain text and then guess its
     columns.  Tesseract's pixel boxes are scaled back to the source PDF page
     size, so the normal header/band parser can learn a reusable layout.
     """
-    key = (str(path.resolve()), page_number)
+    config = config or os.environ.get("UPG_TESSERACT_CONFIG", "--oem 1 --psm 6")
+    key = (str(path.resolve()), page_number, config)
     with EXTRACTION_CACHE_LOCK:
         cached = OCR_WORD_PAGE_CACHE.get(key)
     if cached is not None:
@@ -1277,7 +1281,7 @@ def ocr_pdf_page_words(path: Path, page_number: int) -> list[dict]:
         image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         data = pytesseract.image_to_data(
             image, output_type=TesseractOutput.DICT,
-            config=os.environ.get("UPG_TESSERACT_CONFIG", "--oem 1 --psm 6"),
+            config=config,
             lang=os.environ.get("UPG_OCR_LANGUAGE", "eng"),
         )
         words: list[dict] = []
@@ -1308,6 +1312,33 @@ def ocr_pdf_page_words(path: Path, page_number: int) -> list[dict]:
             OCR_WORD_PAGE_CACHE.pop(next(iter(OCR_WORD_PAGE_CACHE)))
         OCR_WORD_PAGE_CACHE[key] = words
     return words
+
+
+def _ocr_date_anchor_count(words: list[dict]) -> int:
+    """Count concrete date cells, not arbitrary numbers recognised by OCR."""
+    return sum(
+        1 for word in words
+        if float(word.get("x0", 0)) < 360
+        and re.fullmatch(r"\d{2}[-/]\d{2}[-/]\d{2,4}", str(word.get("text", "")).strip())
+    )
+
+
+def ocr_pdf_page_best_words(path: Path, page_number: int) -> list[dict]:
+    """Choose the stronger original-page OCR measurement for a scan.
+
+    Tesseract page-segmentation mode 6 is best for most statement tables. A
+    few scans have faint/ruled date columns, however, where sparse-text mode
+    11 finds substantially more *real date anchors*. We re-measure only those
+    weak pages and select the alternate result only when it proves better by
+    date evidence. This is deterministic OCR recovery, not AI guessing.
+    """
+    primary = ocr_pdf_page_words(path, page_number)
+    primary_dates = _ocr_date_anchor_count(primary)
+    if primary_dates >= 4:
+        return primary
+    alternate = ocr_pdf_page_words(path, page_number, "--oem 1 --psm 11")
+    alternate_dates = _ocr_date_anchor_count(alternate)
+    return alternate if alternate_dates >= max(3, primary_dates + 2) else primary
 
 
 def ocr_pdf_text(path: Path, page_indices: list[int] | None = None) -> str:
@@ -2072,7 +2103,11 @@ def ocr_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float, fl
     finally:
         document.close()
     for page_number in (list(range(page_count)) if page_count <= 60 else sampled_page_indices(page_count)):
-        words = ocr_pdf_page_words(path, page_number)
+        # The profile must be measured with the strongest recovered word
+        # geometry for this source page.  ``ocr_pdf_page_best_words`` keeps
+        # the normal table OCR unless sparse-text OCR finds materially more
+        # date anchors.
+        words = ocr_pdf_page_best_words(path, page_number)
         lines: dict[int, list[dict]] = {}
         for word in words:
             lines.setdefault(round(float(word["top"]) / 3), []).append(word)
@@ -2192,7 +2227,7 @@ def extract_ocr_geometry_rows(path: Path, page_numbers: set[int] | None = None) 
     finally:
         document.close()
     for page_number in sorted(selected):
-        words = ocr_pdf_page_words(path, page_number)
+        words = ocr_pdf_page_best_words(path, page_number)
         lines: dict[int, list[dict]] = {}
         for word in words:
             lines.setdefault(round(float(word["top"]) / 3), []).append(word)
