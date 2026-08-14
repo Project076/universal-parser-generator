@@ -386,6 +386,7 @@ Bank statement extraction policy:
 - A table extractor can truncate or misplace a date while still correctly reading the amount and running balance. For a date-like cell with a missing final year digit, consult the original source text for the immediately following digit and repair it only when that exact completion is present. Keep that transaction; do not discard it merely because the table cell is malformed. If its source Particulars is blank, export a blank Particulars field rather than inventing text.
 - Cut a transaction block before closing-balance labels, transaction totals, grand totals, available-balance labels, disclaimers, and other footer furniture. The printed closing balance is validation evidence, never a transaction amount.
 - Before generating a new parser, compare the layout with saved validated profiles. For a related layout, create an addendum that inherits the stable mapping and changes only the differing fields. Never overwrite or regress the older parser.
+- For an unfamiliar layout, compose only source-proven capabilities from multiple certified profiles before producing the first candidate. For example, take multi-line narration handling from one certified profile and page-furniture removal from another when this source independently exhibits both conditions. Treat each as a rule module, not as a parser copy: measure this statement's own columns and row boundaries, and never borrow another profile's coordinates, headers, executable code, account data, or transaction values.
 - For every upload, including a large PDF, run the exact existing validated parser/profile first. For a large PDF, combine that saved mapping with sampled original-PDF geometry. Create a new parser or addendum only after the existing parser has been fully extracted and has failed a release validation.
 - Keep trying safe candidate strategies - saved parser, related-profile addendum, an AI-generated source-layout profile, detected table layout, signed or unsigned text running-balance layout, and chronological/reverse-chronological order - until one passes every validation gate. Do not stop after the first failed candidate and never export a partial or unreconciled result.
 - A profile may be saved or Excel released only after every narration is traceable to the source and both the full financial reconciliation and each running-balance step pass. Printed debit/credit summary totals are an additional check when present, but a discrepancy is a warning rather than a release gate because some source statements print incorrect totals.
@@ -974,6 +975,17 @@ def certified_learning_context(limit: int = 8) -> list[dict[str, object]]:
             "mapped_fields": sorted(name for name in profile.get("columns", {}) if name in CANONICAL),
             "challenge_history": list(profile.get("challenge_history", summary.get("challenge_history", [])))[:8],
             "diagnostic_rules": list(profile.get("diagnostic_rules", summary.get("diagnostic_rules", [])))[:8],
+            # Capabilities are the independently reusable behaviours learned
+            # from this certified parser.  They are deliberately separate
+            # from its column coordinates and executable code: an unfamiliar
+            # bank may share its continuation/furniture behaviour but never
+            # its geometry.
+            "capability_tags": list(
+                profile.get("feature_vector", {}).get(
+                    "capabilities", summary.get("feature_vector", {}).get("capabilities", [])
+                )
+                if isinstance(profile.get("feature_vector", {}), dict) else []
+            )[:10],
             "balance_chain_exception": bool(validation.get("balance_chain_exception", False)),
             "self_healed_addendum": bool(profile.get("self_healed_addendum", False)),
         })
@@ -1048,31 +1060,57 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
         signals.append(("balance_delta", "Source exposes an unsigned running-balance column; infer direction only from balance movement.", "unsigned_running_balance_text"))
 
     certified = certified_learning_context(limit=64)
-    selected: list[dict[str, object]] = []
-    for capability, reason, strategy in signals:
-        providers: list[str] = []
+
+    def providers_for(capability: str) -> list[dict[str, object]]:
+        """Return compact certified rule modules for one source-proven need.
+
+        A provider is a lesson, not a parser import.  Keeping the actual rule
+        names with the provider lets the planner compose capabilities from
+        several different banks (for example continuation handling from one
+        and footer exclusion from another) without borrowing their offsets.
+        """
+        providers: list[dict[str, object]] = []
+        aliases = {
+            "value_date": ("value_date", "dual_date"),
+            "bf_preperiod_artifact": ("bf_", "opening", "preperiod"),
+            "footer_exclusion": ("footer", "summary", "terminal_row"),
+            "multi_page_continuation": ("continuation", "multi_page", "page_furniture"),
+            "signed_balance_text": ("signed_balance", "running_balance_text", "headerless"),
+            "balance_delta": ("balance_delta", "unsigned_running_balance", "value_date_unsigned"),
+        }.get(capability, (capability,))
         for lesson in certified:
             vocabulary = " ".join([
                 str(lesson.get("strategy", "")),
+                *[str(item) for item in lesson.get("capability_tags", [])],
                 *[str(item) for item in lesson.get("challenge_history", [])],
                 *[str(item) for item in lesson.get("diagnostic_rules", [])],
             ]).lower()
-            aliases = {
-                "value_date": ("value_date", "dual_date"),
-                "bf_preperiod_artifact": ("bf_", "opening", "preperiod"),
-                "footer_exclusion": ("footer", "summary", "terminal_row"),
-                "multi_page_continuation": ("continuation", "multi_page", "page_furniture"),
-                "signed_balance_text": ("signed_balance", "running_balance_text", "headerless"),
-                "balance_delta": ("balance_delta", "unsigned_running_balance", "value_date_unsigned"),
-            }.get(capability, (capability,))
-            if any(alias in vocabulary for alias in aliases):
-                providers.append(str(lesson.get("profile_id")))
+            if not any(alias in vocabulary for alias in aliases):
+                continue
+            reusable_rules = [str(rule) for rule in lesson.get("diagnostic_rules", [])
+                              if str(rule) in DIAGNOSTIC_RULE_LIBRARY]
+            providers.append({
+                "profile_id": str(lesson.get("profile_id")),
+                "strategy_family": str(lesson.get("strategy", "")),
+                "reusable_rules": reusable_rules[:4],
+                "challenges_solved": [str(item) for item in lesson.get("challenge_history", [])][:3],
+            })
+        return providers[:4]
+
+    selected: list[dict[str, object]] = []
+    for capability, reason, strategy in signals:
+        providers = providers_for(capability)
         selected.append({
             "capability": capability,
             "reason": reason,
             "preferred_strategy": strategy,
-            "certified_profile_ids": providers[:4],
+            "certified_profile_ids": [provider["profile_id"] for provider in providers],
+            "certified_rule_modules": providers,
             "instruction": DIAGNOSTIC_RULE_LIBRARY.get(capability, capability),
+            "composition_constraint": (
+                "Compose this behaviour with other source-proven modules only. "
+                "Do not copy a provider's coordinates, header indexes, parser code, or transaction data."
+            ),
         })
     return selected
 
