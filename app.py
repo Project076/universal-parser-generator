@@ -398,7 +398,9 @@ AI_LAYOUT_CONTRACT = (
     "headers, totals, logos, addresses, notices, and page labels. If both dates "
     "exist, use Value Date for output DD/MM/YYYY and posting date only for row "
     "boundaries. Use original PDF geometry when supplied; return -1 for absent "
-    "columns. A candidate is saved only after local financial, source-coverage, "
+    "columns. For an image-only PDF, use OCR word coordinates from the original "
+    "page; flattened OCR text is evidence only and must never define columns. "
+    "A candidate is saved only after local financial, source-coverage, "
     "narration, transaction-count, and balance-chain gates pass."
 )
 # Historical lessons captured from previously resolved statement layouts.  This
@@ -412,6 +414,7 @@ HISTORICAL_CHALLENGE_LESSONS = [
     "Page headers, addresses, branch/account blocks, logos, QR codes, legal notes, print stamps, and repeated titles are furniture even when they sit between two parts of a transaction.",
     "A transaction may continue over a page boundary. Remove intervening furniture, then merge only source-proven narration/amount/balance fragments into the same dated transaction.",
     "Use the original PDF geometry for layout decisions. For large PDFs, use first/middle/last samples with boundary pages to design the profile, then parse and validate all pages.",
+    "For an image-only PDF, use OCR word boxes measured against the original page. Rebuild column bands from those coordinates; never reuse flattened OCR text as if it preserved geometry. A multi-line header such as 'Cheque' over 'No/Reference' is one column label, not two transaction fields.",
     "A bank DOCX can contain an exact fixed-width statement text layer without Word tables, tabs, or coordinates. Preserve its paragraph order and leading spaces, parse it as fixed-width text, and merge its wrapped continuation lines. Do not treat it as PDF geometry or collapse its whitespace before measuring columns.",
     "Statements may run newest-to-oldest. Detect direction before calculating endpoints or balance chains; reverse the chain logic only when source balances prove it.",
     "With a single unsigned amount column, determine withdrawal/deposit from signed running-balance movement, not from references or arbitrary numeric text.",
@@ -2072,7 +2075,8 @@ def ocr_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float, fl
         lines: dict[int, list[dict]] = {}
         for word in words:
             lines.setdefault(round(float(word["top"]) / 3), []).append(word)
-        for line in lines.values():
+        ordered_lines = sorted(lines.values(), key=lambda line: min(float(word["top"]) for word in line))
+        for line in ordered_lines:
             ordered = sorted(line, key=lambda item: float(item["x0"]))
             labels = [str(word["text"]) for word in ordered]
             mapped = map_headers(labels)
@@ -2084,6 +2088,66 @@ def ocr_geometry_profile(path: Path) -> tuple[list[object], list[tuple[float, fl
                 (0.0 if index == 0 else starts[index] - 3.0,
                  (starts[index + 1] - 3.0) if index + 1 < len(starts) else width)
                 for index in range(len(starts))
+            ]
+
+        # Statement scans often place a heading on two visual lines, for
+        # example ``Cheque`` above ``No/Reference``.  A line-by-line OCR pass
+        # cannot see a complete header in that case even though the original
+        # page geometry is perfectly usable.  Build a conservative composite
+        # header from adjacent lines in the same horizontal band.  We use only
+        # recognised bank-column words and retain their original x positions;
+        # this is deliberately not a flattened-text fallback.
+        for index, first_line in enumerate(ordered_lines):
+            top = min(float(word["top"]) for word in first_line)
+            window = list(first_line)
+            for next_line in ordered_lines[index + 1:index + 3]:
+                next_top = min(float(word["top"]) for word in next_line)
+                if next_top - top > 34.0:
+                    break
+                window.extend(next_line)
+
+            header_words: list[tuple[float, str]] = []
+            seen: set[tuple[str, int]] = set()
+            for word in window:
+                label = norm(word["text"])
+                x = float(word["x0"])
+                canonical = None
+                if label in {"description", "narration", "particular", "particulars", "details", "remarks"}:
+                    canonical = "Description"
+                elif label.startswith("cheque") or label.startswith("check") or label.startswith("instrument") or label.startswith("reference"):
+                    canonical = "Cheque No/Reference"
+                elif label.startswith("debit") or label.startswith("withdraw"):
+                    canonical = "Debit"
+                elif label.startswith("credit") or label.startswith("deposit"):
+                    canonical = "Credit"
+                elif label.startswith("balance"):
+                    canonical = "Balance"
+                elif label == "date":
+                    # Prefer a neighbouring "Value" heading where both dates
+                    # appear; otherwise retain the ordinary Date column.
+                    peers = [candidate for candidate in window
+                             if abs(float(candidate["top"]) - float(word["top"])) < 12
+                             and abs(float(candidate["x0"]) - x) < 90]
+                    peer_labels = {norm(candidate["text"]) for candidate in peers}
+                    canonical = "Value Date" if "value" in peer_labels else "Post Date" if "post" in peer_labels else "Date"
+                if canonical is None:
+                    continue
+                key = (canonical, round(x))
+                if key not in seen:
+                    seen.add(key)
+                    header_words.append((x, canonical))
+
+            header_words.sort(key=lambda item: item[0])
+            labels = [label for _x, label in header_words]
+            mapped = map_headers(labels)
+            if not {"date", "narration", "withdrawal", "deposit", "balance"}.issubset(mapped):
+                continue
+            starts = [x for x, _label in header_words]
+            width = max(float(word["x1"]) for word in window) + 12.0
+            return labels, [
+                (0.0 if position == 0 else starts[position] - 3.0,
+                 (starts[position + 1] - 3.0) if position + 1 < len(starts) else width)
+                for position in range(len(starts))
             ]
     return None
 
