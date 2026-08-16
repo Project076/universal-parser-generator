@@ -3205,6 +3205,11 @@ def load_rows(path: Path, strategy_override: str | None = None, job_id: str | No
     elif ext == ".xlsx":
         book = openpyxl.load_workbook(path, data_only=True, read_only=True)
         sheet = book.active
+        # Some bank exports declare ``A1`` as their worksheet dimension even
+        # though their XML contains hundreds of populated rows.  In read-only
+        # mode openpyxl otherwise trusts that stale dimension and returns only
+        # one blank cell.  Reset it so iteration follows the real XML grid.
+        sheet.reset_dimensions()
         rows = [list(row) for row in sheet.iter_rows(values_only=True)]
         result = rows, "\n".join(" ".join(map(str, row)) for row in rows)
     elif ext == ".xls":
