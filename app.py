@@ -1917,8 +1917,13 @@ def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
         # the first transaction date (for example 01/04/2024).  It is not the
         # statement endpoint. Prefer a labelled monetary value (with decimals)
         # and, when a summary repeats it, take the final source occurrence.
+        # Banks also abbreviate the labels as ``Opening Bal:`` / ``Closing
+        # Bal:`` and often put the corresponding amount on the following
+        # line in the statement summary.  This is still a source-declared
+        # endpoint: do not infer it from a transaction row.
+        label = rf"{kind}\s*(?:balance|bal\.?)"
         monetary = re.findall(
-            rf"\b{kind}\s*balance\b[^\d\r\n]{{0,20}}(?:\r?\n\s*)?"
+            rf"\b{label}\b[^\d\r\n]{{0,20}}(?:\r?\n\s*)?"
             r"(-?[\d,]+\.\d{1,2}(?:\s*(?:CR|DR))?)",
             text,
             re.I,
@@ -1927,7 +1932,7 @@ def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
             return money(monetary[-1])
         # Retain support for sources that print whole-number balances, while
         # rejecting a date fragment immediately after a table heading.
-        match = re.search(rf"\b{kind}\s*balance\b\D{{0,20}}([\d,]+(?:\.\d{{1,2}})?(?:\s*(?:CR|DR))?)", text, re.I)
+        match = re.search(rf"\b{label}\b\D{{0,20}}([\d,]+(?:\.\d{{1,2}})?(?:\s*(?:CR|DR))?)", text, re.I)
         if not match:
             return None
         value = money(match.group(1))
@@ -2055,6 +2060,11 @@ def transaction_date_value(value: str) -> datetime | None:
     # `24-01 -2024`.  It is still one visual date cell, not a continuation
     # line.  Normalise whitespace around separators before validation.
     value = re.sub(r"\s*([/-])\s*", r"\1", str(value or "").strip())
+    # Original-PDF geometry may wrap the final two year digits inside the
+    # same Value Date cell (``02/Apr/20\n25``).  A date cell contains no
+    # narration, therefore removing its internal whitespace is safe and
+    # restores the source-printed date without inventing a value.
+    value = re.sub(r"\s+", "", value)
     for pattern in ("%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y", "%d-%b-%Y", "%d/%b/%Y", "%Y-%m-%d"):
         try: return datetime.strptime(value.strip(), pattern)
         except ValueError: continue
