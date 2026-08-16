@@ -3239,6 +3239,16 @@ def load_rows(path: Path, strategy_override: str | None = None, job_id: str | No
         raise ValueError("Legacy .doc requires conversion to DOCX or TXT before safe fixed-width extraction.")
     elif ext == ".pdf": result = extract_pdf_rows(path, strategy_override, job_id)
     else: raise ValueError("This file needs a document-text extraction profile before it can be parsed.")
+    # A workbook can be a valid OOXML file while containing no actual cell
+    # values (for example an exported blank sheet).  Do not send that empty
+    # grid to the AI: any proposed header would necessarily be outside the
+    # measured source and the result is neither useful nor safe.
+    if not result[0] or not any(
+        str(cell or "").strip()
+        for row in result[0]
+        for cell in row
+    ):
+        raise ValueError("The uploaded file contains no readable statement rows or headers. Export the statement again as a populated Excel/CSV/PDF file and retry.")
     with EXTRACTION_CACHE_LOCK:
         # Keep only recent upload evidence; validated learning remains separate
         # and contains no statement data.
