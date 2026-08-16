@@ -3920,8 +3920,19 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # second and final call until that proposed layout has actually failed,
         # then use it only for a targeted repair plan. Deterministic candidates
         # never spend API budget and may run before the first blueprint.
-        if "layout_blueprint" in ai_call_purposes(job_id):
+        ai_purposes = ai_call_purposes(job_id)
+        if "layout_blueprint" in ai_purposes and "targeted_repair_plan" not in ai_purposes:
             investigation = ai_diagnose_failure(diagnostic_evidence, repair_context, path, job_id)
+        elif "targeted_repair_plan" in ai_purposes:
+            # The two-call budget is intentionally exhausted: never make a
+            # third request merely to rediscover that fact. Persist the last
+            # targeted plan as the terminal investigation result instead.
+            investigation = {
+                "rules": [], "strategies": [],
+                "failure_type": prior_investigation.get("failure_type", "novel_layout"),
+                "profile_action": prior_investigation.get("profile_action", "reject_unsafe"),
+                "diagnostic_error": "",
+            }
         else:
             investigation = {
                 "rules": [], "strategies": [], "failure_type": "preflight",
