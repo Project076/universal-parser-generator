@@ -3057,12 +3057,25 @@ def extract_text_layout_rows(raw: str, unsigned_balance: bool = False, use_value
         date = re.match(rf"\s*({date_pattern})\s+", chunk)
         if not date: continue
         if re.search(r"\bB/F\b", chunk, re.I): continue
+        # SBI-style final summaries can start with the statement-period date
+        # after a separate ``Statement Summary:`` line.  The generic date
+        # splitter makes that date the start of a new chunk, so the preceding
+        # summary marker is no longer available to the footer split below.
+        # A period row with count/total headings is never a ledger entry.
+        if re.search(r"(?i)\b(?:dr\s*count|cr\s*count|total\s+debits?|total\s+credits?)\b", chunk[:900]):
+            continue
         # Repeated page headers contain the statement-period end date and
         # account-holder text, but are not transaction rows.
         if "PARTICULARS" in chunk[:800].upper(): continue
         # Only the portion before page/report totals belongs to the current
         # transaction. Footer balances are not closing transaction balances.
-        chunk = re.split(r"(?i)\b(?:page total|grand total|funds in clearing|total available amount|effective available amount|closing balance|unless the constituent)\b", chunk)[0]
+        # A final account-summary block can repeat the statement period dates
+        # (for example ``Summary: 01-04-2025 To 31-03-2026``).  It is source
+        # furniture, not a transaction.  If allowed through the date splitter
+        # it becomes a fabricated final row, reverses chronological ordering,
+        # and corrupts endpoint derivation.  Seal every real transaction at
+        # the start of summary/footer material before reading its balance.
+        chunk = re.split(r"(?i)\b(?:page total|grand total|statement\s+summary|summary\s*:|funds in clearing|total available amount|effective available amount|closing balance|unless the constituent)\b", chunk)[0]
         balance_matches = list(re.finditer(r"(-?[\d,]+(?:\.\d+)?)\s*(Dr|Cr)\b", chunk, re.I))
         numeric_matches = list(re.finditer(r"-?[\d,]+(?:\.\d+)?", chunk))
         forced_amount, value_date_match = None, None
