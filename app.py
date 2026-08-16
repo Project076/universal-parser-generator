@@ -3196,12 +3196,18 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         effective_strategy = "standard_column_geometry"
     header_at = next((i for i, row in enumerate(rows[:20]) if len(map_headers(row)) >= 3), None)
     ai_columns = None
-    if header_at is None or force_ai_profile:
+    # Deterministic candidates must be genuinely deterministic.  Previously a
+    # weak/no header silently invoked the AI here, consuming the blueprint
+    # (and sometimes the repair) before the explicit AI candidate could be
+    # tested and recorded.  AI is now called only by force_ai_profile.
+    if force_ai_profile:
         generated = ai_generated_profile(rows, raw, repair_context, path, job_id)
         if generated:
             header_at, ai_columns = generated
-        elif header_at is None:
-            raise ValueError("Could not identify transaction columns. The AI parser generator could not produce a safe layout profile.")
+        else:
+            raise ValueError("The AI parser generator could not produce a safe layout profile.")
+    elif header_at is None:
+        raise ValueError("Could not identify transaction columns from deterministic source evidence.")
     headers = rows[header_at]
     # A saved profile takes precedence, but automatically fill any missing
     # fields from the current statement header. This keeps early/incomplete
