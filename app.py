@@ -1708,7 +1708,13 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     """Ask the embedded parser-generator AI for a new table layout, not transactions."""
     key = os.environ.get("OPENAI_API_KEY")
     if not key: return None
-    if not reserve_ai_call(job_id, "layout_blueprint"):
+    # The first AI call creates an evidence-led layout blueprint.  Once that
+    # map has been tested and failed, the final call must create a *revised
+    # map* from the measured failure evidence--not merely diagnose it.
+    purpose = "targeted_repair_profile" if (
+        job_id and repair_context and "layout_blueprint" in ai_call_purposes(job_id)
+    ) else "layout_blueprint"
+    if not reserve_ai_call(job_id, purpose):
         return None
     schema = {
         "type": "object", "additionalProperties": False,
@@ -1726,7 +1732,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
                 "upg_learning": compact_ai_learning_packet(source_path, rows[0] if rows else None, raw)}
     instruction = (AI_LAYOUT_CONTRACT + "\nIdentify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
-        "and balance. These are the only allowed transaction outputs. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. The source_matched_certified_capabilities are reusable behaviours only: apply one only when the supplied source evidence proves it, and never copy another profile's coordinates, code, or field indexes. Use -1 when a field is absent. If failure evidence is supplied, propose only a safe addendum to the source layout mapping; do not extract transactions, invent values, or change validation rules."
+        "and balance. These are the only allowed transaction outputs. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. The source_matched_certified_capabilities are reusable behaviours only: apply one only when the supplied source evidence proves it, and never copy another profile's coordinates, code, or field indexes. Use -1 when a field is absent. If failure evidence is supplied, return a revised measured header/column mapping that directly repairs that failure. Do not extract transactions, invent values, or change validation rules."
     )
     payload = {
         "model": AI_MODEL,
@@ -3786,7 +3792,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             # guarantees that only materially new candidates are tested.
             candidates = evidence_first_candidates(
                 path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number,
-                include_ai_addendum=("layout_blueprint" not in ai_call_purposes(job_id) and ai_calls_remaining(job_id) > 0),
+                # A second AI call is deliberately a repaired layout map
+                # based on the first failed extraction.  It is not consumed
+                # by a separate diagnosis-only request.
+                include_ai_addendum=("targeted_repair_profile" not in ai_call_purposes(job_id) and ai_calls_remaining(job_id) > 0),
             )
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
@@ -3916,22 +3925,22 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             error_summary = " | ".join(errors[-4:])
             repair_context += " Candidate execution results: " + error_summary
             patch_job(job_id, last_candidate_errors=errors[-8:])
-        # The first AI call is the evidence-based layout blueprint. Reserve the
-        # second and final call until that proposed layout has actually failed,
-        # then use it only for a targeted repair plan. Deterministic candidates
-        # never spend API budget and may run before the first blueprint.
+        # The first AI call is the evidence-based layout blueprint.  The
+        # second is reserved for a revised geometry/column map from the exact
+        # failure evidence.  It must never be spent on a diagnosis which does
+        # not create a candidate to test.
         ai_purposes = ai_call_purposes(job_id)
-        if "layout_blueprint" in ai_purposes and "targeted_repair_plan" not in ai_purposes:
-            investigation = ai_diagnose_failure(diagnostic_evidence, repair_context, path, job_id)
-        elif "targeted_repair_plan" in ai_purposes:
-            # The two-call budget is intentionally exhausted: never make a
-            # third request merely to rediscover that fact. Persist the last
-            # targeted plan as the terminal investigation result instead.
+        if "targeted_repair_profile" in ai_purposes:
             investigation = {
                 "rules": [], "strategies": [],
                 "failure_type": prior_investigation.get("failure_type", "novel_layout"),
-                "profile_action": prior_investigation.get("profile_action", "reject_unsafe"),
+                "profile_action": "targeted_layout_repair_tested",
                 "diagnostic_error": "",
+            }
+        elif "layout_blueprint" in ai_purposes:
+            investigation = {
+                "rules": [], "strategies": [], "failure_type": "column_geometry",
+                "profile_action": "repair_header_map", "diagnostic_error": "",
             }
         else:
             investigation = {
