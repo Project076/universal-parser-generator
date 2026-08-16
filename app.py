@@ -3031,6 +3031,20 @@ def extract_text_layout_rows(raw: str, unsigned_balance: bool = False, use_value
     to assign withdrawal/deposit amounts without relying on fixed x positions.
     """
     raw = repair_detached_dated_continuations(raw)
+    # Learn the source's decimal width from many already-valid monetary tokens
+    # before attempting to repair any damaged one.  The text-layout extractor
+    # runs before a column map exists, so this is the equivalent of
+    # ``inferred_column_decimal_places`` for headerless PDF ledgers.  A
+    # malformed multi-dot amount is never allowed to teach the rule that
+    # repairs it.
+    trusted_decimal_widths: list[int] = []
+    for token in re.finditer(r"(?<![\d.])-?[\d,]+(?:\.(\d{1,2}))?\s*(?:dr|cr)?\b", raw, re.I):
+        if token.group(1) and money(token.group()) is not None:
+            trusted_decimal_widths.append(len(token.group(1)))
+    text_decimal_places = (
+        max(set(trusted_decimal_widths), key=lambda width: (trusted_decimal_widths.count(width), width))
+        if trusted_decimal_widths else None
+    )
     def text_money(value: object) -> Decimal | None:
         """Read a text-layer money token without accepting a truncated value.
 
@@ -3041,7 +3055,7 @@ def extract_text_layout_rows(raw: str, unsigned_balance: bool = False, use_value
         can never manufacture an opposite-side transaction.
         """
         parsed = money(value)
-        return parsed if parsed is not None else repair_indian_grouping_decimal(value, 2)
+        return parsed if parsed is not None else repair_indian_grouping_decimal(value, text_decimal_places)
     header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
     # Bound numeric dates so a long transaction/reference ID cannot be
     # mistaken for a partial date (for example, `...382/22-04...`).
