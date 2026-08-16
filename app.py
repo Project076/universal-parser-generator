@@ -370,6 +370,31 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "indian_money_punctuation": "Infer decimal precision only from normal monetary cells in the same source column. If a damaged token has multiple full stops, repair it only when its final fractional group has that credible precision and all earlier groups exactly form Indian comma grouping; never change digits, sign, direction, or column.",
     "unordered_balance_chain": "When a statement prints valid dated rows but their on-page order is not the running-balance order, reconstruct direction and order only from unique amount-and-balance links; reject ambiguity or any incomplete chain.",
 }
+# Reusable behaviours are classified independently from bank/layout profiles.
+# A new source can compose (for example) narration continuation from one
+# certified layout and footer removal from another, while its own geometry is
+# still measured from the submitted file.  This is an explainable retrieval
+# system--not a blind whole-parser copy or an untrained "deep learning" claim.
+RULE_GROUPS = {
+    "narration": {"continuation_merge", "multi_page_continuation"},
+    "furniture": {"footer_exclusion", "terminal_row_before_summary", "bf_preperiod_artifact", "headerless_layout"},
+    "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date"},
+    "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency"},
+    "endpoints_and_totals": {"summary_endpoints", "summary_total_warning"},
+    "validation": {"source_coverage"},
+}
+
+def rule_groups_for(rule_ids: object) -> list[str]:
+    """Return deterministic capability groups for stored/retrieved lessons."""
+    values = {str(item) for item in (rule_ids or [])}
+    return sorted(group for group, members in RULE_GROUPS.items() if values & members)
+
+def group_for_capability(capability: str) -> str:
+    return {
+        "value_date": "dates", "bf_preperiod_artifact": "furniture",
+        "footer_exclusion": "furniture", "multi_page_continuation": "narration",
+        "signed_balance_text": "money_and_balance", "balance_delta": "money_and_balance",
+    }.get(capability, "validation")
 PARSER_GENERATOR_POLICY = """
 Bank statement extraction policy:
 - Transaction output is a strict whitelist only: Date, Particulars/Narration, Withdrawal, Deposit, Running/Closing Balance, and optional Instrument/Cheque Number. Date, Particulars/Narration, Withdrawal, Deposit, and Balance are the five mandatory transaction fields. A parser profile may map only these fields; every other PDF object is non-transaction evidence unless it directly proves one of the permitted fields.
@@ -953,13 +978,15 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     detection_code, parser_code = certified_javascript_code(headers, strategy)
     challenges = sorted({str(item) for item in (challenge_history or []) if str(item) and str(item) != "none"})
     features = certified_feature_vector(headers, columns, strategy, diagnostic_rules, challenges, capability_tags)
-    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "feature_vector": features, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
+    learned_rule_ids = sorted({*(diagnostic_rules or []), *challenges, *(capability_tags or [])})
+    rule_groups = rule_groups_for(learned_rule_ids)
+    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
     try: ledger = json.loads(LEARNING_LEDGER.read_text(encoding="utf-8"))
     except (OSError, ValueError): ledger = {"validated_profiles": {}}
-    ledger.setdefault("validated_profiles", {})[ident] = {"observations": observations, "strategy": data["last_validated_strategy"], "self_healed_addendum": data["self_healed_addendum"], "diagnostic_rules": data["diagnostic_rules"], "challenge_history": challenges, "feature_vector": features, "parent_profile": parent_profile}
+    ledger.setdefault("validated_profiles", {})[ident] = {"observations": observations, "strategy": data["last_validated_strategy"], "self_healed_addendum": data["self_healed_addendum"], "diagnostic_rules": data["diagnostic_rules"], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "parent_profile": parent_profile}
     LEARNING_LEDGER.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     return ident
 
@@ -990,6 +1017,7 @@ def certified_learning_context(limit: int = 8) -> list[dict[str, object]]:
             "mapped_fields": sorted(name for name in profile.get("columns", {}) if name in CANONICAL),
             "challenge_history": list(profile.get("challenge_history", summary.get("challenge_history", [])))[:8],
             "diagnostic_rules": list(profile.get("diagnostic_rules", summary.get("diagnostic_rules", [])))[:8],
+            "rule_groups": list(profile.get("rule_groups", summary.get("rule_groups", [])))[:6],
             # Capabilities are the independently reusable behaviours learned
             # from this certified parser.  They are deliberately separate
             # from its column coordinates and executable code: an unfamiliar
@@ -1096,6 +1124,7 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
         for lesson in certified:
             vocabulary = " ".join([
                 str(lesson.get("strategy", "")),
+                *[str(item) for item in lesson.get("rule_groups", [])],
                 *[str(item) for item in lesson.get("capability_tags", [])],
                 *[str(item) for item in lesson.get("challenge_history", [])],
                 *[str(item) for item in lesson.get("diagnostic_rules", [])],
@@ -1108,6 +1137,7 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
                 "profile_id": str(lesson.get("profile_id")),
                 "strategy_family": str(lesson.get("strategy", "")),
                 "reusable_rules": reusable_rules[:4],
+                "rule_groups": list(lesson.get("rule_groups", []))[:4],
                 "challenges_solved": [str(item) for item in lesson.get("challenge_history", [])][:3],
             })
         return providers[:4]
@@ -1117,6 +1147,7 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
         providers = providers_for(capability)
         selected.append({
             "capability": capability,
+            "rule_group": group_for_capability(capability),
             "reason": reason,
             "preferred_strategy": strategy,
             "certified_profile_ids": [provider["profile_id"] for provider in providers],
@@ -1150,6 +1181,7 @@ def compact_ai_learning_packet(path: Path | None = None, headers: list[object] |
             "strategy": item.get("strategy"),
             "mapped_fields": item.get("mapped_fields", []),
             "challenge_history": item.get("challenge_history", [])[:4],
+            "rule_groups": item.get("rule_groups", [])[:4],
         } for item in closest],
         "source_matched_certified_capabilities": source_capability_plan(raw, headers),
     }
