@@ -1797,6 +1797,17 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
         if len(columns) < 3:
             record_failure("AI returned fewer than three usable source columns.")
             return None
+        # Retain the *measured plan*, never source text, so a later retry (and
+        # the final user-visible job status) can distinguish an API failure
+        # from an AI map that was successfully produced but failed validation.
+        # This is essential for evidence-led self healing: the second call
+        # must revise a known map, rather than be treated as an unexplained
+        # generic AI attempt.
+        if job_id:
+            with JOBS_LOCK:
+                maps = list(JOBS.get(job_id, {}).get("ai_layout_maps", []))[-4:]
+            maps.append({"purpose": purpose, "header_row": header_row, "columns": columns})
+            patch_job(job_id, ai_layout_maps=maps, ai_layout_error="")
         return header_row, columns
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError) as error:
         record_failure(safe_openai_error(error))
@@ -3953,6 +3964,13 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             except Exception as error:
                 safe_error = re.sub(r"\s+", " ", str(error)).strip()[:300]
                 errors.append(f"{candidate_name}: {safe_error}")
+                # `errors` is per retry round. Persist a bounded history so a
+                # later duplicate-only round cannot erase the actual failed
+                # AI-layout evidence from the final status.
+                with JOBS_LOCK:
+                    history = list(JOBS.get(job_id, {}).get("candidate_error_history", []))[-12:]
+                history.append(f"round {round_number}: {candidate_name}: {safe_error}")
+                patch_job(job_id, candidate_error_history=history)
                 if "OCR_REQUIRED:" in safe_error or "PASSWORD_REQUIRED:" in safe_error:
                     message = ("Not validated. This is an image-only PDF, so UPG has locked parser creation and Excel export until OCR is available. The statement was not treated as a one-row parser."
                         if "OCR_REQUIRED:" in str(error)
@@ -4019,7 +4037,17 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         else:
             empty_ai_diagnoses = 0
         if empty_ai_diagnoses >= 2:
-            reason = diagnosis_error or "The AI returned no new safe rule or supported strategy after all known candidates were exhausted."
+            with JOBS_LOCK:
+                job_snapshot = dict(JOBS.get(job_id, {}))
+            ai_layout_error = str(job_snapshot.get("ai_layout_error", "") or "")
+            ai_layout_maps = list(job_snapshot.get("ai_layout_maps", []))
+            candidate_history = list(job_snapshot.get("candidate_error_history", []))
+            reason = diagnosis_error or ai_layout_error
+            if not reason and ai_layout_maps:
+                reason = ("The AI produced measured layout maps, but neither map passed the source coverage, "
+                          "financial, narration, and balance checks. The recorded map evidence is retained for a targeted repair.")
+            if not reason:
+                reason = "The AI returned no new safe rule or supported strategy after all known candidates were exhausted."
             message = ("UPG stopped safely before certification: " + reason +
                        " No parser profile was saved and no Excel was released. "
                        "Upload another statement of this layout or add a new supported extraction capability before retrying.")
@@ -4031,7 +4059,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             "failed_strategy_keys": sorted(failed_strategy_keys),
                             "diagnostic_rules": sorted(diagnostic_rules), "planned_strategies": planned_strategies,
                             "empty_ai_diagnoses": empty_ai_diagnoses, "investigation": prior_investigation,
-                            "last_candidate_errors": errors[-8:]})
+                            "last_candidate_errors": (candidate_history + errors)[-8:]})
                 JOBS[job_id] = job
                 persist_job_locked(job_id)
             post_completion_webhook(job_id, "failed", error=message)
