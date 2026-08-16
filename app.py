@@ -1313,7 +1313,17 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         for capability in source_capability_plan(sample, headers):
             strategy = capability.get("preferred_strategy")
             if isinstance(strategy, str) and strategy:
-                add(strategy, False, 760)
+                # A capability is emitted only when the *uploaded source*
+                # proves its signal.  It is therefore stronger than a nearby
+                # certified profile that merely has similar headers.  In
+                # particular, a dated Dr/Cr running-balance ledger must test
+                # its balance-aware strategy before generic table parsing,
+                # otherwise endpoint labels may be absent and the correct
+                # final-row balance is never reached.
+                source_proven_score = 1_160 if strategy in {
+                    "running_balance_text", "unsigned_running_balance_text", "value_date_unsigned"
+                } else 1_020
+                add(strategy, False, source_proven_score)
     except (OSError, ValueError):
         pass
 
