@@ -2101,9 +2101,16 @@ def signed_balance_source_count(raw: str) -> int | None:
     pattern = re.compile(
         r"(?im)^\s*\d{2}-\d{2}-\d{4}\b"
         r"(?:(?!^\s*\d{2}-\d{2}-\d{4}\b)[\s\S])*?"
-        r"\d[\d,]*\.\d{2}\s*(?:dr|cr)\b"
+        r"\d[\d,.]*\.\d{2}\s*(?:dr|cr)\b"
     )
-    count = len(pattern.findall(raw or ""))
+    # A final Statement Summary can begin with the statement-period start date
+    # and end at a signed Closing Balance. It has the same broad text shape as
+    # a ledger row, but its count/total labels prove that it is furniture. Do
+    # not let that one summary control inflate the coverage denominator.
+    count = sum(
+        1 for match in pattern.finditer(raw or "")
+        if not re.search(r"(?i)\b(?:statement\s+summary|dr\s*count|cr\s*count|total\s+debits?|total\s+credits?)\b", match.group())
+    )
     return count if count >= 3 else None
 
 def display_date(value: object) -> str:
@@ -3024,6 +3031,17 @@ def extract_text_layout_rows(raw: str, unsigned_balance: bool = False, use_value
     to assign withdrawal/deposit amounts without relying on fixed x positions.
     """
     raw = repair_detached_dated_continuations(raw)
+    def text_money(value: object) -> Decimal | None:
+        """Read a text-layer money token without accepting a truncated value.
+
+        Browser and OCR PDF text layers can replace Indian grouping commas with
+        full stops (``3,015.17`` -> ``3.015.17``).  Accept that exact numeric
+        shape as a repair, but leave every other multi-dot token unusable.
+        This applies before record deltas are calculated, so a damaged balance
+        can never manufacture an opposite-side transaction.
+        """
+        parsed = money(value)
+        return parsed if parsed is not None else repair_indian_grouping_decimal(value, 2)
     header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
     # Bound numeric dates so a long transaction/reference ID cannot be
     # mistaken for a partial date (for example, `...382/22-04...`).
@@ -3076,8 +3094,8 @@ def extract_text_layout_rows(raw: str, unsigned_balance: bool = False, use_value
         # and corrupts endpoint derivation.  Seal every real transaction at
         # the start of summary/footer material before reading its balance.
         chunk = re.split(r"(?i)\b(?:page total|grand total|statement\s+summary|summary\s*:|funds in clearing|total available amount|effective available amount|closing balance|unless the constituent)\b", chunk)[0]
-        balance_matches = list(re.finditer(r"(-?[\d,]+(?:\.\d+)?)\s*(Dr|Cr)\b", chunk, re.I))
-        numeric_matches = list(re.finditer(r"-?[\d,]+(?:\.\d+)?", chunk))
+        balance_matches = list(re.finditer(r"(-?[\d,.]+)\s*(Dr|Cr)\b", chunk, re.I))
+        numeric_matches = list(re.finditer(r"-?[\d,.]+", chunk))
         forced_amount, value_date_match = None, None
         matching_secondary_date = False
         if use_value_date:
@@ -3092,25 +3110,25 @@ def extract_text_layout_rows(raw: str, unsigned_balance: bool = False, use_value
             # text below the row may contain long numeric reference fragments
             # and must not replace the balance.
                 value_tail = re.sub(r"\b\d{2}:\d{2}:\d{2}\b", "", chunk[value_date_match.end():])
-                value_numbers = list(re.finditer(r"-?[\d,]+(?:\.\d+)?", value_tail))
+                value_numbers = list(re.finditer(r"-?[\d,.]+", value_tail))
                 if len(value_numbers) < 2: continue
-                forced_amount = money(value_numbers[0].group())
+                forced_amount = text_money(value_numbers[0].group())
                 balance_match = value_numbers[1]
                 balance_start = value_date_match.end() + balance_match.start()
-                numeric_balance = money(balance_match.group())
+                numeric_balance = text_money(balance_match.group())
         if not matching_secondary_date:
             # Most signed layouts mark balance with Dr/Cr. A zero balance may
             # omit that suffix, however, and remains a valid dated row when it
             # has a preceding transaction amount.
             zero_balance_without_suffix = (
                 not balance_matches and len(numeric_matches) >= 2
-                and money(numeric_matches[-1].group()) == Decimal("0")
+                and text_money(numeric_matches[-1].group()) == Decimal("0")
             )
             if not balance_matches and not unsigned_balance and not zero_balance_without_suffix: continue
             if not balance_matches and len(numeric_matches) < 2: continue
             balance_match = balance_matches[-1] if balance_matches else numeric_matches[-1]
             balance_start = balance_match.start()
-            numeric_balance = money(balance_match.group(1) if balance_matches else balance_match.group())
+            numeric_balance = text_money(balance_match.group(1) if balance_matches else balance_match.group())
         if numeric_balance is None: continue
         if balance_matches and not matching_secondary_date:
             balance = -abs(numeric_balance) if balance_match.group(2).lower() == "dr" else abs(numeric_balance)
@@ -3118,8 +3136,8 @@ def extract_text_layout_rows(raw: str, unsigned_balance: bool = False, use_value
             # An unsigned layout can still print a literal negative balance.
             # Preserve that sign; it determines the debit/credit movement.
             balance = numeric_balance
-        numbers = list(re.finditer(r"-?[\d,]+(?:\.\d+)?", chunk[:balance_start]))
-        amount = forced_amount if forced_amount is not None else (money(numbers[-1].group()) if numbers else None)
+        numbers = list(re.finditer(r"-?[\d,.]+", chunk[:balance_start]))
+        amount = forced_amount if forced_amount is not None else (text_money(numbers[-1].group()) if numbers else None)
         if previous_balance is None:
             # First row: use its stated amount when available, otherwise keep
             # zero and derive the opening balance from its running balance.
