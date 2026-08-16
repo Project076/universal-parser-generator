@@ -4069,14 +4069,14 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             ai_layout_maps = list(job_snapshot.get("ai_layout_maps", []))
             candidate_history = list(job_snapshot.get("candidate_error_history", []))
             reason = diagnosis_error or ai_layout_error
-            if not reason and ai_layout_maps:
-                reason = ("The AI produced measured layout maps, but neither map passed the source coverage, "
-                          "financial, narration, and balance checks. The recorded map evidence is retained for a targeted repair.")
             if not reason and candidate_history:
                 # A candidate execution error is concrete evidence; never
                 # replace it with the misleading generic exhausted-candidates
                 # message.  It contains no statement text or secret.
                 reason = "The latest parser candidate could not run: " + str(candidate_history[-1]).split(": ", 2)[-1]
+            if not reason and ai_layout_maps:
+                reason = ("The AI produced measured layout maps, but neither map passed the source coverage, "
+                          "financial, narration, and balance checks. The recorded map evidence is retained for a targeted repair.")
             if not reason:
                 reason = "The AI returned no new safe rule or supported strategy after all known candidates were exhausted."
             message = ("UPG stopped safely before certification: " + reason +
