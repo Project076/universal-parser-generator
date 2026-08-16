@@ -1298,11 +1298,13 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         add(strategy, ai_addendum, 880 - index * 20)
 
     ordered = sorted(scores, key=lambda item: scores[item], reverse=True)
-    # Two strong evidence-led candidates normally suffice. A third is allowed
-    # only for an unfamiliar layout, where it is the controlled AI addendum.
+    # Two strong evidence-led candidates normally suffice. Keep the first AI
+    # blueprint as the third candidate whenever budget permits. A saved
+    # strategy is only a reusable hypothesis; if it is wrong for this variant,
+    # it must never suppress fresh measured-layout planning.
     selected = ordered[:2]
     ai_key = (None, True)
-    if include_ai_addendum and ai_key not in selected and ai_key in scores and not validated_strategy:
+    if include_ai_addendum and ai_key not in selected and ai_key in scores:
         selected.append(ai_key)
     return selected
 
