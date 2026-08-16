@@ -1294,7 +1294,12 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
             # direct original-source evidence, stronger than inferred column
             # geometry.  Start with it rather than spending retries proving
             # that a three-field table guess is unsuitable.
-            signed_score = 1_100 if signed_balance_rows >= 3 and len(header_fields) < 4 else 500
+            # Explicit Dr/Cr ledger balances are stronger source evidence than
+            # a generic header map even when the PDF happens to have a neat
+            # table.  The running-balance strategy establishes endpoints from
+            # real ledger rows; a table map alone may not find statement-level
+            # "Opening/Closing Balance" labels at all.
+            signed_score = 1_100 if signed_balance_rows >= 3 else 500
             add("running_balance_text", False, signed_score)
             if signed_balance_rows >= 3 and len(header_fields) < 4:
                 add("page_text_unsigned", False, 1_020)
@@ -3376,6 +3381,13 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
             opening = tx[0]["balance"] - tx[0]["deposit"] + tx[0]["withdrawal"]
         if source_closing is None and tx[-1]["balance"] is not None:
             closing = tx[-1]["balance"]
+    # The statement need not print a separate closing-balance label.  For a
+    # normal oldest-to-newest ledger, the final real transaction's running
+    # balance is the closing balance.  Previously this fallback existed only
+    # for reverse-ordered statements, causing a correctly mapped table to be
+    # rejected before financial validation even began.
+    if closing is None and tx and tx[-1]["balance"] is not None:
+        closing = tx[-1]["balance"]
     opening = opening if opening is not None else money(fallback_open)
     closing = closing if closing is not None else money(fallback_close)
     if opening is None or closing is None: raise ValueError("Opening and closing balances could not be found. Supply them only as a fallback after confirming them from the source statement.")
