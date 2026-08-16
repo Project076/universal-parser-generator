@@ -1776,7 +1776,11 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     payload = {
         "model": AI_MODEL,
         "input": [{"role": "system", "content": [{"type": "input_text", "text": instruction}]},
-                  {"role": "user", "content": [{"type": "input_text", "text": json.dumps(evidence)}]}],
+                  # Native spreadsheet/Word grids may contain Decimal values.
+                  # The AI only plans headers and column positions, so serialise
+                  # those losslessly as strings rather than crashing before the
+                  # API call (which previously consumed an AI budget slot).
+                  {"role": "user", "content": [{"type": "input_text", "text": json.dumps(evidence, default=str)}]}],
         "max_output_tokens": AI_MAX_OUTPUT_TOKENS,
         "text": {"format": {"type": "json_schema", "name": "bank_layout", "strict": True, "schema": schema}},
     }
@@ -4046,6 +4050,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             if not reason and ai_layout_maps:
                 reason = ("The AI produced measured layout maps, but neither map passed the source coverage, "
                           "financial, narration, and balance checks. The recorded map evidence is retained for a targeted repair.")
+            if not reason and candidate_history:
+                # A candidate execution error is concrete evidence; never
+                # replace it with the misleading generic exhausted-candidates
+                # message.  It contains no statement text or secret.
+                reason = "The latest parser candidate could not run: " + str(candidate_history[-1]).split(": ", 2)[-1]
             if not reason:
                 reason = "The AI returned no new safe rule or supported strategy after all known candidates were exhausted."
             message = ("UPG stopped safely before certification: " + reason +
