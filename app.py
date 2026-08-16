@@ -1738,8 +1738,14 @@ def sampled_page_indices(count: int) -> list[int]:
 
 def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str = "", source_path: Path | None = None, job_id: str | None = None) -> tuple[int, dict[str, int]] | None:
     """Ask the embedded parser-generator AI for a new table layout, not transactions."""
+    def record_failure(reason: str) -> None:
+        if job_id:
+            patch_job(job_id, ai_layout_error=reason[:300])
+
     key = os.environ.get("OPENAI_API_KEY")
-    if not key: return None
+    if not key:
+        record_failure("OPENAI_API_KEY is not configured.")
+        return None
     # The first AI call creates an evidence-led layout blueprint.  Once that
     # map has been tested and failed, the final call must create a *revised
     # map* from the measured failure evidence--not merely diagnose it.
@@ -1747,6 +1753,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
         job_id and repair_context and "layout_blueprint" in ai_call_purposes(job_id)
     ) else "layout_blueprint"
     if not reserve_ai_call(job_id, purpose):
+        record_failure("AI call budget is exhausted before a layout map could be generated.")
         return None
     schema = {
         "type": "object", "additionalProperties": False,
@@ -1784,9 +1791,15 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
         generated = json.loads(text)
         header_row = int(generated["header_row"])
         columns = {name: int(index) for name, index in generated["columns"].items() if int(index) >= 0}
-        if not (0 <= header_row < len(rows)) or len(columns) < 3: return None
+        if not (0 <= header_row < len(rows)):
+            record_failure("AI returned a header row outside the measured source grid.")
+            return None
+        if len(columns) < 3:
+            record_failure("AI returned fewer than three usable source columns.")
+            return None
         return header_row, columns
-    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError) as error:
+        record_failure(safe_openai_error(error))
         return None
 
 def ai_choose_text_strategy(raw: str, job_id: str | None = None) -> str | None:
