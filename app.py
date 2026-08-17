@@ -1786,7 +1786,12 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
         }, "required": ["header_row", "columns"],
     }
     geometry = compact_geometry_for_ai(sampled_pdf_geometry_evidence(source_path)) if source_path and source_path.suffix.lower() == ".pdf" else []
+    prior_maps: list[dict] = []
+    if job_id:
+        with JOBS_LOCK:
+            prior_maps = list(JOBS.get(job_id, {}).get("ai_layout_maps", []))[-2:]
     evidence = {"rows": rows[:18], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context[-1800:],
+                "previous_failed_layout_maps": prior_maps,
                 "upg_learning": compact_ai_learning_packet(source_path, rows[0] if rows else None, raw)}
     instruction = (AI_LAYOUT_CONTRACT + "\nIdentify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
@@ -1819,6 +1824,22 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
             return None
         if len(columns) < 3:
             record_failure("AI returned fewer than three usable source columns.")
+            return None
+        # A repair which repeats a failed map cannot improve the parser. PDF
+        # rows are already a measured canonical grid, so the generic 0..5 map
+        # merely repeats that grid; it does not adapt original PDF geometry.
+        map_key = {"header_row": header_row, "columns": columns}
+        previous_keys = [
+            {"header_row": int(item.get("header_row", -1)), "columns": dict(item.get("columns", {}))}
+            for item in prior_maps if isinstance(item, dict)
+        ]
+        canonical_identity = header_row == 0 and all(
+            columns.get(name) == index for index, name in enumerate(CANONICAL)
+        )
+        if map_key in previous_keys or (purpose == "targeted_repair_profile" and canonical_identity):
+            record_failure(
+                "AI repair repeated the failed canonical header map instead of proposing a materially new measured source layout."
+            )
             return None
         # Retain the *measured plan*, never source text, so a later retry (and
         # the final user-visible job status) can distinguish an API failure
