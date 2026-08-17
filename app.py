@@ -369,6 +369,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "source_amount_geometry": "When the running-balance chain is unreliable but separate Withdrawal and Deposit columns are measurable, use original-PDF column geometry for the printed movements; classify neither from balance deltas nor from narration.",
     "reference_date_boundary": "When full-year transaction dates are used, do not split a row at a short date embedded in narration or a reversal/reference number; retain the complete source row and its printed amount.",
     "date_column_boundary": "A date starts a transaction only when it is in the measured Date column at the row boundary. Any date-like text to the right, including narration/reference dates, remains Particulars text.",
+    "numeric_date_geometry": "For original-PDF geometry, recognize both DD-Mon-YYYY and DD-MM-YYYY or DD/MM/YYYY transaction dates, but only inside the measured Date-column x-band. Keep the source Withdrawal and Deposit x-bands authoritative and exclude trailing system-generated footer text from the final narration.",
     "corrupt_balance_text_layer": "For a PDF whose visible balance is correct but whose searchable text corrupts its punctuation, keep the measured debit/credit amount authoritative. Repair a blanked balance only if the preceding movement and the next measured balance, or the independently printed final totals, prove exactly one balance; never invent the opposite movement to force reconciliation.",
     "indian_money_punctuation": "Infer decimal precision only from normal monetary cells in the same source column. If a damaged token has multiple full stops, repair it only when its final fractional group has that credible precision and all earlier groups exactly form Indian comma grouping; never change digits, sign, direction, or column.",
     "unordered_balance_chain": "When a statement prints valid dated rows but their on-page order is not the running-balance order, reconstruct direction and order only from unique amount-and-balance links; reject ambiguity or any incomplete chain.",
@@ -381,7 +382,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
 RULE_GROUPS = {
     "narration": {"continuation_merge", "multi_page_continuation", "reference_date_boundary"},
     "furniture": {"footer_exclusion", "terminal_row_before_summary", "bf_preperiod_artifact", "headerless_layout"},
-    "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date", "date_column_boundary"},
+    "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date", "date_column_boundary", "numeric_date_geometry"},
     "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency", "source_amount_geometry"},
     "endpoints_and_totals": {"summary_endpoints", "summary_total_warning"},
     "validation": {"source_coverage"},
@@ -2863,7 +2864,11 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
     """
     header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
     rows: list[list[object]] = [header]
-    date_re = re.compile(r"^\d{2}-[A-Za-z]{3}-\d{4}$")
+    # Bank PDFs use both textual (18-Feb-2026) and numeric (18-02-2026,
+    # 18/02/2026) dates.  A date-looking token is only a row starter when it
+    # is physically in the measured Date column below, so accepting the
+    # numeric forms cannot turn a narration/reference date into a record.
+    date_re = re.compile(r"^\d{2}(?:-[A-Za-z]{3}-|[-/]\d{2}[-/])\d{4}$")
     with open_pdfplumber(path) as pdf:
         for page in pdf.pages:
             words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
@@ -2934,7 +2939,11 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                     continue
                 narration_words = [word for word in block if x_part - 20 <= float(word["x0"]) < x_wd - 20]
                 narration = clean_narration(" ".join(str(word["text"]) for word in sorted(narration_words, key=lambda item: (float(item["top"]), float(item["x0"])))) )
-                narration = re.split(r"(?i)\b(?:opening\s+balance|total|grand\s+total|this\s+is\s+an\s+auto)\b", narration)[0].strip()
+                narration = re.split(
+                    r"(?i)\b(?:opening\s+balance|total|grand\s+total|"
+                    r"this\s+is\s+an\s+auto|this\s+is\s+a\s+system\s+generated)\b",
+                    narration,
+                )[0].strip()
                 # A final narration word can visually overlap the debit x-band
                 # in borderless source PDFs.  A currency-shaped tail is not
                 # narration; it is the source movement already measured above.
