@@ -366,6 +366,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "multi_page_continuation": "Preserve a dated transaction whose narration or amount cells continue across a page boundary, excluding page headers and footers between its parts.",
     "summary_total_warning": "Keep inconsistent printed debit or credit totals as a warning when transaction count, balance chain, and endpoint reconciliation independently pass.",
     "amount_balance_consistency": "When a source row visibly prints its transaction amount, require that amount to agree with the running-balance movement; reject a layout that only reconciles after replacing source amounts.",
+    "reference_date_boundary": "When full-year transaction dates are used, do not split a row at a short date embedded in narration or a reversal/reference number; retain the complete source row and its printed amount.",
     "corrupt_balance_text_layer": "For a PDF whose visible balance is correct but whose searchable text corrupts its punctuation, keep the measured debit/credit amount authoritative. Repair a blanked balance only if the preceding movement and the next measured balance, or the independently printed final totals, prove exactly one balance; never invent the opposite movement to force reconciliation.",
     "indian_money_punctuation": "Infer decimal precision only from normal monetary cells in the same source column. If a damaged token has multiple full stops, repair it only when its final fractional group has that credible precision and all earlier groups exactly form Indian comma grouping; never change digits, sign, direction, or column.",
     "unordered_balance_chain": "When a statement prints valid dated rows but their on-page order is not the running-balance order, reconstruct direction and order only from unique amount-and-balance links; reject ambiguity or any incomplete chain.",
@@ -376,7 +377,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
 # still measured from the submitted file.  This is an explainable retrieval
 # system--not a blind whole-parser copy or an untrained "deep learning" claim.
 RULE_GROUPS = {
-    "narration": {"continuation_merge", "multi_page_continuation"},
+    "narration": {"continuation_merge", "multi_page_continuation", "reference_date_boundary"},
     "furniture": {"footer_exclusion", "terminal_row_before_summary", "bf_preperiod_artifact", "headerless_layout"},
     "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date"},
     "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency"},
@@ -3092,7 +3093,21 @@ def extract_text_layout_rows(raw: str, unsigned_balance: bool = False, use_value
     # beginning-of-line rule for dual-date layouts so Value Date is not turned
     # into a second transaction.
     primary_date = r"\d{2}-[A-Za-z]{3}-\d{4}" if dual_date_time else date_pattern
-    split_pattern = rf"(?m)(?=^\s*{primary_date}\s)" if dual_date_layout else rf"(?={date_pattern}\s)"
+    # Prefer a full four-digit year as the record boundary whenever the
+    # statement itself uses full-year dates. A reference/narration can carry
+    # a short embedded date, e.g. ``REV/.../24-04-25/...``. The old generic
+    # splitter treated that reference date as a new transaction, truncating
+    # the page-end reversal row before its amount and balance. This is a
+    # boundary repair only: it preserves the original source amount and never
+    # invents a movement to make a balance chain reconcile.
+    full_year_date = r"(?:\d{2}[-/]\d{2}[-/]\d{4}|\d{2}-[A-Za-z]{3}-\d{4})"
+    has_full_year_records = len(re.findall(full_year_date, transaction_text)) >= 3
+    boundary_date = full_year_date if has_full_year_records else primary_date
+    split_pattern = (
+        rf"(?m)(?=^\s*{primary_date}\s)"
+        if dual_date_layout
+        else rf"(?={boundary_date}\s)"
+    )
     chunks = re.split(split_pattern, transaction_text)
     rows, previous_balance = [header], statement_opening
     for chunk in chunks:
@@ -3424,6 +3439,16 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
             # Prefer the non-zero movement, as the opposite column normally
             # contains the literal source value ``0.0``.
             source_amount = withdrawal if withdrawal else deposit
+            # ``extract_text_layout_rows`` carries a seventh, private source
+            # amount cell.  Its public six columns are canonical, but its
+            # movement may have been classified from a running-balance delta.
+            # Preserve the visibly printed amount here so a broken balance
+            # chain cannot silently turn (for example) a printed 10.00 into
+            # a fictional 1,875.00 withdrawal and still pass certification.
+            if generated_canonical_headers(headers) and len(row) > len(CANONICAL):
+                printed_amount = money(row[len(CANONICAL)])
+                if printed_amount is not None:
+                    source_amount = printed_amount
             tx.append({"date": display_date(table_date), "narration": narration, "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": monetary_cell("balance"), "source_amount": source_amount})
     # Transaction extraction uses the furniture-cleaned text, but statement
     # endpoints must come from the original PDF text.  A repeated J&K Bank
