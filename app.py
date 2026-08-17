@@ -366,6 +366,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "multi_page_continuation": "Preserve a dated transaction whose narration or amount cells continue across a page boundary, excluding page headers and footers between its parts.",
     "summary_total_warning": "Keep inconsistent printed debit or credit totals as a warning when transaction count, balance chain, and endpoint reconciliation independently pass.",
     "amount_balance_consistency": "When a source row visibly prints its transaction amount, require that amount to agree with the running-balance movement; reject a layout that only reconciles after replacing source amounts.",
+    "source_amount_geometry": "When the running-balance chain is unreliable but separate Withdrawal and Deposit columns are measurable, use original-PDF column geometry for the printed movements; classify neither from balance deltas nor from narration.",
     "reference_date_boundary": "When full-year transaction dates are used, do not split a row at a short date embedded in narration or a reversal/reference number; retain the complete source row and its printed amount.",
     "date_column_boundary": "A date starts a transaction only when it is in the measured Date column at the row boundary. Any date-like text to the right, including narration/reference dates, remains Particulars text.",
     "corrupt_balance_text_layer": "For a PDF whose visible balance is correct but whose searchable text corrupts its punctuation, keep the measured debit/credit amount authoritative. Repair a blanked balance only if the preceding movement and the next measured balance, or the independently printed final totals, prove exactly one balance; never invent the opposite movement to force reconciliation.",
@@ -381,7 +382,7 @@ RULE_GROUPS = {
     "narration": {"continuation_merge", "multi_page_continuation", "reference_date_boundary"},
     "furniture": {"footer_exclusion", "terminal_row_before_summary", "bf_preperiod_artifact", "headerless_layout"},
     "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date", "date_column_boundary"},
-    "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency"},
+    "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency", "source_amount_geometry"},
     "endpoints_and_totals": {"summary_endpoints", "summary_total_warning"},
     "validation": {"source_coverage"},
 }
@@ -413,6 +414,7 @@ Bank statement extraction policy:
 - Normalize Cr balances as positive and Dr balances as negative. A signed increase is a deposit; a signed decrease is a withdrawal.
 - Monetary format rule for Withdrawal, Deposit, and Balance: a valid amount has zero or one decimal point only; all Indian thousands/lakh/crore grouping must use commas. Infer the column's decimal precision only from normal single-decimal source cells. A token with multiple points may be restored only when the final group has that proven precision and every earlier group exactly fits Indian grouping (for example `-5.00.177.00` -> `-5,00,177.00`). Never change digits, sign, debit/credit direction, or the source column; otherwise reject it as malformed evidence.
 - If a PDF's visual balance is correctly printed but its searchable text has malformed punctuation (for example `-5,00,177.00` becoming `-5.00.177.00`), reject that damaged token rather than truncating it. Preserve the measured source withdrawal/deposit. Restore the balance only when the previous source balance plus that measured movement and either the next measured balance or independently printed final totals prove one unique value; record this as a text-layer repair, never as an invented amount.
+- If the source running-balance chain is unreliable but its separate Withdrawal and Deposit columns are measurable, read each movement from the original PDF's physical x-band. Keep those printed movements authoritative; do not change them from balance deltas or narration. Certify this exception only with full transaction coverage, exact printed withdrawal/deposit totals, one available endpoint or a source-proven derived endpoint, and a visible running-balance warning.
 - Balance-chain validation is mandatory for every transaction with a running balance: previous balance = current balance + current withdrawal - current deposit. Equivalently, current balance = previous balance - withdrawal + deposit. Do not release a parser when any transaction balance is missing or breaks this chain.
 - Exception: if any transaction proves that the source running-balance chain is unreliable, do not use that column for a normal balance-chain pass or transaction classification. Certify only if parsed withdrawals and deposits exactly equal the printed statement totals, while narration coverage and transaction count pass. Form assumed endpoints from one available transaction balance and the verified totals, label them assumed, and require manual source review. If totals or independent evidence are inconsistent, withhold the parser.
 - Transaction-count validation is mandatory: independently count source records that have a transaction date plus amount/running-balance evidence, and require exactly that many parsed transactions. More or fewer parsed rows is a failure even if balances reconcile.
@@ -1887,7 +1889,7 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
         return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI diagnosis unavailable: OPENAI_API_KEY is not configured."}
     if not reserve_ai_call(job_id, "targeted_repair_plan"):
         return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI call budget reached for this job; no new evidence-led repair remains."}
-    safe_strategies = ["geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"]
+    safe_strategies = ["geometry_profile", "source_amount_geometry", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "rules": {"type": "array", "items": {"type": "string", "enum": list(DIAGNOSTIC_RULE_LIBRARY)}, "maxItems": 5},
         "strategies": {"type": "array", "items": {"type": "string", "enum": safe_strategies}, "maxItems": 4},
@@ -2729,8 +2731,8 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
     count = len(open_pdf_reader(path).pages)
     samples = set(sampled_page_indices(count))
     try:
-        if strategy == "geometry_profile":
-            rows = extract_geometry_profile_rows(path, samples)
+        if strategy in {"geometry_profile", "source_amount_geometry"}:
+            rows = (extract_standard_column_geometry_rows(path) if strategy == "source_amount_geometry" else extract_geometry_profile_rows(path, samples))
         else:
             raw = sampled_pdf_text(path)
             if strategy == "value_date_unsigned":
@@ -2944,6 +2946,12 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
     known_header: list[object] | None = None
     if strategy_override == "geometry_profile":
         return extract_geometry_profile_rows(path), raw
+    if strategy_override == "source_amount_geometry":
+        # The engine selected this only after evidence of an unreliable balance
+        # chain.  Preserve the separately printed debit/credit movements from
+        # original-page x-bands; never reconstruct them from that bad chain.
+        measured_rows = extract_standard_column_geometry_rows(path)
+        return (measured_rows, raw) if measured_rows else (extract_geometry_profile_rows(path), raw)
     standard_geometry_header = bool(re.search(
         r"(?is)\bdate\b[\s\S]{0,150}\bparticulars?\b[\s\S]{0,150}\bwithdrawals?\b[\s\S]{0,150}\bdeposits?\b[\s\S]{0,150}\bbalance\b",
         raw,
@@ -3500,7 +3508,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # Certain bank exports visually group same-date rows rather than preserving
     # ledger order. Try a source-amount-preserving reconstruction before any
     # balance-delta fallback; it succeeds only for one complete, unique chain.
-    if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry"):
+    if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
         reconstructed = reconstruct_unordered_balance_chain(tx, opening, closing)
         # In an unordered statement, the first displayed row is not reliable
         # opening evidence. A printed Grand Total can instead derive opening,
@@ -3656,7 +3664,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # generic table discoverer here re-scans all 1,176 pages with pdfplumber,
     # even though this J&K layout has no table borders or reusable headers.
     # Reserve that expensive structural check for a geometry/table candidate.
-    if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry"):
+    if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
         table_count = structured_source_count(path)
         if table_count is not None:
             expected_source_count = table_count
@@ -3780,7 +3788,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # It remains gated by complete records, source amounts and the measured
     # narration column; it never applies to generic text-layout parsing.
     coordinate_trace_valid = (
-        effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry")
+        effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry")
         and path.suffix.lower() == ".pdf"
         and coverage_valid
         and source_amount_valid
