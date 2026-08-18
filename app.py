@@ -372,7 +372,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "numeric_date_geometry": "For original-PDF geometry, recognize both DD-Mon-YYYY and DD-MM-YYYY or DD/MM/YYYY transaction dates, but only inside the measured Date-column x-band. Keep the source Withdrawal and Deposit x-bands authoritative and exclude trailing system-generated footer text from the final narration.",
     "corrupt_balance_text_layer": "For a PDF whose visible balance is correct but whose searchable text corrupts its punctuation, keep the measured debit/credit amount authoritative. Repair a blanked balance only if the preceding movement and the next measured balance, or the independently printed final totals, prove exactly one balance; never invent the opposite movement to force reconciliation.",
     "indian_money_punctuation": "Infer decimal precision only from normal monetary cells in the same source column. If a damaged token has multiple full stops, repair it only when its final fractional group has that credible precision and all earlier groups exactly form Indian comma grouping; never change digits, sign, direction, or column.",
-    "unordered_balance_chain": "When a statement prints valid dated rows but their on-page order is not the running-balance order, reconstruct direction and order only from unique amount-and-balance links; reject ambiguity or any incomplete chain.",
+    "unordered_balance_chain": "Preserve original PDF page and visual row order in the exported transactions. Only when searchable-text serialisation demonstrably differs from that measured order may a unique amount-and-balance chain be built internally for validation; never reorder, delete, or alter source rows. Reject ambiguity or an incomplete chain.",
 }
 # Reusable behaviours are classified independently from bank/layout profiles.
 # A new source can compose (for example) narration continuation from one
@@ -3535,9 +3535,11 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     opening = opening if opening is not None else money(fallback_open)
     closing = closing if closing is not None else money(fallback_close)
     if opening is None or closing is None: raise ValueError("Opening and closing balances could not be found. Supply them only as a fallback after confirming them from the source statement.")
-    # Certain bank exports visually group same-date rows rather than preserving
-    # ledger order. Try a source-amount-preserving reconstruction before any
-    # balance-delta fallback; it succeeds only for one complete, unique chain.
+    # Preserve the source's measured page/row order for export.  Some PDF text
+    # layers serialise same-date rows out of their visual order, so a uniquely
+    # provable chain may be used *only* as an internal validation sequence. It
+    # must never reorder, delete, or alter the source transaction rows.
+    validation_chain = tx
     if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
         reconstructed = reconstruct_unordered_balance_chain(tx, opening, closing)
         # In an unordered statement, the first displayed row is not reliable
@@ -3554,7 +3556,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
                 if reconstructed is not None:
                     opening = total_derived_opening
         if reconstructed is not None:
-            tx = reconstructed
+            validation_chain = reconstructed
     if effective_strategy in ("running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "page_text_unsigned"):
         # A page-level extraction may start a new page without the preceding
         # running balance. Recompute debit/credit from the joined balances so
@@ -3654,7 +3656,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     running_balance_valid = bool(tx)
     chain_checked = 0
     chain_breaks = 0
-    for transaction in tx:
+    for transaction in validation_chain:
         balance = transaction["balance"]
         if balance is None:
             running_balance_valid = False
