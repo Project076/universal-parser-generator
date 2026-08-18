@@ -17,9 +17,11 @@ Then open `http://localhost:8080` in a browser.
 When `OPENAI_API_KEY` is configured, UPG uses the frontier parser-planning
 model only for unfamiliar layouts. It first reuses a certified profile or
 deterministic PDF geometry where possible; those paths make no AI request.
-For a new layout, one job is capped at four evidence-led AI decisions by
-default (classify, build, diagnose, and one material repair). Set
-`UPG_MAX_AI_CALLS_PER_JOB` between `2` and `6` only when an operator needs a
+For a new layout, one job uses at most two evidence-led AI decisions by
+default: one measured layout blueprint and, only after a concrete failed
+candidate, one targeted repaired layout map. Deterministic source evidence,
+certified capabilities, and validation do not consume this allowance. Set
+`UPG_MAX_AI_CALLS_PER_JOB` between `1` and `3` only when an operator needs a
 different limit. Validation is never relaxed by this limit.
 
 ## Validation

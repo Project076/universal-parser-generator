@@ -1937,6 +1937,79 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
         # loop distinguish an AI/API failure from a genuine but empty plan.
         return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI diagnosis unavailable: " + safe_openai_error(error)}
 
+def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str, object]:
+    """Turn a failed candidate into one bounded, module-specific next plan.
+
+    This intentionally makes no API call. The second expert-AI call is reserved
+    for a revised measured layout map; this function keeps that repair focused
+    on the failed module rather than retrying a vague "novel layout".
+    """
+    evidence = " ".join(str(item) for item in errors[-6:]).lower()
+    if candidate is not None:
+        try:
+            columns = candidate[10] or {}
+            if columns.get("_source_totals_conflict"):
+                evidence += " source totals conflict"
+            if columns.get("_source_balance_unreliable"):
+                evidence += " source balance unreliable"
+        except (IndexError, TypeError):
+            pass
+    rules: list[str] = []
+    strategies: list[str] = []
+    failure_type, profile_action = "column_geometry", "repair_header_map"
+
+    def add_rule(name: str) -> None:
+        if name in DIAGNOSTIC_RULE_LIBRARY and name not in rules:
+            rules.append(name)
+
+    def add_strategy(name: str) -> None:
+        if name not in strategies:
+            strategies.append(name)
+
+    # When all three release gates fail together, the source map itself is
+    # unproven. Do not pretend that narration or endpoints alone are the
+    # cause; leave the final AI call to produce a genuinely new measured map.
+    if all(marker in evidence for marker in ("financial=fail", "narration=fail", "source_coverage=fail")):
+        return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "profile_action": profile_action, "diagnostic_error": ""}
+
+    # A source-total/amount defect is more specific than a downstream
+    # financial/narration failure. Choose one dominant repair family per
+    # round—combining every library rule would recreate the broad retry that
+    # this planner is intended to remove.
+    if any(token in evidence for token in ("decimal", "punctuation", "multiple points", "source totals conflict")):
+        failure_type = "source_totals"
+        for name in ("indian_money_punctuation", "amount_balance_consistency", "source_amount_geometry"):
+            add_rule(name)
+        add_strategy("source_amount_geometry")
+        add_strategy("geometry_profile")
+    elif any(token in evidence for token in ("narration", "particular", "continuation", "furniture", "footer")):
+        failure_type, profile_action = "continuation", "repair_continuations"
+        for name in ("continuation_merge", "multi_page_continuation", "footer_exclusion", "terminal_row_before_summary"):
+            add_rule(name)
+        add_strategy("geometry_profile")
+    elif any(token in evidence for token in ("date", "value date", "out-of-fy", "out of fy", "reverse order")):
+        failure_type, profile_action = "date_order", "repair_date_order"
+        for name in ("date_column_boundary", "value_date", "reference_date_boundary"):
+            add_rule(name)
+        add_strategy("value_date_unsigned")
+        add_strategy("geometry_profile")
+    elif any(token in evidence for token in ("coverage", "transaction count", "source records")):
+        failure_type = "transaction_count"
+        for name in ("source_coverage", "bf_preperiod_artifact"):
+            add_rule(name)
+        add_strategy("geometry_profile")
+    elif any(token in evidence for token in ("opening", "closing", "endpoint", "balance", "financial", "source balance unreliable")):
+        failure_type = "unreliable_balance" if "unreliable" in evidence else "balance_direction"
+        profile_action = "repair_balance_direction"
+        for name in ("summary_endpoints", "balance_delta", "signed_balance_text", "corrupt_balance_text_layer"):
+            add_rule(name)
+        add_strategy("running_balance_text")
+        add_strategy("unsigned_running_balance_text")
+
+    return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+            "profile_action": profile_action, "diagnostic_error": ""}
+
 def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
     def find(kind):
         # A column heading such as "Closing Balance*" is commonly followed by
@@ -3945,7 +4018,25 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     preflight = saved_state.get("preflight_blueprint") if isinstance(saved_state.get("preflight_blueprint"), dict) else None
     if not preflight:
         preflight = build_preflight_blueprint(path, large_pdf, validated_strategy, planned_strategies)
-        patch_job(job_id, preflight_blueprint=preflight,
+        # Preserve compact, non-sensitive evidence metadata across fair worker
+        # handoffs. Candidate retries continue to reuse the in-memory source
+        # and geometry caches rather than re-reading the uploaded statement.
+        source_stat = path.stat()
+        evidence_index = {
+            "source_type": path.suffix.lower().lstrip("."),
+            "source_size_bytes": source_stat.st_size,
+            "source_mtime_ns": source_stat.st_mtime_ns,
+            "large_source": large_pdf,
+            "measured_from": preflight.get("measured_from"),
+            "header_fields": preflight.get("header_fields", []),
+            "candidate_plan": preflight.get("candidate_plan", []),
+            "closest_profile_ids": preflight.get("closest_profile_ids", []),
+            "capabilities": [
+                item.get("capability") for item in preflight.get("source_matched_capabilities", [])
+                if isinstance(item, dict) and item.get("capability")
+            ],
+        }
+        patch_job(job_id, preflight_blueprint=preflight, evidence_index=evidence_index,
                   message="UPG completed its preflight audit: measured source layout, compared certified profiles, and planned parser candidates before extraction.")
     rounds_this_lease = 0
     while True:
@@ -3973,6 +4064,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             persist_job_locked(job_id)
         latest = None
         errors = []
+        failure_evidence: list[str] = []
         repair_context = (
             f"UPG self-healing round {round_number}. No validated parser candidate has been found yet. "
             f"Prior expert diagnosis: {prior_investigation.get('failure_type', 'none')}; "
@@ -4115,6 +4207,12 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                 failed_candidates.add(signature)
                 if not force_ai_profile:
                     failed_strategy_keys.add(strategy_key)
+                failure_evidence.append(
+                    f"validation failure: financial={'pass' if candidate[6] else 'fail'}; "
+                    f"narration={'pass' if candidate[7] else 'fail'}; "
+                    f"source_coverage={'pass' if candidate[12] else 'fail'}; "
+                    f"transactions={len(candidate[0])}; source_records={candidate[13]}"
+                )
                 totals_evidence = ("CONFLICT: Grand Total and summed Page Totals agree with each other but differ from parsed amounts; "
                     "inspect duplicate rows, cross-page continuations, footer/header furniture, and amount-column mapping."
                     if candidate[10].get("_source_totals_conflict") else "no independently confirmed printed-total conflict")
@@ -4156,34 +4254,22 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             error_summary = " | ".join(errors[-4:])
             repair_context += " Candidate execution results: " + error_summary
             patch_job(job_id, last_candidate_errors=errors[-8:])
-        # The first AI call is the evidence-based layout blueprint.  The
-        # second is reserved for a revised geometry/column map from the exact
-        # failure evidence.  It must never be spent on a diagnosis which does
-        # not create a candidate to test.
+        # The first AI call is the evidence-based layout blueprint. The second
+        # is reserved for a revised geometry/column map. A deterministic
+        # evidence plan tells it which module actually failed, without
+        # spending a third API call on a diagnosis-only response.
         ai_purposes = ai_call_purposes(job_id)
+        investigation = evidence_repair_plan(errors + failure_evidence, latest)
         if "targeted_repair_profile" in ai_purposes:
-            investigation = {
-                "rules": [], "strategies": [],
-                "failure_type": prior_investigation.get("failure_type", "novel_layout"),
-                "profile_action": "targeted_layout_repair_tested",
-                "diagnostic_error": "",
-            }
-        elif "layout_blueprint" in ai_purposes:
-            investigation = {
-                "rules": [], "strategies": [], "failure_type": "column_geometry",
-                "profile_action": "repair_header_map", "diagnostic_error": "",
-            }
-        else:
-            investigation = {
-                "rules": [], "strategies": [], "failure_type": "preflight",
-                "profile_action": "reuse_geometry", "diagnostic_error": "",
-            }
+            investigation["profile_action"] = "targeted_layout_repair_tested"
         proposed_rules = {str(rule) for rule in investigation["rules"]}
         proposed_strategies = [str(strategy) for strategy in investigation["strategies"]]
         materially_new_rules = proposed_rules - diagnostic_rules
         materially_new_strategies = [strategy for strategy in proposed_strategies if strategy not in planned_strategies]
         diagnostic_rules.update(proposed_rules)
-        planned_strategies = proposed_strategies
+        # Keep the complete plan history. Replacing it could reintroduce an
+        # earlier failed path after a later evidence-led repair.
+        planned_strategies.extend(materially_new_strategies)
         diagnosis_error = str(investigation.get("diagnostic_error", "") or "")
         prior_investigation = {
             "failure_type": investigation.get("failure_type", "novel_layout"),
