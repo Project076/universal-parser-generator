@@ -374,6 +374,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "date_column_boundary": "A date starts a transaction only when it is in the measured Date column at the row boundary. Any date-like text to the right, including narration/reference dates, remains Particulars text.",
     "date_source_cell": "Each exported date must be the date from that row's measured Date or Value Date cell. A source-proven repair of a truncated year is allowed; a date-like narration, reference, balance, or adjacent-row value is never a transaction date.",
     "distinct_source_columns": "Each canonical transaction role must come from its own measured source column. Date, Particulars, Withdrawal, Deposit and Balance may never share a source index. The only supported alternative is one Amount column plus a separate Dr/Cr Type column; never reuse Balance, Narration or a movement column to fill another role.",
+    "header_role_alignment": "When a native or measured source header explicitly identifies a role (for example Withdrawal Amount, Deposit Amount, Transaction Remarks, Value Date or Running Balance), that role must use that exact measured source column. A saved profile or AI addendum may fill only unlabelled roles; it may not move an explicit header to a different column.",
     "numeric_date_geometry": "For original-PDF geometry, recognize both DD-Mon-YYYY and DD-MM-YYYY or DD/MM/YYYY transaction dates, but only inside the measured Date-column x-band. Keep the source Withdrawal and Deposit x-bands authoritative and exclude trailing system-generated footer text from the final narration.",
     "corrupt_balance_text_layer": "For a PDF whose visible balance is correct but whose searchable text corrupts its punctuation, keep the measured debit/credit amount authoritative. Repair a blanked balance only if the preceding movement and the next measured balance, or the independently printed final totals, prove exactly one balance; never invent the opposite movement to force reconciliation.",
     "indian_money_punctuation": "Infer decimal precision only from normal monetary cells in the same source column. If a damaged token has multiple full stops, repair it only when its final fractional group has that credible precision and all earlier groups exactly form Indian comma grouping; never change digits, sign, direction, or column.",
@@ -390,7 +391,7 @@ RULE_GROUPS = {
     "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date", "date_column_boundary", "numeric_date_geometry", "date_source_cell"},
     "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency", "source_amount_geometry", "balance_source_cell"},
     "endpoints_and_totals": {"summary_endpoints", "summary_total_warning"},
-    "validation": {"source_coverage", "narration_source_cell", "balance_source_cell", "date_source_cell", "distinct_source_columns"},
+    "validation": {"source_coverage", "narration_source_cell", "balance_source_cell", "date_source_cell", "distinct_source_columns", "header_role_alignment"},
 }
 # Earlier certified profiles predate the structured rule-library fields.  They
 # are still useful evidence, but an empty historic `diagnostic_rules` list
@@ -972,6 +973,11 @@ def source_columns_are_distinct(columns: dict[str, int]) -> bool:
             continue
         indices.append(value)
     return len(indices) == len(set(indices))
+
+def explicit_header_roles_aligned(headers: list[object], columns: dict[str, int]) -> bool:
+    """Ensure profiles/addenda cannot contradict clear source header labels."""
+    explicit = map_headers(headers)
+    return all(columns.get(role) == index for role, index in explicit.items())
 
 def text_layout_fingerprint(raw: str) -> str:
     """Privacy-safe structural signature for text-only statement layouts."""
@@ -4167,10 +4173,16 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     source_columns = map_headers(headers)
     inherited_missing = {key: value for key, value in inherited_columns.items() if key not in source_columns}
     exact_missing = {key: value for key, value in (exact_profile or {}).items() if key not in source_columns}
+    # A related/exact profile and an AI addendum can contribute only fields
+    # absent from the current source header.  The final source_columns merge
+    # deliberately wins in *both* paths: a labelled `Deposit Amount` on this
+    # statement is stronger evidence than a prior bank's offset or an AI
+    # proposal.  This prevents a non-colliding but shifted map from passing
+    # Step 12's distinct-column gate.
     if force_ai_profile:
-        columns = {**source_columns, **inherited_missing, **exact_missing, **(ai_columns or {})}
+        columns = {**inherited_missing, **exact_missing, **(ai_columns or {}), **source_columns}
     else:
-        columns = {**source_columns, **inherited_missing, **(ai_columns or {}), **exact_missing}
+        columns = {**inherited_missing, **(ai_columns or {}), **exact_missing, **source_columns}
     decimal_places = inferred_column_decimal_places(rows, header_at, columns)
     punctuation_repairs = 0
 
@@ -4550,9 +4562,10 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # contract check is independent of monetary validation and applies to every
     # strategy, including a saved profile and an AI-generated addendum.
     source_columns_distinct = source_columns_are_distinct(columns)
+    source_headers_aligned = explicit_header_roles_aligned(headers, columns)
     source_balance_cells_valid = balance_source_cells_traceable(tx)
     source_date_cells_valid = date_source_cells_traceable(tx)
-    canonical_contract_valid = bool(tx) and source_columns_distinct and source_date_cells_valid and source_balance_cells_valid and all(canonical_transaction_contract_valid(item) for item in tx)
+    canonical_contract_valid = bool(tx) and source_columns_distinct and source_headers_aligned and source_date_cells_valid and source_balance_cells_valid and all(canonical_transaction_contract_valid(item) for item in tx)
     # A strict money parser deliberately blanks malformed values such as
     # ``-5.00.177.00``.  For this narrowly proven source-balance exception,
     # permit those blank balances only after exact printed debit/credit totals,
@@ -4560,7 +4573,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # already established the financial result.  It is never a normal chain
     # pass and is always surfaced as a warning to the downstream consumer.
     if not canonical_contract_valid and source_balance_unreliable:
-        canonical_contract_valid = source_columns_distinct and source_date_cells_valid and all(canonical_transaction_core_valid(item) for item in tx)
+        canonical_contract_valid = source_columns_distinct and source_headers_aligned and source_date_cells_valid and all(canonical_transaction_core_valid(item) for item in tx)
     financial_valid = (
         total_reconciles
         and (running_balance_valid or source_balance_unreliable)
@@ -4609,6 +4622,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     columns["_source_balance_cells_valid"] = source_balance_cells_valid
     columns["_source_date_cells_valid"] = source_date_cells_valid
     columns["_source_columns_distinct"] = source_columns_distinct
+    columns["_source_header_roles_aligned"] = source_headers_aligned
     return tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_withdrawals, declared_deposits, statement_totals_valid
 
 def export_excel(tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_withdrawals=None, declared_deposits=None, statement_totals_valid=True, source_balance_unreliable=False):
