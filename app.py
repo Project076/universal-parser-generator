@@ -1250,6 +1250,61 @@ def profile_activation_guard(headers: list[object], columns: dict[str, object],
         "outcome": "active" if eligible else "blocked",
     }
 
+def addendum_regression_guard(headers: list[object], columns: dict[str, object],
+                              layout_fingerprint: str, parent_profile: str | None,
+                              validation: dict | None) -> tuple[bool, dict[str, object]]:
+    """Step 39: keep a certified parent immutable when adding a variant.
+
+    An addendum is allowed to adjust a newly measured layout, but it must not
+    masquerade as its parent, revive an uncertified parent, or silently take
+    over an identical layout.  The active parent remains usable for its own
+    exact source identity; this guard checks only profile metadata and never
+    retains statement text or transactions.
+    """
+    parent_id = str(parent_profile or "").strip()
+    current_id = profile_id(headers, layout_fingerprint)
+    base = {
+        "step": pipeline_step_key("addendum_regression_guard"),
+        "mode": "independent_profile" if not parent_id else "immutable_parent_addendum",
+        "parent_profile_id": parent_id or None,
+        "preserves_parent": True,
+        "duplicate_layout": False,
+        "parent_certified": None,
+        "outcome": "pass",
+    }
+    if not parent_id:
+        return True, base
+    if parent_id == current_id:
+        return False, {**base, "outcome": "blocked", "reason": "an addendum cannot name itself as its parent"}
+    parent_path = PROFILES / f"{Path(parent_id).name}.json"
+    if not parent_path.exists():
+        return False, {**base, "outcome": "blocked", "reason": "named parent profile does not exist"}
+    try:
+        parent = json.loads(parent_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, {**base, "outcome": "blocked", "reason": "named parent profile is unreadable"}
+    parent_validation = parent.get("validation") if isinstance(parent.get("validation"), dict) else {}
+    parent_activation = parent.get("profile_activation") if isinstance(parent.get("profile_activation"), dict) else {}
+    parent_certification = parent.get("certification") if isinstance(parent.get("certification"), dict) else {}
+    parent_certified = (
+        str(parent_validation.get("status", "")).lower() == "pass"
+        and bool(parent_validation.get("financial_pass", False))
+        and bool(parent_validation.get("narration_pass", False))
+        and (str(parent_activation.get("outcome", "active")) == "active")
+        and str(parent_certification.get("status", "certified")).lower() == "certified"
+    )
+    base["parent_certified"] = parent_certified
+    if not parent_certified:
+        return False, {**base, "outcome": "blocked", "reason": "parent is not currently certified and active"}
+    parent_fingerprint = str(parent.get("layout_fingerprint") or "").strip()
+    current_fingerprint = str(layout_fingerprint or "").strip()
+    if current_fingerprint and parent_fingerprint and current_fingerprint == parent_fingerprint:
+        return False, {
+            **base, "duplicate_layout": True, "outcome": "blocked",
+            "reason": "addendum has the same measured layout fingerprint as its parent",
+        }
+    return True, base
+
 def certified_profile_export_guard(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
     """Step 31: prevent incomplete profiles from crossing the UPG API boundary.
 
@@ -1366,6 +1421,11 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
             revision_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
     observations = int(prior.get("validated_observations", 0)) + 1
     detection_code, parser_code = certified_javascript_code(headers, strategy)
+    regression_ok, regression_guard = addendum_regression_guard(
+        headers, columns, layout_fingerprint, parent_profile, validation
+    )
+    if not regression_ok:
+        raise ValueError("Step 39 addendum regression guard rejected profile: " + json.dumps(regression_guard, separators=(",", ":")))
     activation_ok, activation = profile_activation_guard(headers, columns, layout_fingerprint, parent_profile, validation)
     if not activation_ok:
         raise ValueError("Step 30 profile activation guard rejected incomplete certification: " + json.dumps(activation, separators=(",", ":")))
@@ -1412,7 +1472,7 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
             certified_step_lessons.append(item)
     certified_step_lessons = certified_step_lessons[-24:]
     code_sha256 = hashlib.sha256((detection_code + "\n/*UPG-CODE-BOUNDARY*/\n" + parser_code).encode("utf-8")).hexdigest()
-    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "profile_activation": activation, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
+    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
     _matchable, layout_match = certified_layout_match_contract(data)
     data["layout_match"] = layout_match
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -1679,6 +1739,7 @@ STEP_NAMES = {
     "execution_failure_evidence": (35, "EXECUTION_FAILURE_EVIDENCE"),
     "execution_failure_addendum": (36, "EXECUTION_FAILURE_ADDENDUM_ROUTING"),
     "addendum_lineage_selection": (38, "ADDENDUM_LINEAGE_SELECTION"),
+    "addendum_regression_guard": (39, "ADDENDUM_REGRESSION_GUARD"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5633,6 +5694,7 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "profile_export": export_metadata,
         "code_integrity": integrity_metadata,
         "layout_match": layout_match,
+        "addendum_regression_guard": data.get("addendum_regression_guard", {}),
         "parent_profile_id": data.get("parent_profile"),
         "certification": data.get("certification", {"status": "certified", "source": data.get("upg_source", "upg_native")}),
         "profile_origin": data.get("upg_source", "upg_native"),
@@ -5990,6 +6052,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "execution_failure_evidence", "certified")
                     record_step_learning(job_id, "execution_failure_addendum", "certified")
                     record_step_learning(job_id, "addendum_lineage_selection", "certified")
+                    record_step_learning(job_id, "addendum_regression_guard", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     # An execution-repair request may contribute a certified
