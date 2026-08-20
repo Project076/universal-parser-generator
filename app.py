@@ -1676,6 +1676,7 @@ STEP_NAMES = {
     "code_integrity": (32, "CERTIFIED_CODE_INTEGRITY"),
     "layout_match": (33, "EXACT_LAYOUT_MATCH_CONTRACT"),
     "execution_receipt": (34, "REMOTE_EXECUTION_RECEIPT"),
+    "execution_failure_evidence": (35, "EXECUTION_FAILURE_EVIDENCE"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5937,6 +5938,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "code_integrity", "certified")
                     record_step_learning(job_id, "layout_match", "certified")
                     record_step_learning(job_id, "execution_receipt", "certified")
+                    record_step_learning(job_id, "execution_failure_evidence", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     profile_id = save_profile(
@@ -6267,7 +6269,40 @@ def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = 
         "statement_totals_pass": bool(totals_pass),
     }
     if not execution_pass:
-        raise ValueError(f"Certified profile did not validate this statement: financial={financial_pass}, narration={narration_pass}, coverage={coverage_pass}, source_record={source_record_pass}")
+        # Step 35: Remote consumers must receive actionable, source-safe
+        # evidence rather than a generic 422.  This identifies the earliest
+        # affected validation step so BS Analyzer can request one additive,
+        # step-specific repair instead of retrying a whole parser blindly.
+        failed_gates = []
+        if not financial_pass:
+            failed_gates.append("financial_validation")
+        if not narration_pass:
+            failed_gates.append("narration_validation")
+        if not coverage_pass:
+            failed_gates.append("source_coverage")
+        if not source_record_pass:
+            failed_gates.append("source_record_fingerprint")
+        if not coverage_pass or not source_record_pass:
+            blocked_step = "narration_coverage"
+        elif not narration_pass:
+            blocked_step = "narration_coverage"
+        else:
+            blocked_step = "endpoint"
+        return {
+            "ok": False,
+            "profile_id": profile_id,
+            "profile_version": int(profile.get("version", 1)),
+            "error": "Certified profile did not validate this source.",
+            "validation": execution_validation,
+            "failure_evidence": {
+                "step": pipeline_step_key("execution_failure_evidence"),
+                "blocked_step": pipeline_step_key(blocked_step),
+                "failed_gates": failed_gates,
+                "repair_policy": "additive_step_specific_repair",
+                "action": "submit_targeted_upg_repair",
+                "balance_chain_exception": special_balance_exception,
+            },
+        }
     def output_row(row: dict) -> dict:
         narration = row.get("narration", "")
         instrument = row.get("instrument_number", "")
@@ -6278,6 +6313,7 @@ def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = 
             "balance": float(row.get("balance")) if row.get("balance") is not None else None,
         }
     return {
+        "ok": True,
         "profile_id": profile_id, "profile_version": int(profile.get("version", 1)),
         "transactions": [output_row(row) for row in tx],
         "opening_balance": float(opening), "closing_balance": float(closing),
@@ -6627,7 +6663,7 @@ class App(BaseHTTPRequestHandler):
                     str(fields.get("opening", fields.get("ob", ""))),
                     str(fields.get("closing", fields.get("cb", ""))),
                 )
-                self.json(result)
+                self.json(result, HTTPStatus.OK if result.get("ok", True) else HTTPStatus.UNPROCESSABLE_ENTITY)
             except Exception as error:
                 self.json({"ok": False, "error": str(error)}, HTTPStatus.UNPROCESSABLE_ENTITY)
             finally:
