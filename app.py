@@ -1675,6 +1675,7 @@ STEP_NAMES = {
     "profile_export": (31, "CERTIFIED_EXPORT_CONTRACT"),
     "code_integrity": (32, "CERTIFIED_CODE_INTEGRITY"),
     "layout_match": (33, "EXACT_LAYOUT_MATCH_CONTRACT"),
+    "execution_receipt": (34, "REMOTE_EXECUTION_RECEIPT"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5935,6 +5936,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "profile_export", "certified")
                     record_step_learning(job_id, "code_integrity", "certified")
                     record_step_learning(job_id, "layout_match", "certified")
+                    record_step_learning(job_id, "execution_receipt", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     profile_id = save_profile(
@@ -6236,6 +6238,12 @@ def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = 
     if not profile_path.exists():
         raise ValueError("Certified UPG profile was not found")
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    # Reuse every release guard at the moment of execution.  A profile that
+    # was valid at sync time must not become executable after a later file or
+    # code change merely because its JSON still exists on disk.
+    exported_profile = api_profile_payload(profile_id)
+    if not exported_profile:
+        raise ValueError("Certified UPG profile is incomplete, altered, or not safe for remote execution")
     validation = profile.get("validation") or {}
     if validation.get("status") != "pass" or not profile.get("certification"):
         raise ValueError("UPG profile is not certified")
@@ -6243,21 +6251,23 @@ def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = 
     result = parse_statement(path, fallback_open, fallback_close, strategy)
     tx, opening, closing, total_w, total_d, computed, financial_pass, narration_pass, unmatched, _headers, columns, _parent, coverage_pass, source_count, _fingerprint, declared_wd, declared_dp, totals_pass = result
     special_balance_exception = bool(columns.get("_source_balance_unreliable"))
+    source_record_pass = bool(columns.get("_source_record_fingerprint_valid", True))
+    execution_pass = bool(financial_pass and narration_pass and coverage_pass and source_record_pass)
     execution_validation = {
-        "status": "pass" if financial_pass and narration_pass else "fail",
+        "status": "pass" if execution_pass else "fail",
         "financial_pass": bool(financial_pass),
         "narration_pass": bool(narration_pass),
         "balance_chain_pass": not special_balance_exception,
         "balance_chain_exception": special_balance_exception,
         "manual_review_required": special_balance_exception,
         "source_coverage_pass": bool(coverage_pass),
-        "source_record_fingerprint_pass": bool(columns.get("_source_record_fingerprint_valid", True)),
+        "source_record_fingerprint_pass": source_record_pass,
         "transaction_count": len(tx),
         "source_transaction_count": source_count,
         "statement_totals_pass": bool(totals_pass),
     }
-    if not (financial_pass and narration_pass):
-        raise ValueError(f"Certified profile did not validate this statement: financial={financial_pass}, narration={narration_pass}, coverage={coverage_pass}")
+    if not execution_pass:
+        raise ValueError(f"Certified profile did not validate this statement: financial={financial_pass}, narration={narration_pass}, coverage={coverage_pass}, source_record={source_record_pass}")
     def output_row(row: dict) -> dict:
         narration = row.get("narration", "")
         instrument = row.get("instrument_number", "")
@@ -6276,6 +6286,17 @@ def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = 
         "declared_withdrawals": float(declared_wd) if declared_wd is not None else None,
         "declared_deposits": float(declared_dp) if declared_dp is not None else None,
         "validation": execution_validation,
+        "execution_receipt": {
+            "step": pipeline_step_key("execution_receipt"),
+            "execution_id": uuid.uuid4().hex,
+            "issued_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "profile_id": profile_id,
+            "profile_version": int(profile.get("version", 1)),
+            "code_sha256": (exported_profile.get("code_integrity") or {}).get("code_sha256"),
+            "selection_policy": (exported_profile.get("layout_match") or {}).get("selection_policy"),
+            "all_required_gates_pass": True,
+            "balance_chain_exception": special_balance_exception,
+        },
     }
 
 def sweep_expired_storage() -> None:
