@@ -375,6 +375,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "date_source_cell": "Each exported date must be the date from that row's measured Date or Value Date cell. A source-proven repair of a truncated year is allowed; a date-like narration, reference, balance, or adjacent-row value is never a transaction date.",
     "distinct_source_columns": "Each canonical transaction role must come from its own measured source column. Date, Particulars, Withdrawal, Deposit and Balance may never share a source index. The only supported alternative is one Amount column plus a separate Dr/Cr Type column; never reuse Balance, Narration or a movement column to fill another role.",
     "header_role_alignment": "When a native or measured source header explicitly identifies a role (for example Withdrawal Amount, Deposit Amount, Transaction Remarks, Value Date or Running Balance), that role must use that exact measured source column. A saved profile or AI addendum may fill only unlabelled roles; it may not move an explicit header to a different column.",
+    "measured_column_evidence": "Before a layout map can be certified, its measured Date column must contain source dates, its movement columns (or Amount plus Dr/Cr Type) must contain source movements, and its Balance column must contain source balance evidence on dated rows. A header label alone is never proof of a usable column.",
     "numeric_date_geometry": "For original-PDF geometry, recognize both DD-Mon-YYYY and DD-MM-YYYY or DD/MM/YYYY transaction dates, but only inside the measured Date-column x-band. Keep the source Withdrawal and Deposit x-bands authoritative and exclude trailing system-generated footer text from the final narration.",
     "corrupt_balance_text_layer": "For a PDF whose visible balance is correct but whose searchable text corrupts its punctuation, keep the measured debit/credit amount authoritative. Repair a blanked balance only if the preceding movement and the next measured balance, or the independently printed final totals, prove exactly one balance; never invent the opposite movement to force reconciliation.",
     "indian_money_punctuation": "Infer decimal precision only from normal monetary cells in the same source column. If a damaged token has multiple full stops, repair it only when its final fractional group has that credible precision and all earlier groups exactly form Indian comma grouping; never change digits, sign, direction, or column.",
@@ -391,7 +392,7 @@ RULE_GROUPS = {
     "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date", "date_column_boundary", "numeric_date_geometry", "date_source_cell"},
     "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency", "source_amount_geometry", "balance_source_cell"},
     "endpoints_and_totals": {"summary_endpoints", "summary_total_warning"},
-    "validation": {"source_coverage", "narration_source_cell", "balance_source_cell", "date_source_cell", "distinct_source_columns", "header_role_alignment"},
+    "validation": {"source_coverage", "narration_source_cell", "balance_source_cell", "date_source_cell", "distinct_source_columns", "header_role_alignment", "measured_column_evidence"},
 }
 # Earlier certified profiles predate the structured rule-library fields.  They
 # are still useful evidence, but an empty historic `diagnostic_rules` list
@@ -978,6 +979,44 @@ def explicit_header_roles_aligned(headers: list[object], columns: dict[str, int]
     """Ensure profiles/addenda cannot contradict clear source header labels."""
     explicit = map_headers(headers)
     return all(columns.get(role) == index for role, index in explicit.items())
+
+def measured_column_evidence(rows: list[list[object]], header_at: int, columns: dict[str, int]) -> tuple[bool, dict[str, int]]:
+    """Check that a proposed grid map has real typed evidence below its header.
+
+    This is deliberately a pre-certification guard, not a transaction parser.
+    It prevents an AI/header candidate from pointing at an empty column, page
+    number, account number or narration text merely because its heading looked
+    plausible.  It accepts a source with malformed balance punctuation—the
+    documented balance exception is assessed later—but still requires at least
+    one balance-like source cell on a dated row.
+    """
+    decimal_places = inferred_column_decimal_places(rows, header_at, columns)
+    evidence = {"dated_rows": 0, "movement_rows": 0, "balance_rows": 0}
+
+    def value(row: list[object], role: str) -> object:
+        index = columns.get(role)
+        return row[index] if isinstance(index, int) and 0 <= index < len(row) else ""
+
+    for row in rows[header_at + 1:]:
+        if not transaction_date_value(value(row, "date")):
+            continue
+        evidence["dated_rows"] += 1
+        withdrawal = source_money(value(row, "withdrawal"), decimal_places.get("withdrawal"))
+        deposit = source_money(value(row, "deposit"), decimal_places.get("deposit"))
+        if withdrawal is None and deposit is None and "amount" in columns and "transaction_type" in columns:
+            amount = source_money(value(row, "amount"), decimal_places.get("amount"))
+            kind = str(value(row, "transaction_type") or "").upper()
+            if amount is not None and ("DR" in kind or "CR" in kind):
+                withdrawal = amount if "DR" in kind else Decimal("0")
+                deposit = amount if "CR" in kind else Decimal("0")
+        if (withdrawal or Decimal("0")) != 0 or (deposit or Decimal("0")) != 0:
+            evidence["movement_rows"] += 1
+        raw_balance = value(row, "balance")
+        if source_money(raw_balance, decimal_places.get("balance")) is not None or re.search(r"\d", str(raw_balance or "")):
+            evidence["balance_rows"] += 1
+
+    valid = evidence["dated_rows"] > 0 and evidence["movement_rows"] > 0 and evidence["balance_rows"] > 0
+    return valid, evidence
 
 def text_layout_fingerprint(raw: str) -> str:
     """Privacy-safe structural signature for text-only statement layouts."""
@@ -4184,6 +4223,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     else:
         columns = {**inherited_missing, **(ai_columns or {}), **exact_missing, **source_columns}
     decimal_places = inferred_column_decimal_places(rows, header_at, columns)
+    source_column_evidence_valid, source_column_evidence = measured_column_evidence(rows, header_at, columns)
     punctuation_repairs = 0
 
     def monetary_cell(key: str):
@@ -4565,7 +4605,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     source_headers_aligned = explicit_header_roles_aligned(headers, columns)
     source_balance_cells_valid = balance_source_cells_traceable(tx)
     source_date_cells_valid = date_source_cells_traceable(tx)
-    canonical_contract_valid = bool(tx) and source_columns_distinct and source_headers_aligned and source_date_cells_valid and source_balance_cells_valid and all(canonical_transaction_contract_valid(item) for item in tx)
+    canonical_contract_valid = bool(tx) and source_columns_distinct and source_headers_aligned and source_column_evidence_valid and source_date_cells_valid and source_balance_cells_valid and all(canonical_transaction_contract_valid(item) for item in tx)
     # A strict money parser deliberately blanks malformed values such as
     # ``-5.00.177.00``.  For this narrowly proven source-balance exception,
     # permit those blank balances only after exact printed debit/credit totals,
@@ -4573,7 +4613,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # already established the financial result.  It is never a normal chain
     # pass and is always surfaced as a warning to the downstream consumer.
     if not canonical_contract_valid and source_balance_unreliable:
-        canonical_contract_valid = source_columns_distinct and source_headers_aligned and source_date_cells_valid and all(canonical_transaction_core_valid(item) for item in tx)
+        canonical_contract_valid = source_columns_distinct and source_headers_aligned and source_column_evidence_valid and source_date_cells_valid and all(canonical_transaction_core_valid(item) for item in tx)
     financial_valid = (
         total_reconciles
         and (running_balance_valid or source_balance_unreliable)
@@ -4623,6 +4663,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     columns["_source_date_cells_valid"] = source_date_cells_valid
     columns["_source_columns_distinct"] = source_columns_distinct
     columns["_source_header_roles_aligned"] = source_headers_aligned
+    columns["_source_column_evidence_valid"] = source_column_evidence_valid
     return tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_withdrawals, declared_deposits, statement_totals_valid
 
 def export_excel(tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_withdrawals=None, declared_deposits=None, statement_totals_valid=True, source_balance_unreliable=False):
