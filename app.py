@@ -1745,6 +1745,14 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
     allowed = REPAIR_MODULE_STRATEGIES.get(str(repair_module))
     if allowed:
         ordered = [item for item in ordered if item[1] or item[0] in allowed]
+    # Step 26: an exact certified layout fingerprint is not merely a high
+    # score—it is a direct reusable parser match. Test that saved strategy on
+    # the complete uploaded source before spending work on related layouts or
+    # an AI addendum. If the full validation rejects it, the next retry still
+    # diagnoses the concrete failure and may create an addendum; no release
+    # gate is weakened by this fast path.
+    if retry_round == 1 and validated_strategy:
+        return [candidate_for(validated_strategy)]
     # A source-proven dual-date ledger must first be tested with its measured
     # Value-Date geometry.  Generic table parsing can collapse the date bands,
     # and an AI call before this test only spends money rediscovering evidence
