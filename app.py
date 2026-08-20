@@ -2421,7 +2421,20 @@ def repair_truncated_table_date(value: object, raw: str) -> str:
     return partial.group(1) + proven.group(1) if proven else text
 
 def count_source_transactions(rows: list[list[object]], header_at: int, columns: dict[str, int]) -> int:
-    """Count real source records without trusting parsed totals or narration text."""
+    """Count source-proven transaction records independently of parsed rows.
+
+    A valid record is one Date-column cell, one non-zero source movement, and
+    one visible Balance-column token.  The balance value may be wrong (or have
+    recoverable OCR punctuation damage), but the cell must visibly exist so a
+    parser cannot certify a partial table by counting dates alone.
+    """
+    def numeric_token_present(value: object) -> bool:
+        text = str(value or "").strip()
+        # This intentionally accepts broken Indian punctuation such as
+        # ``-5.00.177.00`` as *record-presence* evidence.  Its numeric value
+        # remains subject to the separate conservative money repair rules.
+        return bool(re.fullmatch(r"[+-]?\s*[\d][\d,\.\s]*(?:\s*(?:dr|cr))?", text, re.I))
+
     count = 0
     for row in rows[header_at + 1:]:
         def cell(key):
@@ -2433,8 +2446,18 @@ def count_source_transactions(rows: list[list[object]], header_at: int, columns:
         narration = str(cell("narration") or "")
         if re.search(r"\b(?:B/F|OPENING\s+BALANCE)\b", narration, re.I):
             continue
-        has_values = any(money(cell(key)) is not None for key in ("withdrawal", "deposit", "amount", "balance"))
-        if has_values:
+        withdrawal = money(cell("withdrawal")) if "withdrawal" in columns else None
+        deposit = money(cell("deposit")) if "deposit" in columns else None
+        amount = money(cell("amount")) if "amount" in columns else None
+        direct_movements = sum(1 for value in (withdrawal, deposit) if value is not None and value != 0)
+        has_one_movement = direct_movements == 1
+        # Amount + Dr/Cr type is the equivalent of separate debit/credit
+        # columns.  It is one source movement only when there were no direct
+        # debit/credit values to contradict it.
+        if direct_movements == 0 and amount is not None and amount != 0 and "transaction_type" in columns:
+            has_one_movement = True
+        balance_visible = "balance" in columns and numeric_token_present(cell("balance"))
+        if has_one_movement and balance_visible:
             count += 1
     return count
 
