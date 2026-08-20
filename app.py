@@ -1899,7 +1899,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
                 "upg_learning": compact_ai_learning_packet(source_path, rows[0] if rows else None, raw)}
     instruction = (AI_LAYOUT_CONTRACT + "\nIdentify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
-        "and balance. These are the only allowed transaction outputs. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. The source_matched_certified_capabilities are reusable behaviours only: apply one only when the supplied source evidence proves it, and never copy another profile's coordinates, code, or field indexes. Use -1 when a field is absent. If failure evidence is supplied, return a revised measured header/column mapping that directly repairs that failure. Do not extract transactions, invent values, or change validation rules."
+        "and balance. These are the only allowed transaction outputs. Interpret unfamiliar header wording semantically from the measured source header: for example Transaction Remarks/Description/Details means narration; Debit/Withdrawal means withdrawal; Credit/Deposit means deposit; Post/Transaction/Booking Date and Value Date are date fields (Value Date wins for output). Do not map account metadata, totals, page furniture, or a word outside the measured table header. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. The source_matched_certified_capabilities are reusable behaviours only: apply one only when the supplied source evidence proves it, and never copy another profile's coordinates, code, or field indexes. Use -1 when a field is absent. If failure evidence is supplied, return a revised measured header/column mapping that directly repairs that failure. Do not extract transactions, invent values, or change validation rules."
     )
     payload = {
         "model": AI_MODEL,
@@ -2926,14 +2926,14 @@ def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = No
     return rows
 
 def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
-    """Reject structurally impossible large-PDF candidates before full parsing.
+    """Reject structurally impossible PDF candidates before full parsing.
 
     This is deliberately not a release validation. It only checks original-PDF
     sample pages for a real header and multiple dated record shapes, letting
     full extraction and all financial/narration gates remain the sole
     certification authority.
     """
-    if path.suffix.lower() != ".pdf" or not is_large_pdf(path):
+    if path.suffix.lower() != ".pdf":
         return True
     count = len(open_pdf_reader(path).pages)
     samples = set(sampled_page_indices(count))
@@ -2942,7 +2942,7 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
             if strategy == "source_amount_geometry":
                 rows = extract_standard_column_geometry_rows(path)
             elif strategy == "dual_date_geometry":
-                rows = extract_dual_date_geometry_rows(path)
+                rows = extract_dual_date_geometry_rows(path, samples)
             else:
                 rows = extract_geometry_profile_rows(path, samples)
         else:
@@ -2957,14 +2957,23 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
                 # Table rediscovery is intentionally not run on every page of
                 # a large PDF. Geometry/AI candidates are stronger evidence.
                 return False
-        if len(rows) < 4 or len(map_headers(rows[0])) < 3:
+        fields = map_headers(rows[0]) if rows else {}
+        if len(rows) < 3 or not {"date", "withdrawal", "deposit", "balance"}.issubset(fields):
             return False
-        date_index = map_headers(rows[0]).get("date", 0)
-        return sum(bool(transaction_date_value(row[date_index] if date_index < len(row) else "")) for row in rows[1:]) >= 2
+        date_index = fields["date"]
+        balance_index = fields["balance"]
+        dated_rows = [row for row in rows[1:] if transaction_date_value(row[date_index] if date_index < len(row) else "")]
+        # This is only a cheap source-shape gate. Full source coverage,
+        # narration, financial and balance-chain validation still decide
+        # certification after the complete extraction.
+        return len(dated_rows) >= 2 and all(
+            balance_index < len(row) and money(row[balance_index]) is not None
+            for row in dated_rows
+        )
     except Exception:
         return False
 
-def extract_dual_date_geometry_rows(path: Path) -> list[list[object]]:
+def extract_dual_date_geometry_rows(path: Path, page_indices: set[int] | None = None) -> list[list[object]]:
     """Read a borderless Post Date / Value Date ledger from original PDF boxes.
 
     This is intentionally a measured layout family, rather than a bank-name
@@ -2974,36 +2983,53 @@ def extract_dual_date_geometry_rows(path: Path) -> list[list[object]]:
     """
     header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
     rows: list[list[object]] = [header]
-    date_re = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+    date_re = re.compile(r"^\d{2}[-/]\d{2}[-/]\d{2,4}$")
     with open_pdfplumber(path) as pdf:
-        for page in pdf.pages:
+        for page_number, page in enumerate(pdf.pages):
+            if page_indices is not None and page_number not in page_indices:
+                continue
             words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
             if not words:
                 continue
             # Original-page x bands established from this family's visible
             # header.  Keep these deliberately broad enough for a small
             # print-scale change while still fencing out account furniture.
-            post_words = [word for word in words if str(word["text"]).lower() == "post"]
+            # Accept semantic header variants.  The x positions are still
+            # measured from this source page; no coordinates are borrowed
+            # from another bank or profile.
+            post_words = [word for word in words if str(word["text"]).lower() in {"post", "posting", "txn", "transaction", "date"}]
             value_words = [word for word in words if str(word["text"]).lower() == "value"]
-            debit_words = [word for word in words if str(word["text"]).lower() == "debit"]
-            credit_words = [word for word in words if str(word["text"]).lower() == "credit"]
+            debit_words = [word for word in words if str(word["text"]).lower() in {"debit", "debits", "withdrawal", "withdrawals"}]
+            credit_words = [word for word in words if str(word["text"]).lower() in {"credit", "credits", "deposit", "deposits"}]
             balance_words = [word for word in words if str(word["text"]).lower() == "balance"]
             if not (post_words and value_words and debit_words and credit_words and balance_words):
                 continue
             # Account metadata can also contain the word "Balance".  Anchor
             # every measured column to the actual Post Date header baseline,
             # never the leftmost occurrence anywhere on the page.
-            post_header = max(post_words, key=lambda word: float(word["top"]))
-            header_top = float(post_header["top"])
+            # Use the header baseline that contains Value Date; account
+            # metadata elsewhere on the page can also contain these words.
+            value_header = max(value_words, key=lambda word: float(word["top"]))
+            header_top = float(value_header["top"])
             same_header = lambda candidates: min(
                 (word for word in candidates if abs(float(word["top"]) - header_top) <= 12),
                 key=lambda word: float(word["x0"]),
             )
-            post_x = float(post_header["x0"])
-            value_x = float(same_header(value_words)["x0"])
-            debit_x = float(same_header(debit_words)["x0"])
-            credit_x = float(same_header(credit_words)["x0"])
-            balance_x = float(same_header(balance_words)["x0"])
+            try:
+                value_x = float(same_header(value_words)["x0"])
+                post_header = min(
+                    (word for word in post_words if abs(float(word["top"]) - header_top) <= 12 and float(word["x0"]) < value_x),
+                    key=lambda word: float(word["x0"]),
+                )
+                post_x = float(post_header["x0"])
+                debit_x = float(same_header(debit_words)["x0"])
+                credit_x = float(same_header(credit_words)["x0"])
+                balance_x = float(same_header(balance_words)["x0"])
+            except ValueError:
+                # Header words exist on the page but do not form one measured
+                # ledger header baseline (for example account-summary text).
+                # Do not borrow coordinates or turn it into an AI call.
+                continue
             anchors: list[tuple[float, str, str]] = []
             for word in words:
                 text = str(word["text"])
@@ -4384,7 +4410,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     skipped_candidates += 1
                     errors.append(f"{candidate_name}: already failed for this statement")
                     continue
-                if large_pdf and not force_ai_profile and not sample_candidate_plausible(path, strategy):
+                # Geometry-based candidates have measurable source evidence
+                # even on a short PDF.  Prove their header/row/amount/balance
+                # shape before paying for a full extraction or AI repair.
+                needs_sample_proof = large_pdf or strategy == "dual_date_geometry"
+                if needs_sample_proof and not force_ai_profile and not sample_candidate_plausible(path, strategy):
                     skipped_candidates += 1
                     failed_strategy_keys.add(strategy_key)
                     errors.append(f"{candidate_name}: rejected by sampled original-PDF structure")
