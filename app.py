@@ -1565,7 +1565,9 @@ STRATEGY_CAPABILITY_COVERAGE: dict[str, frozenset[str]] = {
 def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool, validated_strategy: str | None,
                               planned_strategies: list[str], retry_round: int,
                               include_ai_addendum: bool = True,
-                              repair_module: str = "") -> list[tuple[str | None, bool]]:
+                              repair_module: str = "",
+                              source_sample: str | None = None,
+                              source_geometry: tuple[list[object], list[tuple[float, float]]] | None = None) -> list[tuple[str | None, bool]]:
     """Rank parser candidates from source evidence before parsing the full file.
 
     A candidate is never accepted by score alone.  The score only decides which
@@ -1587,7 +1589,10 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
     header_fields: dict[str, int] = {}
     if path.suffix.lower() == ".pdf":
         try:
-            geometry = sampled_geometry_profile(path)
+            # Step 24: preflight may already have measured this upload's
+            # original-PDF geometry. Reuse that snapshot instead of scanning
+            # the same representative pages again while ranking candidates.
+            geometry = source_geometry if source_geometry is not None else sampled_geometry_profile(path)
             if geometry:
                 headers = geometry[0]
                 header_fields = map_headers(headers)
@@ -1628,7 +1633,9 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         # type.  Previously this always called ``cached_pdf_text`` for a
         # non-large upload, so an .xls job reached PyMuPDF before its Excel
         # reader and failed with "Failed to open file ... as type xls".
-        if path.suffix.lower() == ".pdf":
+        if source_sample is not None:
+            sample = source_sample
+        elif path.suffix.lower() == ".pdf":
             sample = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
         else:
             _, sample = load_rows(path)
@@ -1792,11 +1799,15 @@ def preflight_plan_id(plan: dict[str, object]) -> str:
     }
     return hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
-def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: str | None,
-                              planned_strategies: list[str]) -> dict[str, object]:
-    """Create one evidence-led parser plan before any full-file extraction."""
+
+def source_preflight_snapshot(path: Path, large_pdf: bool) -> dict[str, object]:
+    """Measure an upload once for its preflight planner.
+
+    The snapshot is intentionally job-local and contains only the source
+    evidence needed for planning. It is passed to candidate ranking directly,
+    never stored in a parser profile or learning record.
+    """
     geometry = sampled_geometry_profile(path) if path.suffix.lower() == ".pdf" else None
-    headers = geometry[0] if geometry else []
     try:
         if path.suffix.lower() == ".pdf":
             source_sample = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
@@ -1805,9 +1816,21 @@ def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: s
             source_sample = source_sample[:60000]
     except (OSError, ValueError):
         source_sample = ""
+    return {"geometry": geometry, "sample": source_sample}
+
+def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: str | None,
+                              planned_strategies: list[str]) -> dict[str, object]:
+    """Create one evidence-led parser plan before any full-file extraction."""
+    snapshot = source_preflight_snapshot(path, large_pdf)
+    geometry = snapshot["geometry"]
+    headers = geometry[0] if geometry else []
+    source_sample = str(snapshot["sample"])
     closest = closest_certified_lessons(path, headers)
     capabilities = source_capability_plan(source_sample, headers)
-    candidates = evidence_first_candidates(path, large_pdf, bool(geometry), validated_strategy, planned_strategies, 1)
+    candidates = evidence_first_candidates(
+        path, large_pdf, bool(geometry), validated_strategy, planned_strategies, 1,
+        source_sample=source_sample, source_geometry=geometry,
+    )
     selected_rule_bundle = [
         {
             "capability": str(item.get("capability", "")),
