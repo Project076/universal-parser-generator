@@ -3215,6 +3215,20 @@ def failure_type_from_evidence(failure: str) -> str:
     later unrelated rule such as furniture cleanup or financial reconciliation.
     """
     evidence = (failure or "").lower()
+    # A worker lease can end after a concrete module was already proven to be
+    # the source of the defect.  Its resumed repair context also contains
+    # broad words such as "columns" and "geometry" from the immutable
+    # preflight.  Honour the persisted, evidence-backed diagnosis *before*
+    # looking for those generic words, otherwise an S07 narration repair is
+    # silently downgraded to S05 column geometry on the next lease.
+    for persisted_type in (
+        "continuation", "narration_coverage", "page_furniture",
+        "amount_normalization", "date_order", "balance_direction",
+        "unreliable_balance", "transaction_count", "balance_chain",
+        "header_mapping", "column_geometry", "endpoint",
+    ):
+        if f"prior expert diagnosis: {persisted_type}" in evidence:
+            return "continuation" if persisted_type == "narration_coverage" else persisted_type
     # Step 29 is a promotion gate, not a parser module. If it rejects a
     # candidate, route the addendum back to the concrete upstream module that
     # its metadata identifies rather than asking an agent to "repair"
@@ -6771,7 +6785,30 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # Supply source-proof telemetry from the latest failed candidate.  The
         # next plan must repair the exact failed module, not infer a cause
         # from aggregate financial/narration flags alone.
-        investigation = evidence_repair_plan(errors + failure_evidence + candidate_failure_evidence(latest), latest)
+        # Do not lose the exact failed module merely because this worker lease
+        # produced no new candidate (for example, the AI map was rejected as
+        # unsafe).  Rebuilding from that generic error used to erase an
+        # earlier S07 narration proof and reroute it as S05 column geometry.
+        # Preserve the narrow, additive repair scope until new source evidence
+        # disproves it.
+        if latest is None and not failure_evidence and prior_investigation:
+            previous_route = prior_investigation.get("module_repair_route", {})
+            previous_rules = (
+                list(previous_route.get("target_rule_modules", []))
+                if isinstance(previous_route, dict) else []
+            )
+            previous_rules = [str(rule) for rule in previous_rules if str(rule) in DIAGNOSTIC_RULE_LIBRARY]
+            previous_type = str(prior_investigation.get("failure_type", "column_geometry") or "column_geometry")
+            investigation = {
+                "rules": previous_rules,
+                "strategies": list(targeted_repair_strategies),
+                "failure_type": previous_type,
+                "upstream_steps": [str(step) for step in prior_investigation.get("upstream_steps", []) if str(step)] or [previous_type],
+                "profile_action": str(prior_investigation.get("profile_action", "repair_header_map") or "repair_header_map"),
+                "diagnostic_error": str(prior_investigation.get("diagnostic_error", "") or ""),
+            }
+        else:
+            investigation = evidence_repair_plan(errors + failure_evidence + candidate_failure_evidence(latest), latest)
         module_repair_route = module_level_repair_route(
             investigation,
             preflight.get("capability_drift_detection") if isinstance(preflight, dict) else {},
