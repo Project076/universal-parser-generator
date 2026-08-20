@@ -4854,6 +4854,33 @@ def has_dual_date_header_contract(headers: list[object]) -> bool:
     )
 
 
+def source_has_dual_date_contract(headers: list[object], raw: str, strategy: str | None = None) -> bool:
+    """Identify a two-date source before choosing a coverage denominator.
+
+    ``load_rows`` may already have normalised a measured PDF to the canonical
+    one-date output header (Date / Narration / Withdrawal / Deposit / Balance).
+    In that case inspecting the normalised header alone loses the fact that
+    the original source had both a posting and Value Date column.  Coverage
+    must retain that fact: two visible source dates on one ledger row are one
+    transaction, never two.
+
+    The strategy is evidence, not an override: it is set only after the
+    original-PDF dual-date geometry selector recognised the source contract.
+    The raw-header fallback keeps the rule available to equivalent future
+    layouts whose normalised output header is canonical.
+    """
+    if has_dual_date_header_contract(headers) or strategy == "dual_date_geometry":
+        return True
+    compact = re.sub(r"\s+", " ", str(raw or "")[:12000])
+    return bool(
+        re.search(r"\b(?:transaction|txn|post(?:ing)?|booking|effective)\s*date\b", compact, re.I)
+        and re.search(r"\b(?:value|settlement)\s*date\b", compact, re.I)
+        and re.search(r"\b(?:debits?|withdrawals?)\b", compact, re.I)
+        and re.search(r"\b(?:credits?|deposits?)\b", compact, re.I)
+        and re.search(r"\b(?:running|available|closing)?\s*balance\b", compact, re.I)
+    )
+
+
 def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
     """Extract a normal Date / Particulars / Debit / Credit / Balance ledger.
 
@@ -5946,17 +5973,28 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # Compare it with independently detected table rows so an incomplete subset
     # can never become a validated parser or profile.
     expected_source_count = count_source_transactions(rows, header_at, columns)
+    # A posting/transaction date plus a Value Date are two fields of one
+    # visible ledger row. ``load_rows`` may already have normalised a measured
+    # PDF to a one-date canonical output header, so retain the original-source
+    # contract separately before any raw-text counter can double it.
+    source_has_dual_dates = source_has_dual_date_contract(headers, raw, effective_strategy)
+    grid_source_count = expected_source_count
     # Long-form dates at the start of source lines provide independent record
     # evidence for compact text PDFs. Do not let a malformed candidate define
     # its own coverage denominator.
     long_date_records = len(re.findall(r"(?m)^\s*\d{2}-[A-Za-z]{3}-\d{4}\b", raw))
-    if long_date_records:
+    if long_date_records and not source_has_dual_dates:
         expected_source_count = max(expected_source_count, long_date_records)
     independent_count = (
         signed_balance_source_count(raw)
         if effective_strategy == "running_balance_text"
         else raw_transaction_record_count(raw)
     )
+    if source_has_dual_dates:
+        # Raw-text date counters necessarily see both source date columns.
+        # They are not independent transaction-record evidence for this
+        # layout and must not replace the measured source-grid count.
+        independent_count = None
     if effective_strategy == "running_balance_text" and independent_count is not None:
         # This source shape is stronger than a date-only count.  The latter
         # also sees a small number of dated period/metadata lines, whereas a
@@ -5969,10 +6007,17 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # generic table discoverer here re-scans all 1,176 pages with pdfplumber,
     # even though this J&K layout has no table borders or reusable headers.
     # Reserve that expensive structural check for a geometry/table candidate.
+    table_count = None
     if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
         table_count = structured_source_count(path)
         if table_count is not None:
             expected_source_count = table_count
+    if source_has_dual_dates:
+        # Keep an independently measured source-row denominator. Do not let a
+        # parser candidate validate itself by setting the expected count to its
+        # own output length. If no independent grid/table count exists, zero
+        # remains a safe failure rather than a guessed pass.
+        expected_source_count = table_count if table_count is not None else grid_source_count
     # B/F is an opening anchor, not a movement.  Some independent date-only
     # source counts include it even though the stricter table count excludes
     # it.  Correct only the exact one-row discrepancy that this metadata can
@@ -5984,13 +6029,9 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     excess = expected_source_count - len(tx)
     if bf_metadata_rows and 0 < excess <= bf_metadata_rows:
         expected_source_count -= excess
-    # A measured Post Date + Value Date pair is a stronger record boundary
-    # than text-level date counting, which necessarily sees both date columns.
-    # The geometry parser emits one row only where both source date cells share
-    # a baseline and it reached an amount plus balance, so its own count is the
-    # independent source denominator for this narrow layout family.
-    if effective_strategy == "dual_date_geometry":
-        expected_source_count = len(tx)
+    # Never set a dual-date denominator from ``len(tx)``. A partial parser
+    # must not certify itself merely because it chose its own coverage target.
+    # The source-grid/table count above proves the number of ledger rows.
     coverage_valid = len(tx) == expected_source_count
     # A multi-page statement cannot be safely accepted from a single inferred
     # transaction: that comparison would merely validate an incomplete source
@@ -6083,6 +6124,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     columns["_balance_endpoint_derived"] = locals().get("endpoint_derived", "none")
     columns["_source_totals_conflict"] = source_totals_conflict
     columns["_source_columns_distinct"] = source_columns_distinct
+    columns["_source_dual_date_contract"] = source_has_dual_dates
     columns["_canonical_contract_valid"] = canonical_contract_valid
     columns["_source_record_fingerprint_valid"] = source_fingerprint_valid
     columns["_balance_repaired_from_chain"] = balance_repaired_from_chain
