@@ -1541,6 +1541,7 @@ STEP_NAMES = {
     "transaction_count": (15, "TRANSACTION_COUNT_CHECK"),
     "balance_chain": (17, "BALANCE_CHAIN_CHECK"),
     "novel_layout": (20, "PARSER_PLAN_COMPOSITION"),
+    "addendum_compatibility": (28, "ADDITIVE_COMPATIBILITY_GATE"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -1620,6 +1621,7 @@ def compact_ai_learning_packet(path: Path | None = None, headers: list[object] |
         "narration_coverage": ["narration_source_cell", "continuation_merge", "source_coverage"],
         "transaction_count": ["source_coverage", "date_source_cell", "measured_column_evidence"],
         "balance_chain": ["balance_delta", "amount_balance_consistency", "balance_source_cell"],
+        "addendum_compatibility": ["header_role_alignment", "distinct_source_columns", "measured_column_evidence"],
         "novel_layout": ["distinct_source_columns", "header_role_alignment", "measured_column_evidence"],
     }.get(failure_type, ["distinct_source_columns", "header_role_alignment", "measured_column_evidence"])
     allowed_rules = list(dict.fromkeys([*baseline, *selected_rules]))
@@ -2621,6 +2623,8 @@ def failure_type_from_evidence(failure: str) -> str:
     later unrelated rule such as furniture cleanup or financial reconciliation.
     """
     evidence = (failure or "").lower()
+    if "step 28 additive compatibility" in evidence or "additive compatibility gate" in evidence:
+        return "addendum_compatibility"
     if "header" in evidence or "header role" in evidence:
         return "header_mapping"
     if any(token in evidence for token in ("decimal", "punctuation", "multiple points", "amount token")):
@@ -2665,7 +2669,7 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "rules": {"type": "array", "items": {"type": "string", "enum": allowed_rules}, "maxItems": 5},
         "strategies": {"type": "array", "items": {"type": "string", "enum": safe_strategies}, "maxItems": 4},
-        "failure_type": {"type": "string", "enum": ["source_shape", "column_geometry", "header_mapping", "amount_normalization", "date_order", "bf_summary", "classification", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "balance_chain", "novel_layout"]},
+        "failure_type": {"type": "string", "enum": ["source_shape", "column_geometry", "header_mapping", "amount_normalization", "date_order", "bf_summary", "classification", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "balance_chain", "addendum_compatibility", "novel_layout"]},
         "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
     prompt = AI_LAYOUT_CONTRACT + "\nThis is the final AI decision for this job and it is being made AFTER the first source-layout extraction failed. Repair only " + str(learning_packet["ai_context_scope"]["pipeline_step"]) + ". Do not move downstream until this step has source proof. Produce one targeted, evidence-led repair plan using only the supplied certified modules and strategies. Do not write code or transactions, do not relax validation, and do not request another AI layout addendum. If evidence is insufficient, choose reject_unsafe.\nScoped rules: " + json.dumps(learning_packet["allowed_rule_modules"]) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(learning_packet) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
@@ -4765,6 +4769,42 @@ def measured_source_date_order(transactions: list[dict]) -> str:
         return "reverse"
     return "mixed"
 
+def additive_compatibility_gate(source_columns: dict[str, int], inherited_columns: dict[str, int],
+                                proposed_columns: dict[str, int], parent_profile: str | None) -> tuple[bool, dict[str, object]]:
+    """Step 28: approve only additive, source-proven layout variants.
+
+    A profile from another statement may donate a rule, but never silently move
+    a column whose meaning is explicit in the current source.  This gate
+    records only field identities and mapping facts; it does not retain source
+    values, narration, or transactions.
+    """
+    required = ("date", "particular", "withdrawal", "deposit", "balance")
+    source_conflicts = [
+        field for field, index in source_columns.items()
+        if field in proposed_columns and proposed_columns[field] != index
+    ]
+    mapped = {field: index for field, index in proposed_columns.items() if field in required and isinstance(index, int)}
+    collisions = len(mapped.values()) != len(set(mapped.values()))
+    inherited_only = sorted(field for field in inherited_columns if field not in source_columns and field in mapped)
+    # Narration can genuinely be blank in some exports. Date + running balance
+    # and at least one source movement column are the non-negotiable geometry
+    # anchors; a blank Particulars field is preserved as blank rather than
+    # causing a false rejection.
+    missing = [field for field in ("date", "balance") if field not in mapped]
+    if "withdrawal" not in mapped and "deposit" not in mapped:
+        missing.append("movement")
+    metadata: dict[str, object] = {
+        "step": pipeline_step_key("addendum_compatibility"),
+        "mode": "related_addendum" if parent_profile else "new_layout",
+        "parent_profile": str(parent_profile or ""),
+        "source_proven_fields": sorted(field for field in source_columns if field in required),
+        "inherited_missing_fields_only": inherited_only,
+        "conflicting_explicit_fields": source_conflicts,
+        "column_collision": collisions,
+        "missing_core_fields": missing,
+    }
+    return (not source_conflicts and not collisions and not missing), metadata
+
 def parse_statement(path: Path, fallback_open: str, fallback_close: str, strategy_override: str | None = None, force_ai_profile: bool = False, repair_context: str = "", job_id: str | None = None):
     if path.suffix.lower() == ".pdf":
         source_text = remove_page_furniture(cached_pdf_text(path))
@@ -4841,6 +4881,18 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         columns = {**inherited_missing, **exact_missing, **(ai_columns or {}), **source_columns}
     else:
         columns = {**inherited_missing, **(ai_columns or {}), **exact_missing, **source_columns}
+    addendum_safe, addendum_metadata = additive_compatibility_gate(
+        source_columns, {**inherited_missing, **exact_missing}, columns, parent_profile
+    )
+    # Step 28 applies to all profile variants, not merely AI-generated ones.
+    # A deterministic related profile must also remain an addition to current
+    # source proof, never a silent replacement of an explicit layout field.
+    if not addendum_safe:
+        raise ValueError(
+            "Step 28 additive compatibility gate rejected this layout variant: "
+            + json.dumps(addendum_metadata, separators=(",", ":"))
+        )
+    columns["_addendum_compatibility"] = addendum_metadata
     decimal_places = inferred_column_decimal_places(rows, header_at, columns)
     source_column_evidence_valid, source_column_evidence = measured_column_evidence(rows, header_at, columns)
     punctuation_repairs = 0
