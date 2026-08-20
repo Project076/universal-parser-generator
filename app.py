@@ -810,7 +810,18 @@ def canonical_transaction_contract_valid(transaction: dict) -> bool:
     balance = transaction.get("balance")
     if withdrawal is None or deposit is None or balance is None:
         return False
-    if withdrawal < 0 or deposit < 0 or (withdrawal and deposit):
+    if withdrawal < 0 or deposit < 0:
+        return False
+    # A transaction is a dated source row with one measured movement.  Do not
+    # turn a date-bearing header, period label, B/F metadata, or a blank row
+    # into a zero-value transaction merely because it happens to align with a
+    # balance column.  Likewise never accept two populated financial columns:
+    # that is a column-boundary/mapping defect, not a debit and credit to be
+    # netted out for reconciliation.
+    if (withdrawal == 0) == (deposit == 0):
+        return False
+    source_amount = transaction.get("source_amount")
+    if source_amount is not None and abs(Decimal(source_amount)).quantize(Decimal(".01")) != abs(deposit - withdrawal).quantize(Decimal(".01")):
         return False
     return not narration_is_furniture(transaction.get("narration"))
 
@@ -827,7 +838,10 @@ def canonical_transaction_core_valid(transaction: dict) -> bool:
     deposit = transaction.get("deposit")
     if withdrawal is None or deposit is None or withdrawal < 0 or deposit < 0:
         return False
-    if withdrawal and deposit:
+    if (withdrawal == 0) == (deposit == 0):
+        return False
+    source_amount = transaction.get("source_amount")
+    if source_amount is not None and abs(Decimal(source_amount)).quantize(Decimal(".01")) != abs(deposit - withdrawal).quantize(Decimal(".01")):
         return False
     return not narration_is_furniture(transaction.get("narration"))
 
