@@ -1678,6 +1678,7 @@ STEP_NAMES = {
     "execution_receipt": (34, "REMOTE_EXECUTION_RECEIPT"),
     "execution_failure_evidence": (35, "EXECUTION_FAILURE_EVIDENCE"),
     "execution_failure_addendum": (36, "EXECUTION_FAILURE_ADDENDUM_ROUTING"),
+    "addendum_lineage_selection": (38, "ADDENDUM_LINEAGE_SELECTION"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5637,6 +5638,53 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "profile_origin": data.get("upg_source", "upg_native"),
     }
 
+def select_certified_profile_variant(layout_fingerprint: str = "", headers: list[str] | None = None) -> tuple[dict | None, dict]:
+    """Select one certified profile using source identity, never bank name.
+
+    An addendum gets priority only when it is an *exact* source match.  Its
+    parent remains eligible for its own exact layout/header contract, so new
+    variants cannot silently replace a known-good original parser.
+    """
+    fingerprint = str(layout_fingerprint or "").strip()
+    header_contract = tuple(norm(item) for item in (headers or []) if norm(item))
+    candidates: list[tuple[tuple[int, int, int], dict]] = []
+    for profile_path in PROFILES.glob("*.json"):
+        candidate = api_profile_payload(profile_path.stem)
+        if not candidate:
+            continue
+        try:
+            raw = json.loads(profile_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        profile_headers = tuple(norm(item) for item in raw.get("header_signature", []) if norm(item))
+        exact_layout = bool(fingerprint and candidate.get("layout_fingerprint") == fingerprint)
+        exact_headers = bool(header_contract and profile_headers == header_contract)
+        if not (exact_layout or exact_headers):
+            continue
+        is_addendum = bool(candidate.get("parent_profile_id"))
+        # Exact measured geometry wins.  For an equal exact contract, prefer
+        # the descendant because it is the explicitly certified variant.
+        rank = (2 if exact_layout else 1, 1 if is_addendum else 0, int(candidate.get("version", 1)))
+        candidates.append((rank, candidate))
+    if not candidates:
+        return None, {
+            "step": pipeline_step_key("addendum_lineage_selection"),
+            "selection_policy": "exact_layout_then_exact_header_only",
+            "matched": False,
+        }
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    selected = candidates[0][1]
+    return selected, {
+        "step": pipeline_step_key("addendum_lineage_selection"),
+        "selection_policy": "exact_layout_then_exact_header_only",
+        "matched": True,
+        "selected_profile_id": selected.get("profile_id"),
+        "selected_profile_version": selected.get("version"),
+        "selected_as_addendum": bool(selected.get("parent_profile_id")),
+        "parent_profile_id": selected.get("parent_profile_id"),
+        "candidate_count": len(candidates),
+    }
+
 def post_completion_webhook(job_id: str, status: str, profile_id: str | None = None, error: str | None = None) -> None:
     """Best-effort signed notification; polling remains the reliable fallback."""
     if not (UPG_WEBHOOK_URL and UPG_WEBHOOK_SECRET):
@@ -5941,6 +5989,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "execution_receipt", "certified")
                     record_step_learning(job_id, "execution_failure_evidence", "certified")
                     record_step_learning(job_id, "execution_failure_addendum", "certified")
+                    record_step_learning(job_id, "addendum_lineage_selection", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     # An execution-repair request may contribute a certified
@@ -6553,6 +6602,21 @@ class App(BaseHTTPRequestHandler):
             if job.get("profile_id"): response["profile_id"] = job["profile_id"]
             if status == "failed": response["error"] = job.get("message", "Parser generation failed")
             self.json(response); return
+        if path == "/parser-profiles/select":
+            if not self.api_authorized(): return
+            query = parse_qs(parsed_url.query)
+            fingerprint = query.get("fingerprint", [""])[0]
+            # Header contracts are intentionally supplied as a simple
+            # delimiter-separated list; no source text or transaction data is
+            # needed for selection.
+            headers = [item for item in query.get("headers", [""])[0].split("|") if item]
+            selected, receipt = select_certified_profile_variant(fingerprint, headers)
+            if not selected:
+                self.json({"ok": False, "error": "No exact certified parser variant matched this source.",
+                           "selection_receipt": receipt}, HTTPStatus.NOT_FOUND)
+            else:
+                self.json({"ok": True, "profile": selected, "selection_receipt": receipt})
+            return
         if path == "/parser-profiles":
             if not self.api_authorized(): return
             query = parse_qs(parsed_url.query)
