@@ -2430,6 +2430,42 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
     return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
             "profile_action": profile_action, "diagnostic_error": ""}
 
+# A targeted repair plan may select only extraction modes that the local UPG
+# engine actually implements.  The list deliberately contains *strategies*,
+# not bank-specific parser IDs or old column offsets: the new statement is
+# always measured again from its own source before a strategy is run.
+TARGETED_REPAIR_STRATEGIES = frozenset({
+    "geometry_profile",
+    "source_amount_geometry",
+    "dual_date_geometry",
+    "value_date_unsigned",
+    "unsigned_running_balance_text",
+    "running_balance_text",
+    "page_text_unsigned",
+    "detected_table",
+})
+
+def pending_targeted_repair_strategies(strategies: object, failed_strategy_keys: set[str]) -> list[str]:
+    """Return the untried deterministic actions from the latest repair plan.
+
+    This is the Step 16 execution gate.  A source-proof failure (for example
+    misaligned header roles) must first run its selected measured repair
+    strategy.  It must not spend another AI request, nor replay unrelated
+    candidates, until that narrow deterministic action has been tested.
+    """
+    if not isinstance(strategies, list):
+        return []
+    pending: list[str] = []
+    for raw_strategy in strategies:
+        strategy = str(raw_strategy)
+        if (
+            strategy in TARGETED_REPAIR_STRATEGIES
+            and strategy not in pending
+            and f"{strategy}:deterministic" not in failed_strategy_keys
+        ):
+            pending.append(strategy)
+    return pending
+
 def source_balances(text: str) -> tuple[Decimal | None, Decimal | None]:
     def find(kind):
         # A column heading such as "Closing Balance*" is commonly followed by
@@ -4864,6 +4900,12 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     diagnostic_rules: set[str] = {str(item) for item in saved_state.get("diagnostic_rules", [])}
     planned_strategies: list[str] = [str(item) for item in saved_state.get("planned_strategies", [])]
     prior_investigation = saved_state.get("investigation") if isinstance(saved_state.get("investigation"), dict) else {}
+    # The latest failure selects a small, concrete repair plan.  Preserve it
+    # across fair worker leases/restarts so a queued job resumes the exact
+    # repair it had evidence for instead of falling back to broad candidates.
+    targeted_repair_strategies: list[str] = [
+        str(item) for item in saved_state.get("targeted_repair_strategies", [])
+    ]
     # Retrying is required only while the AI can propose a materially new,
     # supported path.  Persist this across fair worker leases so an empty AI
     # diagnosis can never turn into an infinite queue-consuming loop.
@@ -4975,15 +5017,30 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                           for name in preflight.get("candidate_plan", [])]
         else:
             # A retry is a re-measurement after the exact prior failure, not a
-            # replay of the initial plan. Existing signature memory below
-            # guarantees that only materially new candidates are tested.
-            candidates = evidence_first_candidates(
-                path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number,
-                # A second AI call is deliberately a repaired layout map
-                # based on the first failed extraction.  It is not consumed
-                # by a separate diagnosis-only request.
-                include_ai_addendum=("targeted_repair_profile" not in ai_call_purposes(job_id) and ai_calls_remaining(job_id) > 0),
+            # replay of the initial plan.  Execute the evidence-selected
+            # deterministic repair *before* considering an AI layout call.
+            # This is both safer (we change one failing module at a time) and
+            # cheaper (the agent is not asked to rediscover an available
+            # geometry/text strategy).
+            pending_targeted = pending_targeted_repair_strategies(
+                targeted_repair_strategies, failed_strategy_keys
             )
+            if pending_targeted:
+                candidates = [(strategy, False) for strategy in pending_targeted]
+                patch_job(
+                    job_id,
+                    message=(f"UPG retry round {round_number}: applying targeted "
+                             f"{prior_investigation.get('failure_type', 'source')} repair "
+                             f"from measured failure evidence before any new AI call."),
+                )
+            else:
+                candidates = evidence_first_candidates(
+                    path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number,
+                    # A second AI call is deliberately a repaired layout map
+                    # based on the first failed extraction.  It is not consumed
+                    # by a separate diagnosis-only request.
+                    include_ai_addendum=("targeted_repair_profile" not in ai_call_purposes(job_id) and ai_calls_remaining(job_id) > 0),
+                )
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
             try:
@@ -5149,6 +5206,13 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # Keep the complete plan history. Replacing it could reintroduce an
         # earlier failed path after a later evidence-led repair.
         planned_strategies.extend(materially_new_strategies)
+        # Keep the newest narrow repair plan separate from the historical
+        # candidate list.  ``planned_strategies`` is useful evidence memory;
+        # it must not force unrelated candidates ahead of the exact repair
+        # selected by source-proof telemetry.
+        targeted_repair_strategies = pending_targeted_repair_strategies(
+            proposed_strategies, failed_strategy_keys
+        )
         diagnosis_error = str(investigation.get("diagnostic_error", "") or "")
         prior_investigation = {
             "failure_type": investigation.get("failure_type", "novel_layout"),
@@ -5190,6 +5254,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             "skipped_candidates": skipped_candidates, "failed_candidates": sorted(failed_candidates),
                             "failed_strategy_keys": sorted(failed_strategy_keys),
                             "diagnostic_rules": sorted(diagnostic_rules), "planned_strategies": planned_strategies,
+                            "targeted_repair_strategies": targeted_repair_strategies,
                             "empty_ai_diagnoses": empty_ai_diagnoses, "investigation": prior_investigation,
                             "last_candidate_errors": (candidate_history + errors)[-8:]})
                 JOBS[job_id] = job
@@ -5211,6 +5276,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         "failed_strategy_keys": sorted(failed_strategy_keys),
                         "diagnostic_rules": sorted(diagnostic_rules),
                         "planned_strategies": planned_strategies,
+                        "targeted_repair_strategies": targeted_repair_strategies,
                         "empty_ai_diagnoses": empty_ai_diagnoses,
                         "last_candidate_errors": errors[-8:]})
             job["investigation"] = prior_investigation
