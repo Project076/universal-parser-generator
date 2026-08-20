@@ -2029,6 +2029,66 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
         })
     return selected
 
+# Canonical 50-step pipeline catalogue.  These identifiers are immutable once
+# released: lesson history, repair evidence and audit logs refer to them.
+# STEP_NAMES below remains the compatibility router from a detected failure to
+# its owning canonical step; a number may therefore have more than one alias.
+PIPELINE_STEP_MANIFEST: dict[int, str] = {
+    1: "SOURCE_INTAKE",
+    2: "NATIVE_STRUCTURE_READ",
+    3: "SOURCE_SHAPE_DISCOVERY",
+    4: "HEADER_SEMANTICS",
+    5: "COLUMN_GEOMETRY_MAP",
+    6: "SOURCE_RECORD_BOUNDARIES",
+    7: "NARRATION_ASSEMBLY",
+    8: "FURNITURE_REMOVAL",
+    9: "AMOUNT_NORMALIZATION",
+    10: "BALANCE_INTERPRETATION",
+    11: "DATE_SELECTION_AND_NORMALIZATION",
+    12: "BF_AND_SUMMARY_EXCLUSION",
+    13: "DEBIT_CREDIT_CLASSIFICATION",
+    14: "SOURCE_COVERAGE_CHECK",
+    15: "TRANSACTION_COUNT_CHECK",
+    16: "FINANCIAL_RECONCILIATION",
+    17: "BALANCE_CHAIN_CHECK",
+    18: "LEDGER_ORDER_VERIFICATION",
+    19: "STATEMENT_ENDPOINT_DISCOVERY",
+    20: "PARSER_PLAN_COMPOSITION",
+    21: "SOURCE_STRATEGY_PLAUSIBILITY",
+    22: "CANDIDATE_FAILURE_DEDUPLICATION",
+    23: "MINIMAL_CAPABILITY_COMPOSITION",
+    24: "PREFLIGHT_EVIDENCE_REUSE",
+    25: "MEASURED_CANDIDATE_CONSTRUCTION",
+    26: "EXACT_LAYOUT_REUSE_CHECK",
+    27: "AI_CONTEXT_SCOPE",
+    28: "ADDITIVE_COMPATIBILITY_GATE",
+    29: "CERTIFIED_LESSON_PROMOTION",
+    30: "PROFILE_ACTIVATION_GUARD",
+    31: "CERTIFIED_EXPORT_CONTRACT",
+    32: "CERTIFIED_CODE_INTEGRITY",
+    33: "EXACT_LAYOUT_MATCH_CONTRACT",
+    34: "REMOTE_EXECUTION_RECEIPT",
+    35: "EXECUTION_FAILURE_EVIDENCE",
+    36: "EXECUTION_FAILURE_ADDENDUM_ROUTING",
+    37: "CERTIFIED_PROFILE_IMPORT_GUARD",
+    38: "ADDENDUM_LINEAGE_SELECTION",
+    39: "ADDENDUM_REGRESSION_GUARD",
+    40: "CERTIFIED_REVISION_ATOMICITY",
+    41: "CERTIFIED_LINEAGE_INTEGRITY",
+    42: "CERTIFIED_CAPABILITY_PROVENANCE",
+    43: "CAPABILITY_COMPOSITION_SAFETY",
+    44: "CAPABILITY_APPLICATION_RECEIPT",
+    45: "CAPABILITY_EFFECTIVENESS_FEEDBACK",
+    46: "CAPABILITY_DRIFT_DETECTION",
+    47: "MODULE_LEVEL_REPAIR_ROUTING",
+    48: "CANDIDATE_EVIDENCE_COMPARISON",
+    49: "COST_AND_RETRY_BUDGET_CONTROL",
+    50: "FINAL_CERTIFICATION_AUDIT",
+}
+
+if set(PIPELINE_STEP_MANIFEST) != set(range(1, 51)) or len(set(PIPELINE_STEP_MANIFEST.values())) != 50:
+    raise RuntimeError("Pipeline step manifest must contain one unique name for every step 1 through 50")
+
 STEP_NAMES = {
     "source_intake": (1, "SOURCE_INTAKE"),
     "native_structure": (2, "NATIVE_STRUCTURE_READ"),
@@ -2075,7 +2135,8 @@ STEP_NAMES = {
 
 def pipeline_step_key(failure_type: str) -> str:
     """Stable name used for one step's isolated repair history."""
-    number, name = STEP_NAMES.get(failure_type, STEP_NAMES["column_geometry"])
+    number, _name = STEP_NAMES.get(failure_type, STEP_NAMES["column_geometry"])
+    name = PIPELINE_STEP_MANIFEST[number]
     return f"S{number:02d}_{name}"
 
 def certified_lessons_for_step(profile_id: object, failure_type: str) -> list[dict[str, object]]:
