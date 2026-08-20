@@ -1215,6 +1215,41 @@ def certified_feature_vector(headers: list[object], columns: dict[str, int], str
         "challenge_ids": sorted(challenges),
     }
 
+def profile_activation_guard(headers: list[object], columns: dict[str, object],
+                             layout_fingerprint: str, parent_profile: str | None,
+                             validation: dict | None) -> tuple[bool, dict[str, object]]:
+    """Step 30: publish only a self-contained, certified parser profile.
+
+    A related certified profile may contribute rule modules, but it never
+    becomes the executing parser for a different statement merely because the
+    bank name or a few headers look similar.  The new profile must retain its
+    own source-proven mapping and complete release proof.  This prevents a
+    new addendum from weakening older layouts while keeping all prior
+    immutable revisions usable for their exact layouts.
+    """
+    mapped = {name: value for name, value in columns.items()
+              if name in CANONICAL and isinstance(value, int)}
+    required = {"date", "balance"}
+    has_movement = "withdrawal" in mapped or "deposit" in mapped
+    validation = validation or {}
+    release_proven = all(bool(validation.get(key, False)) for key in
+                         ("financial_pass", "narration_pass", "source_coverage_pass"))
+    canonical = bool(columns.get("_canonical_contract_valid", False))
+    source_record = bool(columns.get("_source_record_fingerprint_valid", True))
+    header_contract = bool(headers) and required.issubset(mapped) and has_movement
+    eligible = bool(header_contract and release_proven and canonical and source_record)
+    return eligible, {
+        "step": pipeline_step_key("profile_activation"),
+        "activation_scope": "exact_layout_only" if layout_fingerprint else "source_header_contract_only",
+        "related_profile_mode": "capability_donor_only" if parent_profile else "independent_profile",
+        "mapped_core_fields": sorted(mapped),
+        "header_contract_pass": header_contract,
+        "release_proof_pass": release_proven,
+        "canonical_contract_pass": canonical,
+        "source_record_fingerprint_pass": source_record,
+        "outcome": "active" if eligible else "blocked",
+    }
+
 def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None, capability_tags: list[str] | None = None, capability_provenance: list[dict[str, object]] | None = None, step_lessons: list[dict[str, object]] | None = None) -> str:
     """Persist validated learning additively; never discard a certified revision.
 
@@ -1244,6 +1279,9 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
             revision_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
     observations = int(prior.get("validated_observations", 0)) + 1
     detection_code, parser_code = certified_javascript_code(headers, strategy)
+    activation_ok, activation = profile_activation_guard(headers, columns, layout_fingerprint, parent_profile, validation)
+    if not activation_ok:
+        raise ValueError("Step 30 profile activation guard rejected incomplete certification: " + json.dumps(activation, separators=(",", ":")))
     challenges = sorted({str(item) for item in (challenge_history or []) if str(item) and str(item) != "none"})
     features = certified_feature_vector(headers, columns, strategy, diagnostic_rules, challenges, capability_tags)
     learned_rule_ids = sorted({*(diagnostic_rules or []), *challenges, *(capability_tags or [])})
@@ -1286,7 +1324,7 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
             seen_step_lessons.add(key)
             certified_step_lessons.append(item)
     certified_step_lessons = certified_step_lessons[-24:]
-    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
+    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "profile_activation": activation, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
@@ -1543,6 +1581,7 @@ STEP_NAMES = {
     "novel_layout": (20, "PARSER_PLAN_COMPOSITION"),
     "addendum_compatibility": (28, "ADDITIVE_COMPATIBILITY_GATE"),
     "certification_promotion": (29, "CERTIFIED_LESSON_PROMOTION"),
+    "profile_activation": (30, "PROFILE_ACTIVATION_GUARD"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5773,6 +5812,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_wd, declared_dp, statement_totals_valid = candidate
                     columns["_certification_promotion"] = promotion_metadata
                     record_step_learning(job_id, "certification_promotion", "certified")
+                    # Step 30 records the publishing decision with the same
+                    # job-local lesson set.  It does not activate a parent
+                    # parser on this new layout; parent knowledge remains a
+                    # capability donor only.
+                    record_step_learning(job_id, "profile_activation", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     profile_id = save_profile(
