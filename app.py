@@ -1482,6 +1482,43 @@ def capability_application_receipt_guard(
         "geometry_policy": "measured_from_new_source_only",
     }
 
+def capability_effectiveness_feedback(
+    application_receipt: dict[str, object], validation: dict[str, object] | None
+) -> dict[str, object]:
+    """Step 45: issue feedback only after a complete certified outcome.
+
+    A module is never called successful merely because it was selected.  Its
+    capability earns one reusable success only when this parser passed the
+    financial and narration gates (and the source-coverage gate when present).
+    The receipt contains rule identities only, never statement data.
+    """
+    validation = validation if isinstance(validation, dict) else {}
+    financial = bool(validation.get("financial_pass", True))
+    narration = bool(validation.get("narration_pass", True))
+    coverage = bool(validation.get("source_coverage_pass", True))
+    certified = financial and narration and coverage
+    receipt_items = application_receipt.get("capability_receipt", []) if isinstance(application_receipt, dict) else []
+    effective = []
+    for item in receipt_items:
+        if not isinstance(item, dict) or not str(item.get("capability", "")):
+            continue
+        effective.append({
+            "capability": str(item.get("capability")),
+            "rule_group": str(item.get("rule_group", "")),
+            "effective_rule_modules": [str(rule) for rule in item.get("applied_rule_modules", [])
+                                       if str(rule) in DIAGNOSTIC_RULE_LIBRARY],
+            "outcome": "certified_success" if certified else "not_promoted",
+        })
+    return {
+        "step": pipeline_step_key("capability_effectiveness_feedback"),
+        "outcome": "pass" if certified else "withheld",
+        "full_release_gates_passed": certified,
+        "financial_pass": financial,
+        "narration_pass": narration,
+        "source_coverage_pass": coverage,
+        "effective_capabilities": effective,
+    }
+
 def certified_profile_export_guard(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
     """Step 31: prevent incomplete profiles from crossing the UPG API boundary.
 
@@ -1623,6 +1660,8 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     )
     if not receipt_ok:
         raise ValueError("Step 44 capability application receipt rejected profile: " + json.dumps(application_receipt, separators=(",", ":")))
+    certification_validation = validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}
+    effectiveness_feedback = capability_effectiveness_feedback(application_receipt, certification_validation)
     version = int(prior.get("version", 0)) + 1
     # A step lesson is stored only with a certified profile.  It contains no
     # statement text or transactions: just the named step, bounded rule IDs,
@@ -1651,7 +1690,7 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
             certified_step_lessons.append(item)
     certified_step_lessons = certified_step_lessons[-24:]
     code_sha256 = hashlib.sha256((detection_code + "\n/*UPG-CODE-BOUNDARY*/\n" + parser_code).encode("utf-8")).hexdigest()
-    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "certified_capability_provenance": provenance_guard, "capability_composition_safety": composition_guard, "capability_application_receipt": application_receipt, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "certified_lineage_integrity": lineage_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
+    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "certified_capability_provenance": provenance_guard, "capability_composition_safety": composition_guard, "capability_application_receipt": application_receipt, "capability_effectiveness_feedback": effectiveness_feedback, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "certified_lineage_integrity": lineage_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": certification_validation, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
     _matchable, layout_match = certified_layout_match_contract(data)
     data["layout_match"] = layout_match
     if not _matchable:
@@ -1695,6 +1734,12 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     for rule in learned_rule_ids:
         if rule in DIAGNOSTIC_RULE_LIBRARY:
             scorecard[rule] = int(scorecard.get(rule, 0) or 0) + 1
+    capability_scorecard = ledger.setdefault("certified_capability_successes", {})
+    if effectiveness_feedback.get("full_release_gates_passed"):
+        for item in effectiveness_feedback.get("effective_capabilities", []):
+            if isinstance(item, dict) and str(item.get("capability", "")):
+                capability = str(item["capability"])
+                capability_scorecard[capability] = int(capability_scorecard.get(capability, 0) or 0) + 1
     LEARNING_LEDGER.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     return ident
 
@@ -1767,6 +1812,16 @@ def certified_rule_successes() -> dict[str, int]:
                     scores[rule] = scores.get(rule, 0) + 1
     return scores
 
+def certified_capability_successes() -> dict[str, int]:
+    """Return certification-earned capability scores for retrieval ranking."""
+    try:
+        ledger = json.loads(LEARNING_LEDGER.read_text(encoding="utf-8"))
+        raw = ledger.get("certified_capability_successes", {})
+    except (OSError, ValueError):
+        raw = {}
+    return {str(capability): int(count or 0) for capability, count in raw.items()
+            if str(capability) in CAPABILITY_DEFAULT_RULES and int(count or 0) > 0}
+
 def closest_certified_lessons(path: Path | None, headers: list[object] | None = None, limit: int = 3) -> list[dict[str, object]]:
     """Find the closest certified layouts using this source's safe structure."""
     target_headers = {norm(item) for item in (headers or []) if norm(item)}
@@ -1805,6 +1860,7 @@ def ai_learning_packet(path: Path | None = None, headers: list[object] | None = 
         },
         "permanent_historical_lessons": HISTORICAL_CHALLENGE_LESSONS,
         "certified_rule_successes": certified_rule_successes(),
+        "certified_capability_successes": certified_capability_successes(),
         "closest_certified_layouts": closest_certified_lessons(path, headers),
         "certified_profile_lessons": certified_learning_context(),
     }
@@ -1838,6 +1894,7 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
 
     certified = certified_learning_context(limit=64)
     success_scores = certified_rule_successes()
+    capability_scores = certified_capability_successes()
 
     def providers_for(capability: str) -> list[dict[str, object]]:
         """Return compact certified rule modules for one source-proven need.
@@ -1879,7 +1936,10 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
                 "reusable_rules": reusable_rules[:4],
                 "rule_groups": list(lesson.get("rule_groups", []))[:4],
                 "challenges_solved": [str(item) for item in lesson.get("challenge_history", [])][:3],
-                "certified_success_score": sum(success_scores.get(rule, 0) for rule in reusable_rules),
+                "certified_success_score": (
+                    capability_scores.get(capability, 0) * 4
+                    + sum(success_scores.get(rule, 0) for rule in reusable_rules)
+                ),
             })
         providers.sort(key=lambda provider: int(provider.get("certified_success_score", 0) or 0), reverse=True)
         return providers[:4]
@@ -1953,6 +2013,7 @@ STEP_NAMES = {
     "certified_capability_provenance": (42, "CERTIFIED_CAPABILITY_PROVENANCE"),
     "capability_composition_safety": (43, "CAPABILITY_COMPOSITION_SAFETY"),
     "capability_application_receipt": (44, "CAPABILITY_APPLICATION_RECEIPT"),
+    "capability_effectiveness_feedback": (45, "CAPABILITY_EFFECTIVENESS_FEEDBACK"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5913,6 +5974,7 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "certified_capability_provenance": data.get("certified_capability_provenance", {}),
         "capability_composition_safety": data.get("capability_composition_safety", {}),
         "capability_application_receipt": data.get("capability_application_receipt", {}),
+        "capability_effectiveness_feedback": data.get("capability_effectiveness_feedback", {}),
         "parent_profile_id": data.get("parent_profile"),
         "certification": data.get("certification", {"status": "certified", "source": data.get("upg_source", "upg_native")}),
         "profile_origin": data.get("upg_source", "upg_native"),
@@ -6276,6 +6338,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "certified_capability_provenance", "certified")
                     record_step_learning(job_id, "capability_composition_safety", "certified")
                     record_step_learning(job_id, "capability_application_receipt", "certified")
+                    record_step_learning(job_id, "capability_effectiveness_feedback", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     # An execution-repair request may contribute a certified
