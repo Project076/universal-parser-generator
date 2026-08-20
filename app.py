@@ -3158,9 +3158,8 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     )
     try:
         with urllib.request.urlopen(request, timeout=90) as response:
-            result = json.loads(response.read().decode())
-        text = next((item["text"] for output in result.get("output", []) for item in output.get("content", []) if item.get("type") == "output_text"), "")
-        generated = json.loads(text)
+            result = json.loads(response.read().decode("utf-8-sig"))
+        generated = response_schema_object(result)
         header_row = int(generated["header_row"])
         columns = {name: int(index) for name, index in generated["columns"].items() if int(index) >= 0}
         if not (0 <= header_row < len(rows)):
@@ -3206,6 +3205,55 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
         record_failure(safe_openai_error(error))
         return None
 
+def response_schema_object(result: object) -> dict:
+    """Read a structured Responses API answer across supported response shapes.
+
+    The API normally puts JSON-schema output in ``output[].content[].text``.
+    A transient gateway/model response can instead expose ``output_text`` or
+    a parsed object.  Treating those valid forms as an empty string caused a
+    JSONDecodeError and ended an otherwise repairable parser job.
+    """
+    if not isinstance(result, dict):
+        raise ValueError("OpenAI returned a non-object response.")
+    direct = result.get("output_parsed")
+    if isinstance(direct, dict):
+        return direct
+    candidates: list[object] = [result.get("output_text")]
+    for output in result.get("output", []) or []:
+        if not isinstance(output, dict):
+            continue
+        if isinstance(output.get("parsed"), dict):
+            return output["parsed"]
+        for content in output.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+            if isinstance(content.get("parsed"), dict):
+                return content["parsed"]
+            text_value = content.get("text")
+            if isinstance(text_value, dict):
+                text_value = text_value.get("value") or text_value.get("text")
+            candidates.append(text_value)
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        text = candidate.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            # A provider may prepend a short label despite JSON-schema mode.
+            start, end = text.find("{"), text.rfind("}")
+            if start < 0 or end <= start:
+                continue
+            decoded = json.loads(text[start:end + 1])
+        if isinstance(decoded, dict):
+            return decoded
+    status = str(result.get("status") or "unknown")
+    incomplete = result.get("incomplete_details") or {}
+    reason = str(incomplete.get("reason") or "no schema object") if isinstance(incomplete, dict) else "no schema object"
+    raise ValueError(f"OpenAI returned no usable schema object (status={status}, reason={reason}).")
+
 def ai_choose_text_strategy(raw: str, job_id: str | None = None) -> str | None:
     """Let the parser-generator select a supported extraction path for a new layout."""
     key = os.environ.get("OPENAI_API_KEY")
@@ -3227,9 +3275,8 @@ def ai_choose_text_strategy(raw: str, job_id: str | None = None) -> str | None:
     }
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=90) as response: result = json.loads(response.read().decode())
-        text = next((item["text"] for output in result.get("output", []) for item in output.get("content", []) if item.get("type") == "output_text"), "")
-        return json.loads(text)["strategy"]
+        with urllib.request.urlopen(request, timeout=90) as response: result = json.loads(response.read().decode("utf-8-sig"))
+        return str(response_schema_object(result)["strategy"])
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
         return None
 
@@ -3336,9 +3383,8 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
     payload = {"model": AI_MODEL, "input": prompt, "max_output_tokens": AI_MAX_OUTPUT_TOKENS, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=90) as response: result = json.loads(response.read().decode())
-        output = next((item["text"] for item_out in result.get("output", []) for item in item_out.get("content", []) if item.get("type") == "output_text"), "")
-        plan = json.loads(output)
+        with urllib.request.urlopen(request, timeout=90) as response: result = json.loads(response.read().decode("utf-8-sig"))
+        plan = response_schema_object(result)
         return {
             "rules": [rule for rule in plan["rules"] if rule in allowed_rules],
             "strategies": [strategy for strategy in plan["strategies"] if strategy in safe_strategies],
