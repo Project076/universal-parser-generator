@@ -1713,6 +1713,16 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         selected.append(ai_key)
     return selected
 
+def preflight_plan_id(plan: dict[str, object]) -> str:
+    """Stable, privacy-safe identity for the measured plan, not source data."""
+    evidence = {
+        "measured_from": plan.get("measured_from"),
+        "header_fields": plan.get("header_fields", []),
+        "candidate_plan": plan.get("candidate_plan", []),
+        "rule_bundle": plan.get("selected_rule_bundle", []),
+    }
+    return hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+
 def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: str | None,
                               planned_strategies: list[str]) -> dict[str, object]:
     """Create one evidence-led parser plan before any full-file extraction."""
@@ -1729,8 +1739,17 @@ def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: s
     closest = closest_certified_lessons(path, headers)
     capabilities = source_capability_plan(source_sample, headers)
     candidates = evidence_first_candidates(path, large_pdf, bool(geometry), validated_strategy, planned_strategies, 1)
-    return {
-        "version": 2,
+    selected_rule_bundle = [
+        {
+            "capability": str(item.get("capability", "")),
+            "rule_group": str(item.get("rule_group", "")),
+            "rules": [str(rule) for rule in item.get("selected_rule_modules", [])],
+            "provider_profile_id": str(item.get("selected_provider_profile_id", "")),
+        }
+        for item in capabilities if isinstance(item, dict)
+    ]
+    plan = {
+        "version": 3,
         "measured_from": "original_pdf_geometry" if geometry else "source_text_structure",
         "header_fields": sorted(map_headers(headers)) if headers else [],
         "transaction_output_contract": {
@@ -1742,9 +1761,12 @@ def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: s
         "closest_profile_ids": [item["profile_id"] for item in closest],
         "closest_challenges": sorted({challenge for item in closest for challenge in item.get("challenge_history", [])}),
         "source_matched_capabilities": capabilities,
+        "selected_rule_bundle": selected_rule_bundle,
         "candidate_plan": ["ai_layout_addendum" if ai else (strategy or "detected_table") for strategy, ai in candidates],
         "full_source_validation_required": True,
     }
+    plan["plan_id"] = preflight_plan_id(plan)
+    return plan
 
 def pdf_password(path: Path) -> str:
     with EXTRACTION_CACHE_LOCK:
@@ -4990,6 +5012,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             "header_fields": preflight.get("header_fields", []),
             "candidate_plan": preflight.get("candidate_plan", []),
             "closest_profile_ids": preflight.get("closest_profile_ids", []),
+            "preflight_plan_id": preflight.get("plan_id", ""),
+            "selected_rule_bundle": preflight.get("selected_rule_bundle", []),
             "capabilities": [
                 item.get("capability") for item in preflight.get("source_matched_capabilities", [])
                 if isinstance(item, dict) and item.get("capability")
@@ -5041,6 +5065,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             f"Prior expert diagnosis: {prior_investigation.get('failure_type', 'none')}; "
             f"safe corrective action: {prior_investigation.get('profile_action', 'none')}; "
             f"validated layout rules to consider: {', '.join(diagnostic_rules) or 'none'}. "
+            f"Immutable measured preflight plan: {preflight.get('plan_id', 'none')}; "
+            f"selected source-proven rule bundle: {json.dumps(preflight.get('selected_rule_bundle', []), separators=(',', ':'))[-1000:] or 'none'}. "
             f"Preflight closest profiles: {', '.join(preflight.get('closest_profile_ids', [])) or 'none'}; "
             f"measured fields: {', '.join(preflight.get('header_fields', [])) or 'unresolved'}. "
             f"Previously tested targeted repairs: {json.dumps(targeted_repair_history, separators=(',', ':'))[-1000:] or 'none'}."
