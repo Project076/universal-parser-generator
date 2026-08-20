@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import io
 import json
@@ -2420,6 +2421,16 @@ def repair_truncated_table_date(value: object, raw: str) -> str:
     proven = re.search(re.escape(partial.group(1)) + r"\s*([0-9])\b", raw)
     return partial.group(1) + proven.group(1) if proven else text
 
+def visible_monetary_token(value: object) -> bool:
+    """Whether a source cell visibly contains a money-like token.
+
+    This is deliberately about source presence, not numeric interpretation. A
+    punctuation-damaged Indian balance is still evidence of a row, while its
+    value remains governed by the conservative money-repair rules.
+    """
+    text = str(value or "").strip()
+    return bool(re.fullmatch(r"[+-]?\s*[\d][\d,\.\s]*(?:\s*(?:dr|cr))?", text, re.I))
+
 def count_source_transactions(rows: list[list[object]], header_at: int, columns: dict[str, int]) -> int:
     """Count source-proven transaction records independently of parsed rows.
 
@@ -2428,13 +2439,6 @@ def count_source_transactions(rows: list[list[object]], header_at: int, columns:
     recoverable OCR punctuation damage), but the cell must visibly exist so a
     parser cannot certify a partial table by counting dates alone.
     """
-    def numeric_token_present(value: object) -> bool:
-        text = str(value or "").strip()
-        # This intentionally accepts broken Indian punctuation such as
-        # ``-5.00.177.00`` as *record-presence* evidence.  Its numeric value
-        # remains subject to the separate conservative money repair rules.
-        return bool(re.fullmatch(r"[+-]?\s*[\d][\d,\.\s]*(?:\s*(?:dr|cr))?", text, re.I))
-
     count = 0
     for row in rows[header_at + 1:]:
         def cell(key):
@@ -2456,10 +2460,66 @@ def count_source_transactions(rows: list[list[object]], header_at: int, columns:
         # debit/credit values to contradict it.
         if direct_movements == 0 and amount is not None and amount != 0 and "transaction_type" in columns:
             has_one_movement = True
-        balance_visible = "balance" in columns and numeric_token_present(cell("balance"))
+        balance_visible = "balance" in columns and visible_monetary_token(cell("balance"))
         if has_one_movement and balance_visible:
             count += 1
     return count
+
+def source_transaction_fingerprint(rows: list[list[object]], header_at: int, columns: dict[str, int]) -> Counter | None:
+    """Build an independent source movement multiset fingerprint.
+
+    Count validation alone cannot distinguish an omitted source debit plus a
+    duplicated equal debit.  Where the source gives separately measured debit
+    or credit cells, retain every (date, side, amount) record and require the
+    finished parser to reproduce the same multiset.  This never uses a running
+    balance to manufacture a movement, and it declines to add a gate for an
+    ambiguous amount-only layout.
+    """
+    if "date" not in columns or "balance" not in columns:
+        return None
+    records: list[tuple[str, str, str]] = []
+    for row in rows[header_at + 1:]:
+        def cell(key: str):
+            index = columns.get(key)
+            return row[index] if index is not None and index < len(row) else ""
+        date = transaction_date_value(str(cell("date") or "").strip())
+        if date is None:
+            continue
+        narration = str(cell("narration") or "")
+        if re.search(r"\b(?:B/F|OPENING\s+BALANCE)\b", narration, re.I):
+            continue
+        if not visible_monetary_token(cell("balance")):
+            continue
+        withdrawal = money(cell("withdrawal")) if "withdrawal" in columns else None
+        deposit = money(cell("deposit")) if "deposit" in columns else None
+        side_values = [("withdrawal", withdrawal), ("deposit", deposit)]
+        nonzero = [(side, value) for side, value in side_values if value is not None and value != 0]
+        if len(nonzero) != 1:
+            # Amount + explicitly printed Dr/Cr is equivalent source evidence.
+            amount = money(cell("amount")) if "amount" in columns else None
+            kind = str(cell("transaction_type") or "").upper()
+            if len(nonzero) == 0 and amount is not None and amount != 0 and ("DR" in kind or "CR" in kind):
+                nonzero = [("withdrawal" if "DR" in kind else "deposit", amount)]
+            else:
+                return None
+        side, value = nonzero[0]
+        records.append((date.isoformat(), side, str(abs(value).quantize(Decimal(".01")))))
+    return Counter(records) if records else None
+
+def parsed_transaction_fingerprint(transactions: list[dict]) -> Counter | None:
+    """Canonical counterpart of ``source_transaction_fingerprint``."""
+    records: list[tuple[str, str, str]] = []
+    for item in transactions:
+        date = transaction_date_value(item.get("date"))
+        withdrawal = item.get("withdrawal")
+        deposit = item.get("deposit")
+        nonzero = [("withdrawal", withdrawal), ("deposit", deposit)]
+        nonzero = [(side, value) for side, value in nonzero if value is not None and value != 0]
+        if date is None or len(nonzero) != 1:
+            return None
+        side, value = nonzero[0]
+        records.append((date.isoformat(), side, str(abs(Decimal(value)).quantize(Decimal(".01")))))
+    return Counter(records) if records else None
 
 def structured_source_count(path: Path) -> int | None:
     """Independent table evidence used to reject a short fallback extraction."""
@@ -4229,6 +4289,21 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         if source_amount is not None and movement.quantize(Decimal(".01")) != abs(source_amount).quantize(Decimal(".01")):
             source_amount_valid = False
             break
+    # A count can still be equal after one source debit is omitted and another
+    # equal debit is duplicated.  For native/measured table layouts retain the
+    # independent (date, side, amount) source multiset and require the final
+    # canonical rows to reproduce it exactly.  Generic text layouts do not
+    # have sufficiently independent cells, so they rely on their stricter raw
+    # record count and per-row source_amount checks instead.
+    source_fingerprint = (
+        source_transaction_fingerprint(rows, header_at, columns)
+        if not generated_canonical_headers(headers) else None
+    )
+    parsed_fingerprint = parsed_transaction_fingerprint(tx) if source_fingerprint is not None else None
+    source_fingerprint_valid = (
+        source_fingerprint is None
+        or (parsed_fingerprint is not None and source_fingerprint == parsed_fingerprint)
+    )
     running = opening
     # Validate each step independently, not just the final reconciliation.
     # This is the user's balance-chain equation rearranged forward.
@@ -4372,6 +4447,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         total_reconciles
         and (running_balance_valid or source_balance_unreliable)
         and source_amount_valid
+        and source_fingerprint_valid
         and no_opening_as_transaction
         and coverage_valid
         and canonical_contract_valid
@@ -4384,6 +4460,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     columns["_balance_endpoint_derived"] = locals().get("endpoint_derived", "none")
     columns["_source_totals_conflict"] = source_totals_conflict
     columns["_canonical_contract_valid"] = canonical_contract_valid
+    columns["_source_record_fingerprint_valid"] = source_fingerprint_valid
     columns["_balance_repaired_from_chain"] = balance_repaired_from_chain
     columns["_monetary_punctuation_repairs"] = punctuation_repairs
     # The original source text is independent evidence.  A narration that cannot
@@ -4707,6 +4784,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             "transaction_count": len(tx),
                             "source_transaction_count": expected_source_count,
                             "source_coverage_pass": bool(coverage_valid),
+                            "source_record_fingerprint_pass": bool(columns.get("_source_record_fingerprint_valid", True)),
                             "canonical_output_contract_pass": bool(columns.get("_canonical_contract_valid")),
                             "date_output_policy": "value_date_priority_dd_mm_yyyy",
                             "printed_totals_conflict": bool(columns.get("_source_totals_conflict")),
@@ -4961,6 +5039,7 @@ def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = 
         "balance_chain_exception": special_balance_exception,
         "manual_review_required": special_balance_exception,
         "source_coverage_pass": bool(coverage_pass),
+        "source_record_fingerprint_pass": bool(columns.get("_source_record_fingerprint_valid", True)),
         "transaction_count": len(tx),
         "source_transaction_count": source_count,
         "statement_totals_pass": bool(totals_pass),
