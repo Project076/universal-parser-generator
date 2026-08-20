@@ -3481,6 +3481,30 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
     except Exception:
         return False
 
+
+def deterministic_strategy_requires_source_proof(path: Path, strategy: str | None) -> bool:
+    """Return whether a deterministic PDF strategy has a native sample proof.
+
+    A full-statement extraction is the expensive operation on a long PDF.  Do
+    not run it merely because a candidate name exists in the retry plan.  The
+    strategies below each have a lightweight, source-native sampler in
+    ``sample_candidate_plausible`` which can prove a header plus dated,
+    amount/balance-bearing record shapes first.  Native spreadsheet/Word/CSV
+    sources are already row-native, so this PDF-only guard deliberately does
+    not add a lossy text sampling step for them.
+    """
+    if path.suffix.lower() != ".pdf":
+        return False
+    return strategy in {
+        "geometry_profile",
+        "source_amount_geometry",
+        "dual_date_geometry",
+        "running_balance_text",
+        "unsigned_running_balance_text",
+        "page_text_unsigned",
+        "value_date_unsigned",
+    }
+
 def extract_dual_date_geometry_rows(path: Path, page_indices: set[int] | None = None) -> list[list[object]]:
     """Read a borderless Post Date / Value Date ledger from original PDF boxes.
 
@@ -5140,14 +5164,23 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     skipped_candidates += 1
                     errors.append(f"{candidate_name}: already failed for this statement")
                     continue
-                # Geometry-based candidates have measurable source evidence
-                # even on a short PDF.  Prove their header/row/amount/balance
-                # shape before paying for a full extraction or AI repair.
-                needs_sample_proof = large_pdf or strategy == "dual_date_geometry"
-                if needs_sample_proof and not force_ai_profile and not sample_candidate_plausible(path, strategy):
+                # Step 21: a deterministic PDF strategy must first prove that
+                # its own measured source shape exists.  This happens on small
+                # PDFs too; a short document is cheaper, but a known-impossible
+                # strategy is still wasted work and misleading retry evidence.
+                # Generic detected-table discovery has no faithful lightweight
+                # sampler, so on a large PDF it is withheld rather than doing
+                # an unbounded full-file table search.  AI is deliberately not
+                # gated here: it receives the measured failure evidence instead.
+                needs_sample_proof = deterministic_strategy_requires_source_proof(path, strategy)
+                unsupported_large_table_scan = large_pdf and strategy is None
+                if (unsupported_large_table_scan or needs_sample_proof) and not force_ai_profile and not sample_candidate_plausible(path, strategy):
                     skipped_candidates += 1
                     failed_strategy_keys.add(strategy_key)
-                    errors.append(f"{candidate_name}: rejected by sampled original-PDF structure")
+                    reason = ("no safe sampled source proof for generic table discovery"
+                              if unsupported_large_table_scan else
+                              "rejected by sampled original-PDF structure")
+                    errors.append(f"{candidate_name}: {reason}")
                     continue
                 with JOBS_LOCK:
                     job = JOBS.get(job_id, {})
