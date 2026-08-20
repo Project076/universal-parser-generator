@@ -1302,6 +1302,12 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
             pass
     if geometry_ready and len(header_fields) >= 4:
         add("geometry_profile", False, 780)
+    # The measured header cells are stronger than a flattened PDF text stream.
+    # A text layer may merge adjacent captions or insert line breaks, whereas
+    # sampled_geometry_profile has preserved the visible column cells.  This
+    # applies to every bank; it is a semantic contract, not a bank template.
+    if path.suffix.lower() == ".pdf" and has_dual_date_header_contract(headers):
+        add("dual_date_geometry", False, 1_300)
 
     for lesson in closest_certified_lessons(path, headers):
         strategy = str(lesson.get("strategy", "detected_table"))
@@ -1340,8 +1346,12 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         # not one bank's exact first-column caption.
         dual_date_header = bool(re.search(
             r"(?is)\b(?:(?:TRANSACTION|TXN|POST(?:ING)?)\s*)?DATE\b[\s\S]{0,100}"
-            r"\bVALUE\s+DATE\b[\s\S]{0,280}\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,100}"
-            r"\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,100}\b(?:RUNNING\s+)?BALANCE\b",
+            r"\bVALUE\s+DATE\b[\s\S]{0,280}\b(?:DEBITS?|WITHDRAWALS?)(?:\b|(?=DEPOSITS?))[\s\S]{0,100}"
+            # Flattened text layers sometimes remove the visual gap between
+            # adjacent headers (``WithdrawalsDeposits``).  The original-PDF
+            # geometry still proves the two bands, so do not let this text
+            # artefact hide an otherwise unambiguous dual-date ledger.
+            r"(?:\s*|(?=DEPOSITS?))\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,100}\b(?:RUNNING\s+)?BALANCE\b",
             sample,
         ))
         if path.suffix.lower() == ".pdf" and dual_date_header:
@@ -2983,7 +2993,10 @@ def extract_dual_date_geometry_rows(path: Path, page_indices: set[int] | None = 
     """
     header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
     rows: list[list[object]] = [header]
-    date_re = re.compile(r"^\d{2}[-/]\d{2}[-/]\d{2,4}$")
+    # Indian bank PDFs commonly display ``01-Apr-2025`` while others use
+    # ``01-04-2025`` or slashes.  All are source dates, provided they are in
+    # the measured Date / Value Date bands below.
+    date_re = re.compile(r"^\d{2}[-/](?:\d{2}|[A-Za-z]{3})[-/]\d{2,4}$")
     with open_pdfplumber(path) as pdf:
         for page_number, page in enumerate(pdf.pages):
             if page_indices is not None and page_number not in page_indices:
@@ -3093,6 +3106,34 @@ def has_standard_geometry_header_contract(raw: str) -> bool:
             return False
         cursor += match.end()
     return True
+
+def has_dual_date_header_contract(headers: list[object]) -> bool:
+    """Recognize a two-date ledger from measured header *cells*.
+
+    Banks may call the first date Transaction/Posting/Booking/Effective Date,
+    while the second may be Value/Settlement Date.  Header spelling is not a
+    reliable parser identity; the required proof is two distinct date cells
+    plus separate debit/credit and balance cells in the measured source grid.
+    """
+    if not headers:
+        return False
+    labels = [norm(header) for header in headers]
+    date_cells = [label for label in labels if "date" in label]
+    has_value_date = any(
+        "value" in label or "settlement" in label or "effective" in label
+        for label in date_cells
+    )
+    has_other_date = any(
+        "value" not in label and "settlement" not in label
+        for label in date_cells
+    )
+    header_fields = map_headers(headers)
+    return (
+        len(date_cells) >= 2
+        and has_value_date
+        and has_other_date
+        and {"withdrawal", "deposit", "balance"}.issubset(header_fields)
+    )
 
 
 def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
