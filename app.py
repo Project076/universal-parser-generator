@@ -1530,9 +1530,28 @@ def saved_text_strategy(path: Path) -> str | None:
         pass
     return None
 
+REPAIR_MODULE_STRATEGIES: dict[str, frozenset[str]] = {
+    # A retry may change only the component disproved by source evidence.  The
+    # strategy is still re-measured from the current source; this map never
+    # imports offsets or executable code from a different bank.
+    "header_mapping": frozenset({"geometry_profile", "source_amount_geometry", "standard_column_geometry"}),
+    "column_geometry": frozenset({"geometry_profile", "source_amount_geometry", "standard_column_geometry", "dual_date_geometry"}),
+    "date_order": frozenset({"dual_date_geometry", "value_date_unsigned", "geometry_profile"}),
+    "continuation": frozenset({"geometry_profile", "standard_column_geometry"}),
+    "narration_coverage": frozenset({"geometry_profile", "standard_column_geometry"}),
+    "page_furniture": frozenset({"geometry_profile", "standard_column_geometry", "page_text_unsigned"}),
+    "source_totals": frozenset({"source_amount_geometry", "geometry_profile", "standard_column_geometry"}),
+    "balance_direction": frozenset({"running_balance_text", "unsigned_running_balance_text", "page_text_unsigned", "geometry_profile"}),
+    "unreliable_balance": frozenset({"running_balance_text", "unsigned_running_balance_text", "page_text_unsigned"}),
+    "endpoint": frozenset({"running_balance_text", "unsigned_running_balance_text", "geometry_profile"}),
+    "transaction_count": frozenset({"geometry_profile", "standard_column_geometry", "source_amount_geometry"}),
+}
+
+
 def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool, validated_strategy: str | None,
                               planned_strategies: list[str], retry_round: int,
-                              include_ai_addendum: bool = True) -> list[tuple[str | None, bool]]:
+                              include_ai_addendum: bool = True,
+                              repair_module: str = "") -> list[tuple[str | None, bool]]:
     """Rank parser candidates from source evidence before parsing the full file.
 
     A candidate is never accepted by score alone.  The score only decides which
@@ -1690,6 +1709,14 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         add(strategy, ai_addendum, 880 - index * 20)
 
     ordered = sorted(scores, key=lambda item: scores[item], reverse=True)
+    # Step 22: after an evidence-led failure, do not recycle candidates merely
+    # because they were useful in another branch of the retry plan.  Only a
+    # strategy that can repair the failed module may earn another full parse.
+    # The AI addendum remains available as the bounded fallback when no
+    # supported deterministic repair is suitable.
+    allowed = REPAIR_MODULE_STRATEGIES.get(str(repair_module))
+    if allowed:
+        ordered = [item for item in ordered if item[1] or item[0] in allowed]
     # A source-proven dual-date ledger must first be tested with its measured
     # Value-Date geometry.  Generic table parsing can collapse the date bands,
     # and an AI call before this test only spends money rediscovering evidence
@@ -5149,6 +5176,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     # based on the first failed extraction.  It is not consumed
                     # by a separate diagnosis-only request.
                     include_ai_addendum=("targeted_repair_profile" not in ai_call_purposes(job_id) and ai_calls_remaining(job_id) > 0),
+                    repair_module=str(prior_investigation.get("failure_type", "")),
                 )
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
