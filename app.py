@@ -1884,12 +1884,17 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
             {"header_row": int(item.get("header_row", -1)), "columns": dict(item.get("columns", {}))}
             for item in prior_maps if isinstance(item, dict)
         ]
-        canonical_identity = header_row == 0 and all(
-            columns.get(name) == index for index, name in enumerate(CANONICAL)
-        )
-        if map_key in previous_keys or (purpose == "targeted_repair_profile" and canonical_identity):
+        # ``rows`` is deliberately normalized into the canonical six-column
+        # transaction grid before this planner sees it.  Therefore a correct
+        # measured source map commonly *is* ``header_row=0`` with columns
+        # ``0..5``.  Treating that shape as intrinsically stale made the AI
+        # reject a valid profile simply because the output contract is
+        # canonical (the date-order jobs exposed this defect).  Only reject an
+        # exact map the AI has already supplied earlier in this job; a first
+        # canonical map must be allowed to reach the normal evidence gates.
+        if map_key in previous_keys:
             record_failure(
-                "AI repair repeated the failed canonical header map instead of proposing a materially new measured source layout."
+                "AI repair repeated an already tested measured header map instead of proposing a new source layout."
             )
             return None
         # Retain the *measured plan*, never source text, so a later retry (and
