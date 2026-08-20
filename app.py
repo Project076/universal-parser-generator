@@ -1289,6 +1289,15 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         else:
             _, sample = load_rows(path)
             sample = sample[:60000]
+        # Common bank ledgers often use business vocabulary such as
+        # ``Transaction Remarks`` and ``Withdrawal Amount`` rather than the
+        # canonical labels.  This complete semantic header contract is direct
+        # source evidence: route it to the measured original-PDF column parser
+        # before generic geometry or an AI layout call.  The parser still has
+        # to pass all normal validation gates; this merely prevents a clearly
+        # tabular statement from being treated as an unknown layout.
+        if path.suffix.lower() == ".pdf" and has_standard_geometry_header_contract(sample):
+            add("standard_column_geometry", False, 1_250)
         if re.search(r"(?i)\bvalue\s+date\b", sample):
             add("value_date_unsigned", False, 520)
         signed_balance_rows = len(re.findall(
@@ -3132,7 +3141,14 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
         measured_rows = extract_standard_column_geometry_rows(path)
         return (measured_rows, raw) if measured_rows else (extract_geometry_profile_rows(path), raw)
     standard_geometry_header = has_standard_geometry_header_contract(raw)
-    if strategy_override is None and standard_geometry_header:
+    # ``standard_column_geometry`` is also a named candidate in the UPG
+    # planning loop.  It must take this exact route when explicitly selected;
+    # otherwise the named candidate falls through to generic table extraction
+    # while automatic parsing uses the measured route.  That discrepancy made
+    # a simple synonym-based ledger look like an AI-only unknown layout.
+    if strategy_override == "standard_column_geometry" or (
+        strategy_override is None and standard_geometry_header
+    ):
         measured_rows = extract_standard_column_geometry_rows(path)
         if measured_rows:
             return measured_rows, raw
