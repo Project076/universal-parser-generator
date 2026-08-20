@@ -1677,6 +1677,7 @@ STEP_NAMES = {
     "layout_match": (33, "EXACT_LAYOUT_MATCH_CONTRACT"),
     "execution_receipt": (34, "REMOTE_EXECUTION_RECEIPT"),
     "execution_failure_evidence": (35, "EXECUTION_FAILURE_EVIDENCE"),
+    "execution_failure_addendum": (36, "EXECUTION_FAILURE_ADDENDUM_ROUTING"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5939,6 +5940,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "layout_match", "certified")
                     record_step_learning(job_id, "execution_receipt", "certified")
                     record_step_learning(job_id, "execution_failure_evidence", "certified")
+                    record_step_learning(job_id, "execution_failure_addendum", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     profile_id = save_profile(
@@ -6251,7 +6253,7 @@ def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = 
         raise ValueError("UPG profile is not certified")
     strategy = str(profile.get("last_validated_strategy") or "geometry_profile")
     result = parse_statement(path, fallback_open, fallback_close, strategy)
-    tx, opening, closing, total_w, total_d, computed, financial_pass, narration_pass, unmatched, _headers, columns, _parent, coverage_pass, source_count, _fingerprint, declared_wd, declared_dp, totals_pass = result
+    tx, opening, closing, total_w, total_d, computed, financial_pass, narration_pass, unmatched, _headers, columns, _parent, coverage_pass, source_count, source_fingerprint, declared_wd, declared_dp, totals_pass = result
     special_balance_exception = bool(columns.get("_source_balance_unreliable"))
     source_record_pass = bool(columns.get("_source_record_fingerprint_valid", True))
     execution_pass = bool(financial_pass and narration_pass and coverage_pass and source_record_pass)
@@ -6288,6 +6290,20 @@ def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = 
             blocked_step = "narration_coverage"
         else:
             blocked_step = "endpoint"
+        repair_subject = {
+            "parent_profile_id": profile_id,
+            "parent_profile_version": int(profile.get("version", 1)),
+            "source_layout_fingerprint": str(source_fingerprint or ""),
+            "blocked_pipeline_step": pipeline_step_key(blocked_step),
+            "failed_gates": failed_gates,
+            "mode": "addendum_only",
+            "preserve_parent_profile": True,
+            "allowed_change_scope": ["new-source geometry", "new-source header contract", pipeline_step_key(blocked_step)],
+            "disallowed_change_scope": ["replace parent parser", "alter parent profile", "copy source transactions"],
+        }
+        repair_subject["repair_request_id"] = hashlib.sha256(
+            json.dumps(repair_subject, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:24]
         return {
             "ok": False,
             "profile_id": profile_id,
@@ -6301,6 +6317,13 @@ def execute_certified_profile(profile_id: str, path: Path, fallback_open: str = 
                 "repair_policy": "additive_step_specific_repair",
                 "action": "submit_targeted_upg_repair",
                 "balance_chain_exception": special_balance_exception,
+            },
+            # Step 36 is deliberately an addendum handoff.  A certified
+            # parent remains reusable for its original layout; only a new,
+            # source-scoped variant may be engineered and certified.
+            "repair_request": {
+                "step": pipeline_step_key("execution_failure_addendum"),
+                **repair_subject,
             },
         }
     def output_row(row: dict) -> dict:
