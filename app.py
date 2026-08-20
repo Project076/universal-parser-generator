@@ -2289,8 +2289,12 @@ REPAIR_MODULE_STRATEGIES: dict[str, frozenset[str]] = {
     "date_order": frozenset({"dual_date_geometry", "value_date_unsigned", "geometry_profile"}),
     "bf_summary": frozenset({"geometry_profile", "page_text_unsigned"}),
     "classification": frozenset({"source_amount_geometry", "running_balance_text", "unsigned_running_balance_text"}),
-    "continuation": frozenset({"geometry_profile", "standard_column_geometry"}),
-    "narration_coverage": frozenset({"geometry_profile", "standard_column_geometry"}),
+    # Narration failures are not column-map failures.  Try the independently
+    # measured strict-date-boundary assembly before asking an agent to move
+    # columns.  It attaches undated Particulars fragments only to the dated
+    # row immediately above them, rather than splitting them by a midpoint.
+    "continuation": frozenset({"narration_geometry"}),
+    "narration_coverage": frozenset({"narration_geometry"}),
     "page_furniture": frozenset({"geometry_profile", "standard_column_geometry", "page_text_unsigned"}),
     "source_totals": frozenset({"source_amount_geometry", "geometry_profile", "standard_column_geometry"}),
     "balance_direction": frozenset({"running_balance_text", "unsigned_running_balance_text", "page_text_unsigned", "geometry_profile"}),
@@ -2305,6 +2309,7 @@ REPAIR_MODULE_STRATEGIES: dict[str, frozenset[str]] = {
 # These are capability families, not bank names or remembered coordinates.
 STRATEGY_CAPABILITY_COVERAGE: dict[str, frozenset[str]] = {
     "geometry_profile": frozenset({"header_mapping", "column_geometry", "narration", "furniture", "bf_preperiod_artifact"}),
+    "narration_geometry": frozenset({"narration", "continuation", "furniture"}),
     "standard_column_geometry": frozenset({"header_mapping", "column_geometry", "narration", "furniture"}),
     "source_amount_geometry": frozenset({"header_mapping", "column_geometry", "amounts", "balance"}),
     "dual_date_geometry": frozenset({"value_date", "date_order", "column_geometry"}),
@@ -3407,7 +3412,7 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
     scoped_failure_type = failure_type_from_evidence(failure)
     learning_packet = compact_ai_learning_packet(source_path, raw=raw, failure_type=scoped_failure_type)
     allowed_rules = list(learning_packet.get("allowed_rule_modules", {}).keys())
-    safe_strategies = ["geometry_profile", "source_amount_geometry", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"]
+    safe_strategies = ["narration_geometry", "geometry_profile", "source_amount_geometry", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "rules": {"type": "array", "items": {"type": "string", "enum": allowed_rules}, "maxItems": 5},
         "strategies": {"type": "array", "items": {"type": "string", "enum": safe_strategies}, "maxItems": 4},
@@ -3554,6 +3559,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
             failure_type, profile_action = "continuation", "repair_continuations"
             for name in ("narration_source_cell", "continuation_merge", "multi_page_continuation", "footer_exclusion"):
                 add_rule(name)
+            add_strategy("narration_geometry")
             add_strategy("geometry_profile")
         elif '"financial_pass":false' in evidence:
             failure_type, profile_action = "endpoint", "repair_balance_direction"
@@ -3603,6 +3609,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         failure_type, profile_action = "narration_coverage", "repair_continuations"
         for name in ("narration_source_cell", "continuation_merge", "multi_page_continuation", "footer_exclusion"):
             add_rule(name)
+        add_strategy("narration_geometry")
         add_strategy("geometry_profile")
         return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
                 "upstream_steps": upstream_steps or [failure_type],
@@ -3641,6 +3648,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         failure_type, profile_action = "continuation", "repair_continuations"
         for name in ("continuation_merge", "multi_page_continuation", "footer_exclusion", "terminal_row_before_summary"):
             add_rule(name)
+        add_strategy("narration_geometry")
         add_strategy("geometry_profile")
     elif any(token in evidence for token in ("date", "value date", "out-of-fy", "out of fy", "reverse order")):
         failure_type, profile_action = "date_order", "repair_date_order"
@@ -3789,6 +3797,7 @@ def final_certification_audit(validation: dict[str, object], receipt: dict[str, 
 # always measured again from its own source before a strategy is run.
 TARGETED_REPAIR_STRATEGIES = frozenset({
     "geometry_profile",
+    "narration_geometry",
     "source_amount_geometry",
     "dual_date_geometry",
     "value_date_unsigned",
@@ -4561,7 +4570,8 @@ def extract_ocr_geometry_rows(path: Path, page_numbers: set[int] | None = None) 
     return rows
 
 
-def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = None) -> list[list[object]]:
+def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = None,
+                                  narration_mode: str = "midpoint") -> list[list[object]]:
     """Apply sampled column bands without table rediscovery.
 
     `page_numbers` is a zero-based representative-page set used for fast
@@ -4660,9 +4670,17 @@ def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = No
                         # transaction anchors.  This preserves ordinary
                         # continuation lines while putting above-date
                         # particulars on their actual transaction.
-                        midpoint = ((current_top or line_top) + line_top) / 2
-                        prior = [(top, fragment) for top, fragment in pending_fragments if top <= midpoint]
-                        following = [(top, fragment) for top, fragment in pending_fragments if top > midpoint]
+                        if narration_mode == "strict_prior":
+                            # S07 narration-boundary addendum: a fragment
+                            # without a new valid Date-column value is a
+                            # continuation of the preceding dated row.  This
+                            # is deliberately a separate measured candidate,
+                            # not an assumption or a changed column map.
+                            prior, following = pending_fragments, []
+                        else:
+                            midpoint = ((current_top or line_top) + line_top) / 2
+                            prior = [(top, fragment) for top, fragment in pending_fragments if top <= midpoint]
+                            following = [(top, fragment) for top, fragment in pending_fragments if top > midpoint]
                         append_fragments(current, prior)
                         rows.append(current)
                         append_fragments(cells, following)
@@ -4722,11 +4740,13 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
     try:
         count = len(open_pdf_reader(path).pages)
         samples = set(sampled_page_indices(count))
-        if strategy in {"geometry_profile", "source_amount_geometry", "dual_date_geometry"}:
+        if strategy in {"geometry_profile", "narration_geometry", "source_amount_geometry", "dual_date_geometry"}:
             if strategy == "source_amount_geometry":
                 rows = extract_standard_column_geometry_rows(path)
             elif strategy == "dual_date_geometry":
                 rows = extract_dual_date_geometry_rows(path, samples)
+            elif strategy == "narration_geometry":
+                rows = extract_geometry_profile_rows(path, samples, narration_mode="strict_prior")
             else:
                 rows = extract_geometry_profile_rows(path, samples)
         else:
@@ -4779,6 +4799,7 @@ def deterministic_strategy_requires_source_proof(path: Path, strategy: str | Non
         return False
     return strategy in {
         "geometry_profile",
+        "narration_geometry",
         "source_amount_geometry",
         "dual_date_geometry",
         "running_balance_text",
@@ -5270,6 +5291,10 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
     known_header: list[object] | None = None
     if strategy_override == "geometry_profile":
         return extract_geometry_profile_rows(path), raw
+    if strategy_override == "narration_geometry":
+        # S07 narration-boundary repair.  Keep the same original-PDF column
+        # bands and change only how undated Particulars fragments are joined.
+        return extract_geometry_profile_rows(path, narration_mode="strict_prior"), raw
     if strategy_override == "source_amount_geometry":
         # The engine selected this only after evidence of an unreliable balance
         # chain.  Preserve the separately printed debit/credit movements from
@@ -5960,7 +5985,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # provable chain may be used *only* as an internal validation sequence. It
     # must never reorder, delete, or alter the source transaction rows.
     validation_chain = ledger_sequence
-    if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
+    if effective_strategy in ("geometry_profile", "narration_geometry", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
         reconstructed = reconstruct_unordered_balance_chain(tx, opening, closing)
         # In an unordered statement, the first displayed row is not reliable
         # opening evidence. A printed Grand Total can instead derive opening,
@@ -6144,7 +6169,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # even though this J&K layout has no table borders or reusable headers.
     # Reserve that expensive structural check for a geometry/table candidate.
     table_count = None
-    if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
+    if effective_strategy in ("geometry_profile", "narration_geometry", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
         table_count = structured_source_count(path)
         if table_count is not None:
             expected_source_count = table_count
@@ -6282,7 +6307,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # It remains gated by complete records, source amounts and the measured
     # narration column; it never applies to generic text-layout parsing.
     coordinate_trace_valid = (
-        effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry")
+        effective_strategy in ("geometry_profile", "narration_geometry", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry")
         and path.suffix.lower() == ".pdf"
         and coverage_valid
         and source_amount_valid
@@ -6660,13 +6685,36 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                 blocked_type = str(prior_investigation.get("failure_type", "") or "")
                 if blocked_type:
                     repair_calls = set(ai_call_purposes(job_id))
-                    candidates = [(None, True)] if (
-                        ai_calls_remaining(job_id) > 0
-                        and (
-                            "targeted_repair_profile" not in repair_calls
-                            or "targeted_repair_revision" not in repair_calls
-                        )
-                    ) else []
+                    # A narration-boundary failure is not repairable by
+                    # asking the model for another header map.  Use the one
+                    # remaining expert call, if any, only to select/add rules
+                    # inside S07; the deterministic strict-boundary candidate
+                    # above is the only executable change to source rows.
+                    if blocked_type in {"continuation", "narration_coverage", "page_furniture"}:
+                        if ai_calls_remaining(job_id) > 0 and "targeted_repair_plan" not in repair_calls:
+                            module_plan = ai_diagnose_failure(diagnostic_evidence, repair_context, path, job_id)
+                            diagnostic_rules.update(str(rule) for rule in module_plan.get("rules", [])
+                                                    if str(rule) in DIAGNOSTIC_RULE_LIBRARY)
+                            targeted_repair_history.append({
+                                "failure_type": blocked_type,
+                                "profile_action": module_plan.get("profile_action", "reject_unsafe"),
+                                "rules": module_plan.get("rules", []),
+                                "strategies": module_plan.get("strategies", []),
+                            })
+                            record_step_learning(job_id, blocked_type, "agent_module_addendum", module_plan.get("rules", []))
+                            patch_job(job_id, message=(
+                                "UPG completed a narration-module review. Its measured narration-boundary "
+                                "addendum was already tested; no unrelated column map will be tried."
+                            ))
+                        candidates = []
+                    else:
+                        candidates = [(None, True)] if (
+                            ai_calls_remaining(job_id) > 0
+                            and (
+                                "targeted_repair_profile" not in repair_calls
+                                or "targeted_repair_revision" not in repair_calls
+                            )
+                        ) else []
                     if not candidates:
                         empty_ai_diagnoses = max(empty_ai_diagnoses, 1)
                         patch_job(job_id, message=(
