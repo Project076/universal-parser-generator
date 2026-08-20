@@ -1547,6 +1547,20 @@ REPAIR_MODULE_STRATEGIES: dict[str, frozenset[str]] = {
     "transaction_count": frozenset({"geometry_profile", "standard_column_geometry", "source_amount_geometry"}),
 }
 
+# A strategy can address more than one structural capability, but UPG should
+# not pay for two full parses that both solve exactly the same observed need.
+# These are capability families, not bank names or remembered coordinates.
+STRATEGY_CAPABILITY_COVERAGE: dict[str, frozenset[str]] = {
+    "geometry_profile": frozenset({"header_mapping", "column_geometry", "narration", "furniture", "bf_preperiod_artifact"}),
+    "standard_column_geometry": frozenset({"header_mapping", "column_geometry", "narration", "furniture"}),
+    "source_amount_geometry": frozenset({"header_mapping", "column_geometry", "amounts", "balance"}),
+    "dual_date_geometry": frozenset({"value_date", "date_order", "column_geometry"}),
+    "value_date_unsigned": frozenset({"value_date", "date_order", "balance"}),
+    "running_balance_text": frozenset({"signed_balance_text", "balance", "endpoint"}),
+    "unsigned_running_balance_text": frozenset({"balance_delta", "balance", "endpoint"}),
+    "page_text_unsigned": frozenset({"furniture", "continuation", "balance", "endpoint"}),
+}
+
 
 def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool, validated_strategy: str | None,
                               planned_strategies: list[str], retry_round: int,
@@ -1558,6 +1572,7 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
     small set earns a full-document extraction and the normal release gates.
     """
     scores: dict[tuple[str | None, bool], int] = {}
+    source_capabilities: set[str] = set()
     def add(strategy: str | None, ai_addendum: bool, score: int) -> None:
         key = (strategy, ai_addendum)
         scores[key] = max(scores.get(key, -10_000), score)
@@ -1675,6 +1690,8 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         # Promote only the extraction family proved by this source's features;
         # never borrow another bank's offsets or executable parser code.
         for capability in source_capability_plan(sample, headers):
+            if isinstance(capability, dict) and capability.get("capability"):
+                source_capabilities.add(str(capability["capability"]))
             strategy = capability.get("preferred_strategy")
             if isinstance(strategy, str) and strategy:
                 # A capability is emitted only when the *uploaded source*
@@ -1734,7 +1751,32 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
     # blueprint as the third candidate whenever budget permits. A saved
     # strategy is only a reusable hypothesis; if it is wrong for this variant,
     # it must never suppress fresh measured-layout planning.
-    selected = ordered[:2]
+    # Step 23: choose the smallest high-evidence deterministic bundle that
+    # covers distinct *observed* source needs.  Previously two nearly
+    # identical geometry candidates could be selected simply because they had
+    # adjacent scores. This preserves quality—the later release gates are
+    # unchanged—while avoiding duplicate full-document work and AI calls.
+    selected: list[tuple[str | None, bool]] = []
+    covered: set[str] = set()
+    deterministic = [item for item in ordered if not item[1]]
+    for item in deterministic:
+        strategy = item[0]
+        capabilities = STRATEGY_CAPABILITY_COVERAGE.get(str(strategy), frozenset())
+        gain = (capabilities & source_capabilities) - covered
+        if not selected or gain:
+            selected.append(item)
+            covered.update(capabilities)
+        if len(selected) >= 2:
+            break
+    # Some simple statements advertise no specialized capability. Preserve a
+    # second evidence-ranked fallback in that case, but never duplicate a
+    # strategy already chosen.
+    if len(selected) < 2:
+        for item in deterministic:
+            if item not in selected:
+                selected.append(item)
+            if len(selected) >= 2:
+                break
     ai_key = (None, True)
     if include_ai_addendum and ai_key not in selected and ai_key in scores:
         selected.append(ai_key)
