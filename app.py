@@ -5943,6 +5943,15 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "execution_failure_addendum", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
+                    # An execution-repair request may contribute a certified
+                    # parent only as immutable lineage.  It never injects the
+                    # parent's coordinates or replaces the source's measured
+                    # layout; this remains a new, independently certified
+                    # addendum.
+                    addendum_context = job_context.get("addendum_context", {})
+                    requested_parent = str(addendum_context.get("parent_profile_id", "")) if isinstance(addendum_context, dict) else ""
+                    if requested_parent and api_profile_payload(requested_parent):
+                        parent_profile = requested_parent
                     profile_id = save_profile(
                         headers, columns, parent_profile, strategy or "detected_table", force_ai_profile,
                         layout_fingerprint, sorted(diagnostic_rules),
@@ -6488,7 +6497,7 @@ class App(BaseHTTPRequestHandler):
             filename = re.search(br'filename="([^"]*)"', head)
             fields[key] = (filename.group(1).decode(errors="ignore"), value) if filename else value.decode(errors="replace")
         return fields
-    def start_api_job(self, fields: dict) -> str:
+    def start_api_job(self, fields: dict, addendum_context: dict | None = None) -> str:
         if "file" not in fields:
             raise ValueError("file is required")
         filename, content = fields["file"]
@@ -6500,7 +6509,7 @@ class App(BaseHTTPRequestHandler):
         opening = fields.get("ob", fields.get("opening", ""))
         closing = fields.get("cb", fields.get("closing", ""))
         with JOBS_LOCK:
-            JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": timestamp_now(), "client_heartbeat_at": timestamp_now(), "bs_analyzer_statement_id": fields.get("bs_analyzer_statement_id"), "bank_name": fields.get("bank_name", "Unknown"), "source_format": fields.get("source_format", ""), "source_file": saved.name, "fallback_open": opening, "fallback_close": closing, "password_provided": bool(fields.get("password", fields.get("pdf_password", "")))}
+            JOBS[job_id] = {"processing": True, "valid": False, "status": "pending", "message": "UPG is creating and validating parser candidates.", "submitted_at": timestamp_now(), "client_heartbeat_at": timestamp_now(), "bs_analyzer_statement_id": fields.get("bs_analyzer_statement_id"), "bank_name": fields.get("bank_name", "Unknown"), "source_format": fields.get("source_format", ""), "source_file": saved.name, "fallback_open": opening, "fallback_close": closing, "password_provided": bool(fields.get("password", fields.get("pdf_password", ""))), "addendum_context": dict(addendum_context or {})}
             persist_job_locked(job_id)
         # Return the accepted job before CPU-heavy PDF work enters the queue.
         defer_retry_job(job_id, saved, opening, closing)
@@ -6643,6 +6652,40 @@ class App(BaseHTTPRequestHandler):
                     code = "invalid_job_submission"
                 print(f"UPG parser-job rejected: {code}", flush=True)
                 self.json({"error": detail, "code": code}, HTTPStatus.BAD_REQUEST)
+            return
+        repair_match = re.fullmatch(r"/parser-profiles/([^/]+)/repair", path)
+        if repair_match:
+            if not self.api_authorized(): return
+            parent_profile_id = repair_match.group(1)
+            try:
+                # The repair endpoint accepts the same original file payload
+                # as a normal job, but its only authority is a source-scoped
+                # addendum linked to an existing certified parent.
+                parent_profile = api_profile_payload(parent_profile_id)
+                if not parent_profile:
+                    raise ValueError("Certified parent profile was not found or is not executable")
+                fields = self.multipart_fields()
+                blocked_step = str(fields.get("blocked_pipeline_step", "")).strip()
+                if blocked_step and not re.fullmatch(r"S\d{2}_[A-Z0-9_]+", blocked_step):
+                    raise ValueError("blocked_pipeline_step must be a named UPG pipeline step")
+                repair_context = {
+                    "step": pipeline_step_key("execution_failure_addendum"),
+                    "parent_profile_id": parent_profile_id,
+                    "parent_profile_version": int(parent_profile.get("version", 1)),
+                    "repair_request_id": str(fields.get("repair_request_id", "")).strip(),
+                    "blocked_pipeline_step": blocked_step or pipeline_step_key("execution_failure_evidence"),
+                    "mode": "addendum_only",
+                    "preserve_parent_profile": True,
+                }
+                job_id = self.start_api_job(fields, repair_context)
+                record_step_learning(job_id, "execution_failure_addendum", "pending")
+                patch_job(job_id, message=(
+                    "UPG is engineering a source-scoped addendum; the certified parent profile remains unchanged."
+                ))
+                self.json({"job_id": job_id, "parent_profile_id": parent_profile_id,
+                           "repair_request": repair_context}, HTTPStatus.ACCEPTED)
+            except Exception as error:
+                self.json({"error": str(error), "code": "invalid_addendum_request"}, HTTPStatus.BAD_REQUEST)
             return
         if path == "/parser-profiles/import":
             if not self.api_authorized(): return
