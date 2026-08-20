@@ -1333,9 +1333,15 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         # this *before* the general standard-table candidate: text-table
         # extraction can merge the two date bands and then incorrectly report
         # a date-order defect, even though the visual source is unambiguous.
+        # Banks label the first date band as Date, Transaction Date, Posting
+        # Date, Post Date, or Txn Date.  Requiring the words "TXN" or "POST"
+        # made a visibly dual-date ledger fall through to generic parsing.
+        # Require the full surrounding money/balance contract as the guard,
+        # not one bank's exact first-column caption.
         dual_date_header = bool(re.search(
-            r"(?is)\b(?:TXN|POST(?:ING)?)\s+DATE\b[\s\S]{0,80}\bVALUE\s+DATE\b[\s\S]{0,240}"
-            r"\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,80}\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,80}\bBALANCE\b",
+            r"(?is)\b(?:(?:TRANSACTION|TXN|POST(?:ING)?)\s*)?DATE\b[\s\S]{0,100}"
+            r"\bVALUE\s+DATE\b[\s\S]{0,280}\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,100}"
+            r"\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,100}\b(?:RUNNING\s+)?BALANCE\b",
             sample,
         ))
         if path.suffix.lower() == ".pdf" and dual_date_header:
@@ -1403,6 +1409,19 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         add(strategy, ai_addendum, 880 - index * 20)
 
     ordered = sorted(scores, key=lambda item: scores[item], reverse=True)
+    # A source-proven dual-date ledger must first be tested with its measured
+    # Value-Date geometry.  Generic table parsing can collapse the date bands,
+    # and an AI call before this test only spends money rediscovering evidence
+    # we already have.  If it fails, the next retry can diagnose that exact
+    # failed module using the retained evidence.
+    dual_key = ("dual_date_geometry", False)
+    if retry_round == 1 and dual_key in scores:
+        selected = [dual_key]
+        fallback = next((item for item in ordered
+                         if item != dual_key and not item[1]), None)
+        if fallback is not None:
+            selected.append(fallback)
+        return selected
     # Two strong evidence-led candidates normally suffice. Keep the first AI
     # blueprint as the third candidate whenever budget permits. A saved
     # strategy is only a reusable hypothesis; if it is wrong for this variant,
@@ -3276,8 +3295,9 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
     # This is deliberately based on the complete transaction header contract,
     # not on a bank name or a one-off statement fingerprint.
     dual_date_geometry_header = bool(re.search(
-        r"(?is)\b(?:TXN|POST(?:ING)?)\s+DATE\b[\s\S]{0,80}\bVALUE\s+DATE\b[\s\S]{0,240}"
-        r"\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,80}\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,80}\bBALANCE\b",
+        r"(?is)\b(?:(?:TRANSACTION|TXN|POST(?:ING)?)\s*)?DATE\b[\s\S]{0,100}"
+        r"\bVALUE\s+DATE\b[\s\S]{0,280}\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,100}"
+        r"\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,100}\b(?:RUNNING\s+)?BALANCE\b",
         raw,
     ))
     # Prefer this route even where the header also meets the ordinary
@@ -3672,8 +3692,9 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         effective_strategy is None
         and path.suffix.lower() == ".pdf"
         and re.search(
-            r"(?is)\b(?:TXN|POST(?:ING)?)\s+DATE\b[\s\S]{0,80}\bVALUE\s+DATE\b[\s\S]{0,240}"
-            r"\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,80}\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,80}\bBALANCE\b",
+        r"(?is)\b(?:(?:TRANSACTION|TXN|POST(?:ING)?)\s*)?DATE\b[\s\S]{0,100}"
+        r"\bVALUE\s+DATE\b[\s\S]{0,280}\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,100}"
+        r"\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,100}\b(?:RUNNING\s+)?BALANCE\b",
             raw,
         )
     ):
