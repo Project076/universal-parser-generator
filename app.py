@@ -114,6 +114,10 @@ EXTRACTION_CACHE_LOCK = threading.Lock()
 PDF_TEXT_CACHE: dict[str, str] = {}
 PDF_SAMPLE_CACHE: dict[str, str] = {}
 PDF_GEOMETRY_PROFILE_CACHE: dict[str, tuple[list[object], list[tuple[float, float]]] | None] = {}
+# A candidate's original-source plausibility is immutable for one uploaded
+# file. Retain the tiny boolean result so retries never re-extract the same
+# representative pages merely to rediscover that a strategy cannot fit.
+CANDIDATE_SAMPLE_PROOF_CACHE: dict[tuple[str, str], bool] = {}
 # The same source page may be measured with a secondary Tesseract layout mode
 # when the normal table mode misses date anchors.  Include the mode in the
 # cache key so a recovery pass can never overwrite the primary geometry.
@@ -3535,9 +3539,14 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
     """
     if path.suffix.lower() != ".pdf":
         return True
-    count = len(open_pdf_reader(path).pages)
-    samples = set(sampled_page_indices(count))
+    key = (str(path.resolve()), strategy or "detected_table")
+    with EXTRACTION_CACHE_LOCK:
+        cached = CANDIDATE_SAMPLE_PROOF_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
+        count = len(open_pdf_reader(path).pages)
+        samples = set(sampled_page_indices(count))
         if strategy in {"geometry_profile", "source_amount_geometry", "dual_date_geometry"}:
             if strategy == "source_amount_geometry":
                 rows = extract_standard_column_geometry_rows(path)
@@ -3556,22 +3565,28 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
             else:
                 # Table rediscovery is intentionally not run on every page of
                 # a large PDF. Geometry/AI candidates are stronger evidence.
-                return False
+                rows = []
         fields = map_headers(rows[0]) if rows else {}
         if len(rows) < 3 or not {"date", "withdrawal", "deposit", "balance"}.issubset(fields):
-            return False
-        date_index = fields["date"]
-        balance_index = fields["balance"]
-        dated_rows = [row for row in rows[1:] if transaction_date_value(row[date_index] if date_index < len(row) else "")]
-        # This is only a cheap source-shape gate. Full source coverage,
-        # narration, financial and balance-chain validation still decide
-        # certification after the complete extraction.
-        return len(dated_rows) >= 2 and all(
-            balance_index < len(row) and money(row[balance_index]) is not None
-            for row in dated_rows
-        )
+            result = False
+        else:
+            date_index = fields["date"]
+            balance_index = fields["balance"]
+            dated_rows = [row for row in rows[1:] if transaction_date_value(row[date_index] if date_index < len(row) else "")]
+            # This is only a cheap source-shape gate. Full source coverage,
+            # narration, financial and balance-chain validation still decide
+            # certification after the complete extraction.
+            result = len(dated_rows) >= 2 and all(
+                balance_index < len(row) and money(row[balance_index]) is not None
+                for row in dated_rows
+            )
     except Exception:
-        return False
+        result = False
+    with EXTRACTION_CACHE_LOCK:
+        if len(CANDIDATE_SAMPLE_PROOF_CACHE) >= 72:
+            CANDIDATE_SAMPLE_PROOF_CACHE.pop(next(iter(CANDIDATE_SAMPLE_PROOF_CACHE)))
+        CANDIDATE_SAMPLE_PROOF_CACHE[key] = result
+    return result
 
 
 def deterministic_strategy_requires_source_proof(path: Path, strategy: str | None) -> bool:
