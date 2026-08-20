@@ -346,9 +346,9 @@ FIVE_MINUTES_MS = 300000
 # the reasoning capability available for unfamiliar layouts.
 AI_MODEL = os.environ.get("UPG_AI_MODEL", "gpt-5.6-sol")
 try:
-    AI_MAX_OUTPUT_TOKENS = min(1_200, max(250, int(os.environ.get("UPG_AI_MAX_OUTPUT_TOKENS", "550"))))
+    AI_MAX_OUTPUT_TOKENS = min(1_200, max(250, int(os.environ.get("UPG_AI_MAX_OUTPUT_TOKENS", "750"))))
 except ValueError:
-    AI_MAX_OUTPUT_TOKENS = 550
+    AI_MAX_OUTPUT_TOKENS = 750
 try:
     # One layout plan and, only if needed, one evidence-led repair diagnosis.
     # Deterministic profiles/validation do not consume this allowance.
@@ -3157,9 +3157,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            result = json.loads(response.read().decode("utf-8-sig"))
-        generated = response_schema_object(result)
+        generated = request_openai_schema(request, job_id, purpose)
         header_row = int(generated["header_row"])
         columns = {name: int(index) for name, index in generated["columns"].items() if int(index) >= 0}
         if not (0 <= header_row < len(rows)):
@@ -3254,6 +3252,40 @@ def response_schema_object(result: object) -> dict:
     reason = str(incomplete.get("reason") or "no schema object") if isinstance(incomplete, dict) else "no schema object"
     raise ValueError(f"OpenAI returned no usable schema object (status={status}, reason={reason}).")
 
+def request_openai_schema(request: urllib.request.Request, job_id: str | None, purpose: str) -> dict:
+    """Make one logical AI decision, tolerating one malformed provider reply.
+
+    An incomplete Responses API payload is not evidence that a parser layout is
+    wrong.  Retrying it once with the same measured evidence is safer than
+    burning the job's final targeted-repair decision and reporting a parser
+    failure.  The retry is deliberately limited to one and is recorded
+    separately from the two logical expert decisions per job.
+    """
+    for provider_attempt in range(2):
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                result = json.loads(response.read().decode("utf-8-sig"))
+            return response_schema_object(result)
+        except (ValueError, json.JSONDecodeError) as error:
+            retryable = (
+                isinstance(error, json.JSONDecodeError)
+                or "no usable schema object" in str(error).lower()
+            )
+            if not retryable or provider_attempt:
+                raise
+            if job_id:
+                with JOBS_LOCK:
+                    job = JOBS.get(job_id, {})
+                    retries = list(job.get("ai_provider_response_retries", []))[-4:]
+                    retries.append({"purpose": purpose, "reason": safe_openai_error(error)[:220]})
+                    job["ai_provider_response_retries"] = retries
+                    JOBS[job_id] = job
+                    persist_job_locked(job_id)
+            # The first response had no schema object; it was not a tested
+            # parser candidate.  Retry once, never in an unbounded loop.
+            continue
+    raise ValueError("OpenAI returned no usable schema object after one controlled retry.")
+
 def ai_choose_text_strategy(raw: str, job_id: str | None = None) -> str | None:
     """Let the parser-generator select a supported extraction path for a new layout."""
     key = os.environ.get("OPENAI_API_KEY")
@@ -3293,6 +3325,9 @@ def safe_openai_error(error: Exception) -> str:
         return f"OpenAI HTTP {error.code}" + (f": {message}" if message else ".")
     if isinstance(error, urllib.error.URLError):
         return f"OpenAI network error: {type(error.reason).__name__}."
+    if isinstance(error, ValueError):
+        detail = re.sub(r"\s+", " ", str(error)).strip()[:220]
+        return "OpenAI response error" + (f": {detail}" if detail else ".")
     return f"OpenAI response error: {type(error).__name__}."
 
 def failure_type_from_evidence(failure: str) -> str:
