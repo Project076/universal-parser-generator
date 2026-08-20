@@ -3040,12 +3040,21 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     # map* from the measured failure evidence--not merely diagnose it.
     prior_purposes = ai_call_purposes(job_id)
     repair_failure = failure_type_from_evidence(repair_context) if repair_context else "column_geometry"
-    purpose = "targeted_repair_profile" if (
-        job_id and repair_context and (
-            "layout_blueprint" in prior_purposes
-            or "deterministic_geometry_preflight" in prior_purposes
+    if job_id and repair_context and (
+        "layout_blueprint" in prior_purposes
+        or "deterministic_geometry_preflight" in prior_purposes
+    ):
+        # A first targeted map that has genuinely been executed but fails a
+        # source-proof gate must get one *different* evidence-led revision.
+        # Do not call the model repeatedly: this is the single final AI call
+        # for the job and it receives the exact failed-row/count evidence.
+        purpose = (
+            "targeted_repair_revision"
+            if "targeted_repair_profile" in prior_purposes
+            else "targeted_repair_profile"
         )
-    ) else "layout_blueprint"
+    else:
+        purpose = "layout_blueprint"
     # A complete semantic PDF ledger header is already stronger evidence than
     # an LLM's generic 0..5 column map.  Previously we spent the first AI call
     # asking it to rediscover that obvious map, then rejected the repeated
@@ -3092,7 +3101,39 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     prior_maps: list[dict] = []
     if job_id:
         with JOBS_LOCK:
-            prior_maps = list(JOBS.get(job_id, {}).get("ai_layout_maps", []))[-2:]
+            job_snapshot = dict(JOBS.get(job_id, {}))
+            prior_maps = list(job_snapshot.get("ai_layout_maps", []))[-2:]
+        # A measured AI map is useful only if it has actually reached the
+        # normal parser and validation gates.  A worker hand-off or transient
+        # exception could previously leave a map recorded as "known", then
+        # make a later retry reject the map as a duplicate without ever
+        # testing it.  Replay that unexecuted map once, without another API
+        # call, so the job records real candidate evidence.  It is still
+        # rejected unless all normal gates pass.
+        if (
+            purpose == "targeted_repair_profile"
+            and prior_maps
+            and str(job_snapshot.get("ai_layout_map_execution_state", ""))
+            not in {"running", "tested"}
+        ):
+            prior = prior_maps[-1]
+            try:
+                replay_header = int(prior["header_row"])
+                replay_columns = {
+                    name: int(index)
+                    for name, index in dict(prior.get("columns", {})).items()
+                    if name in CANONICAL and int(index) >= 0
+                }
+            except (KeyError, TypeError, ValueError):
+                replay_header, replay_columns = -1, {}
+            if 0 <= replay_header < len(rows) and len(replay_columns) >= 3:
+                patch_job(
+                    job_id,
+                    ai_layout_map_execution_state="running",
+                    ai_layout_map_replayed=True,
+                    ai_layout_error="",
+                )
+                return replay_header, replay_columns
     evidence = {"rows": rows[:18], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context[-1800:],
                 "previous_failed_layout_maps": prior_maps,
                 "upg_learning": compact_ai_learning_packet(source_path, rows[0] if rows else None, raw, repair_failure)}
@@ -6537,9 +6578,13 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                 # gets one narrowly scoped agent addendum, or the job stops.
                 blocked_type = str(prior_investigation.get("failure_type", "") or "")
                 if blocked_type:
+                    repair_calls = set(ai_call_purposes(job_id))
                     candidates = [(None, True)] if (
-                        "targeted_repair_profile" not in ai_call_purposes(job_id)
-                        and ai_calls_remaining(job_id) > 0
+                        ai_calls_remaining(job_id) > 0
+                        and (
+                            "targeted_repair_profile" not in repair_calls
+                            or "targeted_repair_revision" not in repair_calls
+                        )
                     ) else []
                     if not candidates:
                         empty_ai_diagnoses = max(empty_ai_diagnoses, 1)
@@ -6550,7 +6595,13 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                 else:
                     candidates = evidence_first_candidates(
                         path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number,
-                        include_ai_addendum=("targeted_repair_profile" not in ai_call_purposes(job_id) and ai_calls_remaining(job_id) > 0),
+                        include_ai_addendum=(
+                            ai_calls_remaining(job_id) > 0
+                            and (
+                                "targeted_repair_profile" not in ai_call_purposes(job_id)
+                                or "targeted_repair_revision" not in ai_call_purposes(job_id)
+                            )
+                        ),
                     )
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
@@ -6598,7 +6649,15 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     })
                     JOBS[job_id] = job
                     persist_job_locked(job_id)
+                if force_ai_profile:
+                    # This lets ai_generated_profile distinguish a map that
+                    # merely exists in job metadata from one that genuinely
+                    # reached the parser.  It prevents a hand-off from
+                    # converting an untested repair into a false duplicate.
+                    patch_job(job_id, ai_layout_map_execution_state="running")
                 candidate = parse_statement(path, fallback_open, fallback_close, strategy, force_ai_profile, repair_context, job_id)
+                if force_ai_profile:
+                    patch_job(job_id, ai_layout_map_execution_state="tested")
                 if job_cancel_requested(job_id):
                     patch_job(job_id, processing=False, valid=False, status="cancelled",
                               message="UPG job was cancelled safely after the current extraction step.")
@@ -6746,6 +6805,12 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     "Propose a safe header/column addendum only; do not weaken validation.")
             except Exception as error:
                 safe_error = re.sub(r"\s+", " ", str(error)).strip()[:300]
+                if force_ai_profile:
+                    # Preserve the actual failure of the measured addendum.
+                    # A later retry may safely replay only maps that never
+                    # reached this point; a tested map requires new evidence.
+                    patch_job(job_id, ai_layout_map_execution_state="tested",
+                              ai_layout_map_execution_error=safe_error)
                 errors.append(f"{candidate_name}: {safe_error}")
                 # `errors` is per retry round. Persist a bounded history so a
                 # later duplicate-only round cannot erase the actual failed
@@ -6814,7 +6879,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             preflight.get("capability_drift_detection") if isinstance(preflight, dict) else {},
         )
         investigation["module_repair_route"] = module_repair_route
-        if "targeted_repair_profile" in ai_purposes:
+        if {"targeted_repair_profile", "targeted_repair_revision"} & set(ai_purposes):
             investigation["profile_action"] = "targeted_layout_repair_tested"
         proposed_rules = {str(rule) for rule in investigation["rules"]}
         proposed_strategies = [str(strategy) for strategy in investigation["strategies"]]
