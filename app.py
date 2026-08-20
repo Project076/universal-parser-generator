@@ -1404,21 +1404,24 @@ def capability_composition_safety_guard(
     measured from the newly submitted source; this guard protects the bounded
     rule-library composition only.
     """
-    selected_rules = sorted({str(rule) for rule in learned_rule_ids if str(rule)})
+    # ``learned_rule_ids`` also carries compact challenge labels such as
+    # ``column_geometry``.  Those are investigation context, not reusable
+    # rule modules, so they must not make an otherwise valid certification
+    # fail merely because they are not keys in the rule library.
+    raw_learning = sorted({str(rule) for rule in learned_rule_ids if str(rule)})
+    selected_rules = [rule for rule in raw_learning if rule in DIAGNOSTIC_RULE_LIBRARY]
+    challenge_context = [rule for rule in raw_learning if rule not in DIAGNOSTIC_RULE_LIBRARY]
     declared_groups = sorted({str(group) for group in rule_groups if str(group)})
     expected_groups = rule_groups_for(selected_rules)
     base = {
         "step": pipeline_step_key("capability_composition_safety"),
         "selected_rule_modules": selected_rules,
+        "non_module_challenge_context": challenge_context,
         "declared_rule_groups": declared_groups,
         "expected_rule_groups": expected_groups,
         "provider_capability_count": len(provenance),
         "outcome": "pass",
     }
-    unknown_rules = sorted(set(selected_rules) - set(DIAGNOSTIC_RULE_LIBRARY))
-    if unknown_rules:
-        return False, {**base, "outcome": "blocked",
-                       "reason": "unknown reusable rule module", "unknown_rule_modules": unknown_rules}
     if declared_groups != expected_groups:
         return False, {**base, "outcome": "blocked",
                        "reason": "declared rule groups do not match selected modules"}
@@ -1438,6 +1441,46 @@ def capability_composition_safety_guard(
                            "capability": str(item.get("capability", "")),
                            "provider_rule_group": provider_group, "module_rule_groups": module_groups}
     return True, base
+
+def capability_application_receipt_guard(
+    learned_rule_ids: list[str], provenance: list[dict[str, object]]
+) -> tuple[bool, dict[str, object]]:
+    """Step 44: prove selected reusable modules reached the parser plan.
+
+    This is an auditable receipt for the library-composition workflow.  Every
+    source-matched capability must contribute its selected, known rule modules
+    to the candidate's rule set.  It does not copy provider code or geometry:
+    it only proves the relevant reusable *behaviour* was applied to the new
+    statement's independently measured layout.
+    """
+    applied_rules = sorted({str(rule) for rule in learned_rule_ids if str(rule) in DIAGNOSTIC_RULE_LIBRARY})
+    receipt: list[dict[str, object]] = []
+    for item in provenance:
+        if not isinstance(item, dict):
+            return False, {"step": pipeline_step_key("capability_application_receipt"), "outcome": "blocked",
+                           "reason": "invalid capability receipt item"}
+        capability = str(item.get("capability", "")).strip()
+        modules = sorted({str(rule) for rule in item.get("rule_modules", []) if str(rule)})
+        missing = sorted(set(modules) - set(applied_rules))
+        if missing:
+            return False, {
+                "step": pipeline_step_key("capability_application_receipt"), "outcome": "blocked",
+                "reason": "selected capability modules were not applied to the parser plan",
+                "capability": capability, "missing_rule_modules": missing,
+            }
+        receipt.append({
+            "capability": capability,
+            "rule_group": str(item.get("rule_group", "")),
+            "applied_rule_modules": modules,
+            "provider_profile_ids": [str(profile_id) for profile_id in item.get("provider_profile_ids", []) if str(profile_id)][:4],
+        })
+    return True, {
+        "step": pipeline_step_key("capability_application_receipt"),
+        "outcome": "pass",
+        "applied_rule_modules": applied_rules,
+        "capability_receipt": receipt,
+        "geometry_policy": "measured_from_new_source_only",
+    }
 
 def certified_profile_export_guard(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
     """Step 31: prevent incomplete profiles from crossing the UPG API boundary.
@@ -1575,6 +1618,11 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     )
     if not composition_ok:
         raise ValueError("Step 43 capability composition guard rejected profile: " + json.dumps(composition_guard, separators=(",", ":")))
+    receipt_ok, application_receipt = capability_application_receipt_guard(
+        learned_rule_ids, provenance
+    )
+    if not receipt_ok:
+        raise ValueError("Step 44 capability application receipt rejected profile: " + json.dumps(application_receipt, separators=(",", ":")))
     version = int(prior.get("version", 0)) + 1
     # A step lesson is stored only with a certified profile.  It contains no
     # statement text or transactions: just the named step, bounded rule IDs,
@@ -1603,7 +1651,7 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
             certified_step_lessons.append(item)
     certified_step_lessons = certified_step_lessons[-24:]
     code_sha256 = hashlib.sha256((detection_code + "\n/*UPG-CODE-BOUNDARY*/\n" + parser_code).encode("utf-8")).hexdigest()
-    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "certified_capability_provenance": provenance_guard, "capability_composition_safety": composition_guard, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "certified_lineage_integrity": lineage_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
+    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "certified_capability_provenance": provenance_guard, "capability_composition_safety": composition_guard, "capability_application_receipt": application_receipt, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "certified_lineage_integrity": lineage_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
     _matchable, layout_match = certified_layout_match_contract(data)
     data["layout_match"] = layout_match
     if not _matchable:
@@ -1904,6 +1952,7 @@ STEP_NAMES = {
     "certified_lineage_integrity": (41, "CERTIFIED_LINEAGE_INTEGRITY"),
     "certified_capability_provenance": (42, "CERTIFIED_CAPABILITY_PROVENANCE"),
     "capability_composition_safety": (43, "CAPABILITY_COMPOSITION_SAFETY"),
+    "capability_application_receipt": (44, "CAPABILITY_APPLICATION_RECEIPT"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5863,6 +5912,7 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "certified_lineage_integrity": data.get("certified_lineage_integrity", {}),
         "certified_capability_provenance": data.get("certified_capability_provenance", {}),
         "capability_composition_safety": data.get("capability_composition_safety", {}),
+        "capability_application_receipt": data.get("capability_application_receipt", {}),
         "parent_profile_id": data.get("parent_profile"),
         "certification": data.get("certification", {"status": "certified", "source": data.get("upg_source", "upg_native")}),
         "profile_origin": data.get("upg_source", "upg_native"),
@@ -6225,6 +6275,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "certified_lineage_integrity", "certified")
                     record_step_learning(job_id, "certified_capability_provenance", "certified")
                     record_step_learning(job_id, "capability_composition_safety", "certified")
+                    record_step_learning(job_id, "capability_application_receipt", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     # An execution-repair request may contribute a certified
