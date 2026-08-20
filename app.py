@@ -2158,13 +2158,13 @@ def transaction_date_value(value: str) -> datetime | None:
     # Text layers frequently split a date across adjacent words, e.g.
     # `24-01 -2024`.  It is still one visual date cell, not a continuation
     # line.  Normalise whitespace around separators before validation.
-    value = re.sub(r"\s*([/-])\s*", r"\1", str(value or "").strip())
+    value = re.sub(r"\s*([/.-])\s*", r"\1", str(value or "").strip())
     # Original-PDF geometry may wrap the final two year digits inside the
     # same Value Date cell (``02/Apr/20\n25``).  A date cell contains no
     # narration, therefore removing its internal whitespace is safe and
     # restores the source-printed date without inventing a value.
     value = re.sub(r"\s+", "", value)
-    for pattern in ("%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y", "%d-%b-%Y", "%d/%b/%Y", "%Y-%m-%d"):
+    for pattern in ("%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y", "%d-%m-%y", "%d/%m/%y", "%d.%m.%y", "%d-%b-%Y", "%d/%b/%Y", "%Y-%m-%d"):
         try: return datetime.strptime(value.strip(), pattern)
         except ValueError: continue
     return None
@@ -2927,6 +2927,31 @@ def extract_dual_date_geometry_rows(path: Path) -> list[list[object]]:
                 pass
     return rows if len(rows) > 1 else []
 
+def has_standard_geometry_header_contract(raw: str) -> bool:
+    """Return true for a conventional five-column bank ledger header.
+
+    This deliberately identifies *field meaning*, not a particular bank's
+    spelling.  A normal statement might call narration ``Transaction
+    Remarks`` and movements ``Withdrawal Amount`` / ``Deposit Amount``.  Such
+    a statement must use the measured original-PDF geometry path before any
+    generic table/OCR or AI fallback is considered.
+    """
+    field_patterns = (
+        r"\b(?:transaction\s+|posting\s+|value\s+)?date\b",
+        r"\b(?:particulars?|remarks?|narration|description|details)\b",
+        r"\b(?:withdrawals?|debits?)\b",
+        r"\b(?:deposits?|credits?)\b",
+        r"\b(?:running\s+)?balance\b",
+    )
+    cursor = 0
+    for pattern in field_patterns:
+        match = re.search(pattern, raw[cursor:], re.I)
+        if not match:
+            return False
+        cursor += match.end()
+    return True
+
+
 def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
     """Extract a normal Date / Particulars / Debit / Credit / Balance ledger.
 
@@ -2941,20 +2966,40 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
     # 18/02/2026) dates.  A date-looking token is only a row starter when it
     # is physically in the measured Date column below, so accepting the
     # numeric forms cannot turn a narration/reference date into a record.
-    date_re = re.compile(r"^\d{2}(?:-[A-Za-z]{3}-|[-/]\d{2}[-/])\d{4}$")
+    # PDF text layers use all three numeric separators.  ``09.04.2025`` is
+    # common in ICICI and several other Indian bank exports; accepting it is
+    # safe here because the token must also be below the measured header and
+    # physically inside the measured Date-column band.
+    date_re = re.compile(r"^\d{2}(?:-[A-Za-z]{3}-|[-/.]\d{2}[-/.])\d{4}$")
     with open_pdfplumber(path) as pdf:
         for page in pdf.pages:
             words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
-            headers = {}
+            # The five required *fields* are often labelled differently by a
+            # bank.  For example ICICI Saving statements use ``Transaction
+            # Remarks``, ``Withdrawal Amount (INR)`` and ``Deposit Amount
+            # (INR)``.  Do not make a measured original-PDF geometry path
+            # depend on a single bank's header vocabulary.
+            headers: dict[str, list[dict]] = {key: [] for key in ("date", "particulars", "withdrawals", "deposits", "balance")}
             for word in words:
-                key = str(word["text"]).lower()
-                if key in {"date", "particulars", "withdrawals", "deposits", "balance"}:
-                    headers.setdefault(key, []).append(word)
+                key = re.sub(r"[^a-z]", "", str(word["text"]).lower())
+                if key in {"date", "transactiondate", "postingdate", "valuedate"}:
+                    headers["date"].append(word)
+                elif key in {"particular", "particulars", "remarks", "remark", "narration", "description", "details"}:
+                    headers["particulars"].append(word)
+                elif key in {"withdrawal", "withdrawals", "debit", "debits", "dr"}:
+                    headers["withdrawals"].append(word)
+                elif key in {"deposit", "deposits", "credit", "credits", "cr"}:
+                    headers["deposits"].append(word)
+                elif key in {"balance", "runningbalance", "closingbalance"}:
+                    headers["balance"].append(word)
             if not all(headers.get(key) for key in ("date", "particulars", "withdrawals", "deposits", "balance")):
                 continue
             # All five labels must share the actual table-header baseline.
+            # A wrapped label (for example ``Transaction\nDate``) can put the
+            # word ``Date`` one text-line lower than ``Withdrawal``/``Deposit``;
+            # twelve points is still far tighter than any transaction row gap.
             candidates = [word for word in headers["date"] if all(
-                any(abs(float(other["top"]) - float(word["top"])) <= 10 for other in headers[key])
+                any(abs(float(other["top"]) - float(word["top"])) <= 12 for other in headers[key])
                 for key in ("particulars", "withdrawals", "deposits", "balance")
             )]
             if not candidates:
@@ -2962,12 +3007,31 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             date_header = max(candidates, key=lambda word: float(word["top"]))
             header_top = float(date_header["top"])
             def same_line(key: str):
-                return min((word for word in headers[key] if abs(float(word["top"]) - header_top) <= 10), key=lambda word: float(word["x0"]))
+                return min((word for word in headers[key] if abs(float(word["top"]) - header_top) <= 12), key=lambda word: float(word["x0"]))
             x_date = float(date_header["x0"])
             x_part = float(same_line("particulars")["x0"])
             x_wd = float(same_line("withdrawals")["x0"])
             x_dp = float(same_line("deposits")["x0"])
             x_bal = float(same_line("balance")["x0"])
+            # A header can start to the right of the first actual narration
+            # glyph.  The common ``Cheque Number | Transaction Remarks``
+            # layout is an example: the data narration begins immediately
+            # after the cheque-number column, not under the word ``Remarks``.
+            # Use the right edge of that preceding reference header as a
+            # measured lower narration boundary; never expand into the Date
+            # or amount columns.
+            header_words = [word for word in words if abs(float(word["top"]) - header_top) <= 12]
+            reference_right_edges = [
+                float(word["x1"])
+                for word in header_words
+                if float(word["x1"]) < x_part
+                and re.sub(r"[^a-z]", "", str(word["text"]).lower())
+                in {"cheque", "chq", "number", "no", "reference", "ref", "instrument"}
+            ]
+            x_narration_left = min(
+                x_part - 20,
+                max(reference_right_edges) + 1 if reference_right_edges else x_part - 20,
+            )
             anchors = sorted(
                 [(float(word["top"]), str(word["text"])) for word in words
                  if date_re.fullmatch(str(word["text"])) and float(word["x0"]) < x_part - 20 and float(word["top"]) > header_top + 12],
@@ -2983,13 +3047,25 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                     # same broad vertical block.
                     footer_tops = [float(word["top"]) - 3 for word in words
                                    if float(word["top"]) > top + 8
-                                   and str(word["text"]).strip().lower() in {"total", "grand", "page"}]
+                                   and str(word["text"]).strip().lower() in {
+                                       "total", "grand", "page", "www.icici.bank.in",
+                                       "www.", "please", "never", "disclaimer",
+                                   }]
                     next_top = min(footer_tops) if footer_tops else float(page.height) - 6
-                block = [word for word in words if top - 4 <= float(word["top"]) < next_top]
+                # Some exports put the first short narration line a few points
+                # above the date/amount baseline (``Credit trxn`` above its
+                # own date). Keep that measured near-row continuation, while
+                # the next Date anchor still provides the hard transaction
+                # boundary.
+                block = [word for word in words if top - 7 <= float(word["top"]) < next_top]
                 line = [word for word in block if abs(float(word["top"]) - top) <= 5]
                 def band(left: float, right: float, source=line) -> str:
                     return " ".join(str(word["text"]) for word in sorted(source, key=lambda item: float(item["x0"])) if left <= (float(word["x0"]) + float(word["x1"])) / 2 < right)
-                withdrawal_text = band(x_wd - 50, x_dp - 20).replace(" ", "")
+                # Do not overlap adjacent measured money columns.  Earlier
+                # broad bands could read the same deposit once as deposit and
+                # again as the final balance, which then tempted later logic
+                # to repair a ledger that was actually read incorrectly.
+                withdrawal_text = band(x_wd - 10, x_dp - 10).replace(" ", "")
                 # Some original PDFs let the final word of a narration range
                 # overlap the debit column (``to17-3,894.00``).  The final
                 # currency token is still source text in the debit band; do
@@ -2998,8 +3074,8 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 trailing_amount = re.search(r"(\d[\d,]*\.\d{2})$", withdrawal_text)
                 if trailing_amount and not re.fullmatch(r"-?\d[\d,]*\.\d{2}", withdrawal_text):
                     withdrawal_text = trailing_amount.group(1)
-                deposit_text = band(x_dp - 25, x_bal - 20).replace(" ", "")
-                balance_text = band(x_bal - 30, float(page.width) + 5).replace(" ", "")
+                deposit_text = band(x_dp - 10, x_bal - 10).replace(" ", "")
+                balance_text = band(x_bal - 10, float(page.width) + 5).replace(" ", "")
                 # Preserve raw monetary source cells.  The statement-level
                 # normalizer can infer the column's decimal precision from
                 # every valid row, then safely repair an isolated text-layer
@@ -3010,7 +3086,7 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 # an unusable balance cannot erase it or change its direction.
                 if not withdrawal and not deposit:
                     continue
-                narration_words = [word for word in block if x_part - 20 <= float(word["x0"]) < x_wd - 20]
+                narration_words = [word for word in block if x_narration_left <= float(word["x0"]) < x_wd - 10]
                 narration = clean_narration(" ".join(str(word["text"]) for word in sorted(narration_words, key=lambda item: (float(item["top"]), float(item["x0"])))) )
                 narration = re.split(
                     r"(?i)\b(?:opening\s+balance|total|grand\s+total|"
@@ -3055,10 +3131,7 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
         # original-page x-bands; never reconstruct them from that bad chain.
         measured_rows = extract_standard_column_geometry_rows(path)
         return (measured_rows, raw) if measured_rows else (extract_geometry_profile_rows(path), raw)
-    standard_geometry_header = bool(re.search(
-        r"(?is)\bdate\b[\s\S]{0,150}\bparticulars?\b[\s\S]{0,150}\bwithdrawals?\b[\s\S]{0,150}\bdeposits?\b[\s\S]{0,150}\bbalance\b",
-        raw,
-    ))
+    standard_geometry_header = has_standard_geometry_header_contract(raw)
     if strategy_override is None and standard_geometry_header:
         measured_rows = extract_standard_column_geometry_rows(path)
         if measured_rows:
@@ -3460,10 +3533,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     elif (
         effective_strategy is None
         and path.suffix.lower() == ".pdf"
-        and re.search(
-            r"(?is)\bdate\b[\s\S]{0,150}\bparticulars?\b[\s\S]{0,150}\bwithdrawals?\b[\s\S]{0,150}\bdeposits?\b[\s\S]{0,150}\bbalance\b",
-            raw,
-        )
+        and has_standard_geometry_header_contract(raw)
     ):
         effective_strategy = "standard_column_geometry"
     header_at = next((i for i, row in enumerate(rows[:20]) if len(map_headers(row)) >= 3), None)
