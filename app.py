@@ -1250,6 +1250,43 @@ def profile_activation_guard(headers: list[object], columns: dict[str, object],
         "outcome": "active" if eligible else "blocked",
     }
 
+def certified_profile_export_guard(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
+    """Step 31: prevent incomplete profiles from crossing the UPG API boundary.
+
+    BS Analyzer may execute only code that UPG has certified.  A profile may
+    be a useful internal historical lesson without being safe to export as an
+    executable parser.  This guard checks the wire contract, not statement
+    contents: no transaction rows, source text, or account information is
+    retained or exposed here.
+    """
+    validation = data.get("validation") if isinstance(data.get("validation"), dict) else {}
+    activation = data.get("profile_activation") if isinstance(data.get("profile_activation"), dict) else {}
+    certification = data.get("certification") if isinstance(data.get("certification"), dict) else {}
+    detection = str(data.get("detection_code") or "").strip()
+    parser = str(data.get("parser_code") or "").strip()
+    code_contract = bool(
+        re.search(r"\bfunction\s+detect\s*\(", detection)
+        and re.search(r"\bfunction\s+parse\s*\(", parser)
+    )
+    validation_pass = (
+        str(validation.get("status", "")).lower() == "pass"
+        and bool(validation.get("financial_pass", False))
+        and bool(validation.get("narration_pass", False))
+    )
+    activation_state = str(activation.get("outcome", ""))
+    legacy_certified = not activation and str(certification.get("status", "certified")).lower() == "certified"
+    activation_pass = activation_state == "active" or legacy_certified
+    eligible = bool(code_contract and validation_pass and activation_pass)
+    return eligible, {
+        "step": pipeline_step_key("profile_export"),
+        "detection_code_contract_pass": bool(re.search(r"\bfunction\s+detect\s*\(", detection)),
+        "parser_code_contract_pass": bool(re.search(r"\bfunction\s+parse\s*\(", parser)),
+        "validation_pass": validation_pass,
+        "activation_pass": activation_pass,
+        "legacy_certified_profile": legacy_certified,
+        "outcome": "exportable" if eligible else "withheld",
+    }
+
 def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None, capability_tags: list[str] | None = None, capability_provenance: list[dict[str, object]] | None = None, step_lessons: list[dict[str, object]] | None = None) -> str:
     """Persist validated learning additively; never discard a certified revision.
 
@@ -1582,6 +1619,7 @@ STEP_NAMES = {
     "addendum_compatibility": (28, "ADDITIVE_COMPATIBILITY_GATE"),
     "certification_promotion": (29, "CERTIFIED_LESSON_PROMOTION"),
     "profile_activation": (30, "PROFILE_ACTIVATION_GUARD"),
+    "profile_export": (31, "CERTIFIED_EXPORT_CONTRACT"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5502,6 +5540,13 @@ def api_profile_payload(profile_id: str) -> dict | None:
                 "validation": data.get("validation") or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True, "transaction_count": data.get("validated_observations")},
             })
             profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Step 31 is the last release gate.  Internal lessons and incomplete
+    # drafts remain available to UPG's planning system, but BS Analyzer must
+    # never receive code unless the exact executable contract and all UPG
+    # certification evidence are present.
+    exportable, export_metadata = certified_profile_export_guard(data)
+    if not exportable:
+        return None
     return {
         "profile_id": profile_id,
         "version": int(data.get("version", 1)),
@@ -5514,6 +5559,7 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "columns": data.get("columns", {}),
         "rules": data.get("rules", {}),
         "validation": data.get("validation", {"status": "pass"}),
+        "profile_export": export_metadata,
         "parent_profile_id": data.get("parent_profile"),
         "certification": data.get("certification", {"status": "certified", "source": data.get("upg_source", "upg_native")}),
         "profile_origin": data.get("upg_source", "upg_native"),
@@ -5817,6 +5863,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     # parser on this new layout; parent knowledge remains a
                     # capability donor only.
                     record_step_learning(job_id, "profile_activation", "certified")
+                    record_step_learning(job_id, "profile_export", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     profile_id = save_profile(
