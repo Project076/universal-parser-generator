@@ -1313,6 +1313,30 @@ def certified_code_integrity_guard(data: dict[str, object]) -> tuple[bool, dict[
         "outcome": "sealed" if integrity_pass else "withheld",
     }
 
+def certified_layout_match_contract(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
+    """Step 33: describe the only safe way a consumer may select a parser.
+
+    A bank name is a family label, never proof that two statements share a
+    layout.  Exact source fingerprints are authoritative.  Older/text-only
+    certified profiles may use their recorded header contract as a bounded
+    fallback, but never a fuzzy bank-name match.
+    """
+    fingerprint = str(data.get("layout_fingerprint") or "").strip()
+    headers = [norm(item) for item in data.get("header_signature", []) if norm(item)]
+    activation = data.get("profile_activation") if isinstance(data.get("profile_activation"), dict) else {}
+    exact_layout = bool(fingerprint)
+    header_contract = bool(headers)
+    eligible = exact_layout or header_contract
+    return eligible, {
+        "step": pipeline_step_key("layout_match"),
+        "selection_policy": "exact_layout_fingerprint" if exact_layout else "exact_header_contract",
+        "layout_fingerprint": fingerprint or None,
+        "header_signature": headers[:12],
+        "bank_name_is_not_a_match_key": True,
+        "activation_scope": activation.get("activation_scope", "legacy_header_contract_only"),
+        "outcome": "matchable" if eligible else "withheld",
+    }
+
 def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None, capability_tags: list[str] | None = None, capability_provenance: list[dict[str, object]] | None = None, step_lessons: list[dict[str, object]] | None = None) -> str:
     """Persist validated learning additively; never discard a certified revision.
 
@@ -1389,6 +1413,8 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     certified_step_lessons = certified_step_lessons[-24:]
     code_sha256 = hashlib.sha256((detection_code + "\n/*UPG-CODE-BOUNDARY*/\n" + parser_code).encode("utf-8")).hexdigest()
     data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "profile_activation": activation, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
+    _matchable, layout_match = certified_layout_match_contract(data)
+    data["layout_match"] = layout_match
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
@@ -1648,6 +1674,7 @@ STEP_NAMES = {
     "profile_activation": (30, "PROFILE_ACTIVATION_GUARD"),
     "profile_export": (31, "CERTIFIED_EXPORT_CONTRACT"),
     "code_integrity": (32, "CERTIFIED_CODE_INTEGRITY"),
+    "layout_match": (33, "EXACT_LAYOUT_MATCH_CONTRACT"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5584,6 +5611,9 @@ def api_profile_payload(profile_id: str) -> dict | None:
                          "code_sha256": integrity_metadata["code_sha256"]}
         data["certification"] = certification
         profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    matchable, layout_match = certified_layout_match_contract(data)
+    if not matchable:
+        return None
     return {
         "profile_id": profile_id,
         "version": int(data.get("version", 1)),
@@ -5598,6 +5628,7 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "validation": data.get("validation", {"status": "pass"}),
         "profile_export": export_metadata,
         "code_integrity": integrity_metadata,
+        "layout_match": layout_match,
         "parent_profile_id": data.get("parent_profile"),
         "certification": data.get("certification", {"status": "certified", "source": data.get("upg_source", "upg_native")}),
         "profile_origin": data.get("upg_source", "upg_native"),
@@ -5903,6 +5934,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "profile_activation", "certified")
                     record_step_learning(job_id, "profile_export", "certified")
                     record_step_learning(job_id, "code_integrity", "certified")
+                    record_step_learning(job_id, "layout_match", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     profile_id = save_profile(
