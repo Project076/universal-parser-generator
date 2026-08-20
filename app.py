@@ -1542,6 +1542,7 @@ STEP_NAMES = {
     "balance_chain": (17, "BALANCE_CHAIN_CHECK"),
     "novel_layout": (20, "PARSER_PLAN_COMPOSITION"),
     "addendum_compatibility": (28, "ADDITIVE_COMPATIBILITY_GATE"),
+    "certification_promotion": (29, "CERTIFIED_LESSON_PROMOTION"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -2623,6 +2624,19 @@ def failure_type_from_evidence(failure: str) -> str:
     later unrelated rule such as furniture cleanup or financial reconciliation.
     """
     evidence = (failure or "").lower()
+    # Step 29 is a promotion gate, not a parser module. If it rejects a
+    # candidate, route the addendum back to the concrete upstream module that
+    # its metadata identifies rather than asking an agent to "repair"
+    # certification itself.
+    if "certification promotion gate failed" in evidence:
+        if '"canonical_contract_pass":false' in evidence:
+            return "header_mapping"
+        if '"source_coverage_pass":false' in evidence or '"transaction_count_match":false' in evidence:
+            return "transaction_count"
+        if '"narration_pass":false' in evidence:
+            return "continuation"
+        if '"financial_pass":false' in evidence:
+            return "endpoint"
     if "step 28 additive compatibility" in evidence or "additive compatibility gate" in evidence:
         return "addendum_compatibility"
     if "header" in evidence or "header role" in evidence:
@@ -2792,6 +2806,40 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
     def add_strategy(name: str) -> None:
         if name not in strategies:
             strategies.append(name)
+
+    # S29 does not have a parser rule of its own.  It is the promotion
+    # decision, so a rejection must be sent back to the first *upstream*
+    # interpretation that the promotion proof disproved.  This makes a late
+    # certification failure an additive correction to a measured module,
+    # rather than a vague new parser attempt.
+    if "certification promotion gate failed" in evidence:
+        if '"canonical_contract_pass":false' in evidence:
+            failure_type, profile_action = "header_mapping", "repair_header_map"
+            for name in ("header_role_alignment", "distinct_source_columns", "measured_column_evidence"):
+                add_rule(name)
+            add_strategy("geometry_profile")
+        elif '"source_coverage_pass":false' in evidence or '"transaction_count_match":false' in evidence:
+            failure_type, profile_action = "transaction_count", "repair_source_coverage"
+            for name in ("source_coverage", "bf_preperiod_artifact"):
+                add_rule(name)
+            add_strategy("geometry_profile")
+        elif '"narration_pass":false' in evidence:
+            failure_type, profile_action = "continuation", "repair_continuations"
+            for name in ("narration_source_cell", "continuation_merge", "multi_page_continuation", "footer_exclusion"):
+                add_rule(name)
+            add_strategy("geometry_profile")
+        elif '"financial_pass":false' in evidence:
+            failure_type, profile_action = "endpoint", "repair_balance_direction"
+            for name in ("summary_endpoints", "balance_delta", "signed_balance_text"):
+                add_rule(name)
+            add_strategy("running_balance_text")
+        else:
+            failure_type, profile_action = "transaction_count", "repair_source_coverage"
+            add_rule("source_coverage")
+            add_strategy("geometry_profile")
+        return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "upstream_steps": upstream_steps or [failure_type],
+                "profile_action": profile_action, "diagnostic_error": ""}
 
     # A failed source proof is more reliable than downstream aggregate gates.
     # Repair only that module, in priority order.  This turns a failed
@@ -4805,6 +4853,34 @@ def additive_compatibility_gate(source_columns: dict[str, int], inherited_column
     }
     return (not source_conflicts and not collisions and not missing), metadata
 
+def certification_promotion_gate(candidate: tuple) -> tuple[bool, dict[str, object]]:
+    """Step 29: promote an addendum only after complete release evidence.
+
+    This is intentionally stricter than a parser merely returning rows.  It
+    is the only place a job-local addendum may become durable reusable
+    knowledge. Printed grand totals remain a cross-check, rather than an
+    absolute gate, because some source statements print them incorrectly.
+    """
+    try:
+        tx, _opening, _closing, _wd, _dep, _computed, financial, narration, _unmatched, _headers, columns, _parent, coverage, expected_count, _fingerprint, _declared_wd, _declared_dep, totals_match = candidate
+        columns = columns or {}
+    except (IndexError, TypeError, ValueError):
+        return False, {"step": pipeline_step_key("certification_promotion"), "reason": "candidate contract incomplete"}
+    canonical = bool(columns.get("_canonical_contract_valid", False))
+    source_record = bool(columns.get("_source_record_fingerprint_valid", True))
+    passed = bool(financial and narration and coverage and canonical and source_record and len(tx) == int(expected_count or 0))
+    return passed, {
+        "step": pipeline_step_key("certification_promotion"),
+        "financial_pass": bool(financial),
+        "narration_pass": bool(narration),
+        "source_coverage_pass": bool(coverage),
+        "canonical_contract_pass": canonical,
+        "source_record_fingerprint_pass": source_record,
+        "transaction_count_match": len(tx) == int(expected_count or 0),
+        "printed_totals": "pass" if totals_match else "warning_not_release_gate",
+        "outcome": "certified" if passed else "not_promoted",
+    }
+
 def parse_statement(path: Path, fallback_open: str, fallback_close: str, strategy_override: str | None = None, force_ai_profile: bool = False, repair_context: str = "", job_id: str | None = None):
     if path.suffix.lower() == ".pdf":
         source_text = remove_page_furniture(cached_pdf_text(path))
@@ -5692,8 +5768,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     continue
                 new_candidates_this_round += 1
                 attempted_candidates += 1
-                if candidate[6] and candidate[7]:
+                promotion_ok, promotion_metadata = certification_promotion_gate(candidate)
+                if candidate[6] and candidate[7] and promotion_ok:
                     tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_wd, declared_dp, statement_totals_valid = candidate
+                    columns["_certification_promotion"] = promotion_metadata
+                    record_step_learning(job_id, "certification_promotion", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     profile_id = save_profile(
@@ -5743,6 +5822,12 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     post_completion_webhook(job_id, "completed", profile_id)
                     clear_pdf_password(path)
                     return
+                if candidate[6] and candidate[7] and not promotion_ok:
+                    # A local gate was optimistic but the full promotion
+                    # contract found a release defect. Keep the candidate out
+                    # of the profile library and feed its compact proof back
+                    # into the appropriate earlier step on the next round.
+                    errors.append("certification promotion gate failed: " + json.dumps(promotion_metadata, separators=(",", ":")))
                 failed_candidates.add(signature)
                 if not force_ai_profile:
                     failed_strategy_keys.add(strategy_key)
