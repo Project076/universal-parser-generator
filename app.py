@@ -1519,6 +1519,53 @@ def capability_effectiveness_feedback(
         "effective_capabilities": effective,
     }
 
+def capability_drift_detection(capabilities: list[dict[str, object]] | None) -> dict[str, object]:
+    """Step 46: detect *behavioural* drift before reusing a capability.
+
+    A provider proves that a rule module worked on an earlier certified
+    layout; it does not prove that the new source has identical headings,
+    coordinates, furniture wording, or continuation shape.  This audit tells
+    the planner exactly which module needs a measured addendum.  It never
+    blocks a candidate merely because no earlier bank supplied the feature,
+    and it never permits copying a provider's parser or geometry.
+    """
+    findings: list[dict[str, object]] = []
+    for item in capabilities or []:
+        if not isinstance(item, dict):
+            continue
+        capability = str(item.get("capability", "")).strip()
+        if not capability:
+            continue
+        expected = sorted({str(rule) for rule in rules_for_capability(capability)})
+        selected = sorted({str(rule) for rule in item.get("selected_rule_modules", [])
+                           if str(rule) in DIAGNOSTIC_RULE_LIBRARY})
+        provider_id = str(item.get("selected_provider_profile_id", "")).strip()
+        if not provider_id:
+            level = "new_capability_evidence"
+            repair = "measure_new_source_and_apply_library_default_modules"
+        elif not set(expected).issubset(set(selected)):
+            level = "partial_provider_coverage"
+            repair = "retain_defaults_and_make_a_targeted_module_addendum"
+        else:
+            level = "geometry_or_wording_variation"
+            repair = "reuse_modules_only_after_measuring_new_source_geometry"
+        findings.append({
+            "capability": capability,
+            "rule_group": str(item.get("rule_group", "")),
+            "selected_provider_profile_id": provider_id or None,
+            "expected_rule_modules": expected,
+            "selected_rule_modules": selected,
+            "drift_level": level,
+            "repair_policy": repair,
+            "foreign_geometry_or_code_reuse_forbidden": True,
+        })
+    return {
+        "step": pipeline_step_key("capability_drift_detection"),
+        "outcome": "measured",
+        "findings": findings,
+        "agent_scope": "repair_only_the_identified_module_after_evidence_of_failure",
+    }
+
 def certified_profile_export_guard(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
     """Step 31: prevent incomplete profiles from crossing the UPG API boundary.
 
@@ -2014,6 +2061,7 @@ STEP_NAMES = {
     "capability_composition_safety": (43, "CAPABILITY_COMPOSITION_SAFETY"),
     "capability_application_receipt": (44, "CAPABILITY_APPLICATION_RECEIPT"),
     "capability_effectiveness_feedback": (45, "CAPABILITY_EFFECTIVENESS_FEEDBACK"),
+    "capability_drift_detection": (46, "CAPABILITY_DRIFT_DETECTION"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -2508,6 +2556,7 @@ def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: s
     source_sample = str(snapshot["sample"])
     closest = closest_certified_lessons(path, headers)
     capabilities = source_capability_plan(source_sample, headers)
+    capability_drift = capability_drift_detection(capabilities)
     candidates = evidence_first_candidates(
         path, large_pdf, bool(geometry), validated_strategy, planned_strategies, 1,
         source_sample=source_sample, source_geometry=geometry,
@@ -2534,6 +2583,7 @@ def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: s
         "closest_profile_ids": [item["profile_id"] for item in closest],
         "closest_challenges": sorted({challenge for item in closest for challenge in item.get("challenge_history", [])}),
         "source_matched_capabilities": capabilities,
+        "capability_drift_detection": capability_drift,
         "selected_rule_bundle": selected_rule_bundle,
         "candidate_plan": ["ai_layout_addendum" if ai else (strategy or "detected_table") for strategy, ai in candidates],
         "step_gate": step_gate,
@@ -6102,6 +6152,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             "closest_profile_ids": preflight.get("closest_profile_ids", []),
             "preflight_plan_id": preflight.get("plan_id", ""),
             "selected_rule_bundle": preflight.get("selected_rule_bundle", []),
+            "capability_drift": preflight.get("capability_drift_detection", {}),
             "capabilities": [
                 item.get("capability") for item in preflight.get("source_matched_capabilities", [])
                 if isinstance(item, dict) and item.get("capability")
@@ -6179,6 +6230,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             f"validated layout rules to consider: {', '.join(diagnostic_rules) or 'none'}. "
             f"Immutable measured preflight plan: {preflight.get('plan_id', 'none')}; "
             f"selected source-proven rule bundle: {json.dumps(preflight.get('selected_rule_bundle', []), separators=(',', ':'))[-1000:] or 'none'}. "
+            f"Capability drift audit: {json.dumps(preflight.get('capability_drift_detection', {}), separators=(',', ':'))[-1200:] or 'none'}. "
             f"Preflight closest profiles: {', '.join(preflight.get('closest_profile_ids', [])) or 'none'}; "
             f"measured fields: {', '.join(preflight.get('header_fields', [])) or 'unresolved'}. "
             f"Previously tested targeted repairs: {json.dumps(targeted_repair_history, separators=(',', ':'))[-1000:] or 'none'}."
