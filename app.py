@@ -1215,7 +1215,7 @@ def certified_feature_vector(headers: list[object], columns: dict[str, int], str
         "challenge_ids": sorted(challenges),
     }
 
-def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None, capability_tags: list[str] | None = None, capability_provenance: list[dict[str, object]] | None = None) -> str:
+def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None, capability_tags: list[str] | None = None, capability_provenance: list[dict[str, object]] | None = None, step_lessons: list[dict[str, object]] | None = None) -> str:
     """Persist validated learning additively; never discard a certified revision.
 
     A later statement can add a capability or a self-healing addendum, but it
@@ -1260,13 +1260,39 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
         for item in (capability_provenance or []) if isinstance(item, dict) and item.get("capability")
     ][:12]
     version = int(prior.get("version", 0)) + 1
-    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
+    # A step lesson is stored only with a certified profile.  It contains no
+    # statement text or transactions: just the named step, bounded rule IDs,
+    # and the fact that the resulting complete parser passed every release
+    # gate.  Earlier lessons remain in prior immutable profile revisions.
+    prior_step_lessons = [
+        dict(item) for item in prior.get("step_lessons", [])
+        if isinstance(item, dict) and item.get("step") and item.get("outcome") == "certified"
+    ]
+    new_certified_step_lessons = [
+        {"step": str(item.get("step", "")), "failure_type": str(item.get("failure_type", "")),
+         "rules": [str(rule) for rule in item.get("rules", []) if str(rule) in DIAGNOSTIC_RULE_LIBRARY][:8],
+         "outcome": "certified", "learning_mode": "additive"}
+        for item in (step_lessons or []) if isinstance(item, dict) and item.get("step")
+    ]
+    # Keep prior certified lessons in the active profile as well as in its
+    # immutable revision.  A new variant adds knowledge; it never replaces
+    # the knowledge that an older certified layout still needs.
+    certified_step_lessons: list[dict[str, object]] = []
+    seen_step_lessons: set[tuple[str, str, tuple[str, ...]]] = set()
+    for item in [*prior_step_lessons, *new_certified_step_lessons]:
+        key = (str(item.get("step", "")), str(item.get("failure_type", "")),
+               tuple(str(rule) for rule in item.get("rules", [])))
+        if key[0] and key not in seen_step_lessons:
+            seen_step_lessons.add(key)
+            certified_step_lessons.append(item)
+    certified_step_lessons = certified_step_lessons[-24:]
+    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
     try: ledger = json.loads(LEARNING_LEDGER.read_text(encoding="utf-8"))
     except (OSError, ValueError): ledger = {"validated_profiles": {}}
-    ledger.setdefault("validated_profiles", {})[ident] = {"observations": observations, "strategy": data["last_validated_strategy"], "self_healed_addendum": data["self_healed_addendum"], "diagnostic_rules": data["diagnostic_rules"], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "parent_profile": parent_profile}
+    ledger.setdefault("validated_profiles", {})[ident] = {"observations": observations, "strategy": data["last_validated_strategy"], "self_healed_addendum": data["self_healed_addendum"], "diagnostic_rules": data["diagnostic_rules"], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "parent_profile": parent_profile}
     # A rule earns preference only after a full certified outcome.  This is a
     # bounded aggregate scorecard, not ML training and not statement storage.
     scorecard = ledger.setdefault("certified_rule_successes", {})
@@ -1498,9 +1524,13 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
 STEP_NAMES = {
     "source_intake": (1, "SOURCE_INTAKE"),
     "native_structure": (2, "NATIVE_STRUCTURE_READ"),
+    "source_shape": (3, "SOURCE_SHAPE_DISCOVERY"),
     "column_geometry": (5, "COLUMN_GEOMETRY_MAP"),
     "header_mapping": (4, "HEADER_SEMANTICS"),
+    "amount_normalization": (9, "AMOUNT_NORMALIZATION"),
     "date_order": (11, "DATE_SELECTION_AND_NORMALIZATION"),
+    "bf_summary": (12, "BF_AND_SUMMARY_EXCLUSION"),
+    "classification": (13, "DEBIT_CREDIT_CLASSIFICATION"),
     "continuation": (7, "NARRATION_ASSEMBLY"),
     "page_furniture": (8, "FURNITURE_REMOVAL"),
     "balance_direction": (10, "BALANCE_INTERPRETATION"),
@@ -1509,8 +1539,51 @@ STEP_NAMES = {
     "source_totals": (16, "FINANCIAL_RECONCILIATION"),
     "narration_coverage": (14, "SOURCE_COVERAGE_CHECK"),
     "transaction_count": (15, "TRANSACTION_COUNT_CHECK"),
+    "balance_chain": (17, "BALANCE_CHAIN_CHECK"),
     "novel_layout": (20, "PARSER_PLAN_COMPOSITION"),
 }
+
+def pipeline_step_key(failure_type: str) -> str:
+    """Stable name used for one step's isolated repair history."""
+    number, name = STEP_NAMES.get(failure_type, STEP_NAMES["column_geometry"])
+    return f"S{number:02d}_{name}"
+
+def certified_lessons_for_step(profile_id: object, failure_type: str) -> list[dict[str, object]]:
+    """Read only the safe, already-certified lessons for one pipeline step."""
+    ident = str(profile_id or "")
+    if not ident:
+        return []
+    try:
+        profile = json.loads((PROFILES / f"{ident}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    expected = pipeline_step_key(failure_type)
+    return [dict(item) for item in profile.get("step_lessons", [])
+            if isinstance(item, dict) and item.get("step") == expected][:3]
+
+def record_step_learning(job_id: str | None, failure_type: str, status: str,
+                         rules: object = None, agent_used: bool = False) -> None:
+    """Record bounded state for the exact blocked pipeline step.
+
+    This is runtime investigation state, not certified learning. It lets a
+    later retry stay at the same step, and becomes reusable learning only when
+    ``save_profile`` is reached after the complete parser passes.
+    """
+    if not job_id:
+        return
+    step = pipeline_step_key(failure_type)
+    safe_rules = [str(item) for item in (rules or []) if str(item) in DIAGNOSTIC_RULE_LIBRARY][:8]
+    with JOBS_LOCK:
+        job = JOBS.get(job_id, {})
+        history = [dict(item) for item in job.get("pipeline_step_history", []) if isinstance(item, dict)][-20:]
+        event = {"step": step, "failure_type": failure_type, "status": status, "rules": safe_rules,
+                 "agent_used": bool(agent_used), "at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+        if not history or history[-1] != event:
+            history.append(event)
+        job.update({"blocked_pipeline_step": step if status != "certified" else "",
+                    "pipeline_step_history": history[-20:]})
+        JOBS[job_id] = job
+        persist_job_locked(job_id)
 
 def compact_ai_learning_packet(path: Path | None = None, headers: list[object] | None = None,
                                raw: str = "", failure_type: str = "column_geometry") -> dict[str, object]:
@@ -1534,7 +1607,10 @@ def compact_ai_learning_packet(path: Path | None = None, headers: list[object] |
     baseline = {
         "column_geometry": ["distinct_source_columns", "header_role_alignment", "measured_column_evidence"],
         "header_mapping": ["header_role_alignment", "measured_column_evidence", "distinct_source_columns"],
+        "amount_normalization": ["indian_money_punctuation", "amount_balance_consistency", "source_amount_geometry"],
         "date_order": ["date_column_boundary", "date_source_cell", "reverse_order"],
+        "bf_summary": ["bf_preperiod_artifact", "terminal_row_before_summary", "footer_exclusion"],
+        "classification": ["amount_balance_consistency", "balance_delta", "source_amount_geometry"],
         "continuation": ["continuation_merge", "narration_source_cell", "reference_date_boundary"],
         "page_furniture": ["footer_exclusion", "terminal_row_before_summary", "multi_page_continuation"],
         "balance_direction": ["balance_delta", "amount_balance_consistency", "balance_source_cell"],
@@ -1543,6 +1619,7 @@ def compact_ai_learning_packet(path: Path | None = None, headers: list[object] |
         "source_totals": ["summary_total_warning", "source_amount_geometry", "amount_balance_consistency"],
         "narration_coverage": ["narration_source_cell", "continuation_merge", "source_coverage"],
         "transaction_count": ["source_coverage", "date_source_cell", "measured_column_evidence"],
+        "balance_chain": ["balance_delta", "amount_balance_consistency", "balance_source_cell"],
         "novel_layout": ["distinct_source_columns", "header_role_alignment", "measured_column_evidence"],
     }.get(failure_type, ["distinct_source_columns", "header_role_alignment", "measured_column_evidence"])
     allowed_rules = list(dict.fromkeys([*baseline, *selected_rules]))
@@ -1568,6 +1645,9 @@ def compact_ai_learning_packet(path: Path | None = None, headers: list[object] |
             "mapped_fields": item.get("mapped_fields", []),
             "challenge_history": item.get("challenge_history", [])[:4],
             "rule_groups": item.get("rule_groups", [])[:4],
+            # Supply only lessons for this exact step. A narration repair must
+            # not be influenced by a foreign balance-chain repair.
+            "same_step_certified_lessons": certified_lessons_for_step(item.get("profile_id"), failure_type),
         } for item in closest],
         "source_matched_certified_capabilities": capabilities,
     }
@@ -1612,8 +1692,11 @@ REPAIR_MODULE_STRATEGIES: dict[str, frozenset[str]] = {
     # strategy is still re-measured from the current source; this map never
     # imports offsets or executable code from a different bank.
     "header_mapping": frozenset({"geometry_profile", "source_amount_geometry", "standard_column_geometry"}),
+    "amount_normalization": frozenset({"source_amount_geometry", "geometry_profile"}),
     "column_geometry": frozenset({"geometry_profile", "source_amount_geometry", "standard_column_geometry", "dual_date_geometry"}),
     "date_order": frozenset({"dual_date_geometry", "value_date_unsigned", "geometry_profile"}),
+    "bf_summary": frozenset({"geometry_profile", "page_text_unsigned"}),
+    "classification": frozenset({"source_amount_geometry", "running_balance_text", "unsigned_running_balance_text"}),
     "continuation": frozenset({"geometry_profile", "standard_column_geometry"}),
     "narration_coverage": frozenset({"geometry_profile", "standard_column_geometry"}),
     "page_furniture": frozenset({"geometry_profile", "standard_column_geometry", "page_text_unsigned"}),
@@ -1622,6 +1705,7 @@ REPAIR_MODULE_STRATEGIES: dict[str, frozenset[str]] = {
     "unreliable_balance": frozenset({"running_balance_text", "unsigned_running_balance_text", "page_text_unsigned"}),
     "endpoint": frozenset({"running_balance_text", "unsigned_running_balance_text", "geometry_profile"}),
     "transaction_count": frozenset({"geometry_profile", "standard_column_geometry", "source_amount_geometry"}),
+    "balance_chain": frozenset({"running_balance_text", "unsigned_running_balance_text", "source_amount_geometry"}),
 }
 
 # A strategy can address more than one structural capability, but UPG should
@@ -2361,6 +2445,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     # map has been tested and failed, the final call must create a *revised
     # map* from the measured failure evidence--not merely diagnose it.
     prior_purposes = ai_call_purposes(job_id)
+    repair_failure = failure_type_from_evidence(repair_context) if repair_context else "column_geometry"
     purpose = "targeted_repair_profile" if (
         job_id and repair_context and (
             "layout_blueprint" in prior_purposes
@@ -2397,6 +2482,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     if not reserve_ai_call(job_id, purpose):
         record_failure("AI call budget is exhausted before a layout map could be generated.")
         return None
+    record_step_learning(job_id, repair_failure, "agent_repair_requested", agent_used=True)
     schema = {
         "type": "object", "additionalProperties": False,
         "properties": {
@@ -2415,7 +2501,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
             prior_maps = list(JOBS.get(job_id, {}).get("ai_layout_maps", []))[-2:]
     evidence = {"rows": rows[:18], "original_pdf_geometry_samples": geometry, "failed_validation_evidence": repair_context[-1800:],
                 "previous_failed_layout_maps": prior_maps,
-                "upg_learning": compact_ai_learning_packet(source_path, rows[0] if rows else None, raw)}
+                "upg_learning": compact_ai_learning_packet(source_path, rows[0] if rows else None, raw, repair_failure)}
     instruction = (AI_LAYOUT_CONTRACT + "\nIdentify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
         "and balance. These are the only allowed transaction outputs. Interpret unfamiliar header wording semantically from the measured source header: for example Transaction Remarks/Description/Details means narration; Debit/Withdrawal means withdrawal; Credit/Deposit means deposit; Post/Transaction/Booking Date and Value Date are date fields (Value Date wins for output). Do not map account metadata, totals, page furniture, or a word outside the measured table header. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. The source_matched_certified_capabilities are reusable behaviours only: apply one only when the supplied source evidence proves it, and never copy another profile's coordinates, code, or field indexes. Use -1 when a field is absent. If failure evidence is supplied, return a revised measured header/column mapping that directly repairs that failure. The previous targeted repairs and failed layout maps are evidence of actions already tested: do not repeat them. Change only a source role which the measured geometry or grid proves should change; if no such source evidence exists, do not invent a map. Do not extract transactions, invent values, or change validation rules."
@@ -2535,6 +2621,14 @@ def failure_type_from_evidence(failure: str) -> str:
     later unrelated rule such as furniture cleanup or financial reconciliation.
     """
     evidence = (failure or "").lower()
+    if "header" in evidence or "header role" in evidence:
+        return "header_mapping"
+    if any(token in evidence for token in ("decimal", "punctuation", "multiple points", "amount token")):
+        return "amount_normalization"
+    if any(token in evidence for token in ("b/f", "brought forward", "summary", "grand total", "page total")):
+        return "bf_summary"
+    if any(token in evidence for token in ("debit", "credit", "withdrawal", "deposit", "classification")):
+        return "classification"
     if any(token in evidence for token in ("header", "column", "geometry", "grid", "source columns")):
         return "column_geometry"
     if any(token in evidence for token in ("date", "value date", "chronolog", "reverse order")):
@@ -2543,7 +2637,9 @@ def failure_type_from_evidence(failure: str) -> str:
         return "continuation"
     if any(token in evidence for token in ("footer", "furniture", "page total", "summary")):
         return "page_furniture"
-    if any(token in evidence for token in ("running balance", "balance direction", "balance chain")):
+    if "balance chain" in evidence:
+        return "balance_chain"
+    if any(token in evidence for token in ("running balance", "balance direction")):
         return "balance_direction"
     if "transaction count" in evidence or "source coverage" in evidence:
         return "transaction_count"
@@ -2569,7 +2665,7 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "rules": {"type": "array", "items": {"type": "string", "enum": allowed_rules}, "maxItems": 5},
         "strategies": {"type": "array", "items": {"type": "string", "enum": safe_strategies}, "maxItems": 4},
-        "failure_type": {"type": "string", "enum": ["column_geometry", "header_mapping", "date_order", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "novel_layout"]},
+        "failure_type": {"type": "string", "enum": ["source_shape", "column_geometry", "header_mapping", "amount_normalization", "date_order", "bf_summary", "classification", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "balance_chain", "novel_layout"]},
         "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
     prompt = AI_LAYOUT_CONTRACT + "\nThis is the final AI decision for this job and it is being made AFTER the first source-layout extraction failed. Repair only " + str(learning_packet["ai_context_scope"]["pipeline_step"]) + ". Do not move downstream until this step has source proof. Produce one targeted, evidence-led repair plan using only the supplied certified modules and strategies. Do not write code or transactions, do not relax validation, and do not request another AI layout addendum. If evidence is insufficient, choose reject_unsafe.\nScoped rules: " + json.dumps(learning_packet["allowed_rule_modules"]) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(learning_packet) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
@@ -2659,6 +2755,32 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
     strategies: list[str] = []
     failure_type, profile_action = "column_geometry", "repair_header_map"
 
+    # Certification is the final regression test.  A local step can look
+    # healthy while a later gate exposes a defect in its interpretation. Keep
+    # the implicated *upstream* steps as an ordered, bounded audit list. The
+    # first item is the immediate addendum target; the rest are evidence for
+    # the next re-measurement, never unrelated future pipeline steps.
+    upstream_steps: list[str] = []
+    def implicate(step: str) -> None:
+        if step not in upstream_steps:
+            upstream_steps.append(step)
+    if any(token in evidence for token in ("header roles aligned=fail", "source columns distinct=fail", "measured column evidence=fail")):
+        implicate("header_mapping")
+    if "source date cells=fail" in evidence:
+        implicate("date_order")
+    if "source narration cells=fail" in evidence or "gate narration=fail" in evidence:
+        implicate("continuation")
+    if "source balance cells=fail" in evidence or "source balance unreliable" in evidence:
+        implicate("balance_direction")
+    if "source record fingerprint=fail" in evidence or "gate source_coverage=fail" in evidence:
+        implicate("transaction_count")
+    if any(token in evidence for token in ("decimal", "punctuation", "multiple points", "source totals conflict")):
+        implicate("amount_normalization")
+    if any(token in evidence for token in ("b/f", "brought forward", "summary", "grand total", "page total")):
+        implicate("bf_summary")
+    if "balance chain" in evidence:
+        implicate("balance_chain")
+
     def add_rule(name: str) -> None:
         if name in DIAGNOSTIC_RULE_LIBRARY and name not in rules:
             rules.append(name)
@@ -2678,6 +2800,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         add_strategy("geometry_profile")
         add_strategy("source_amount_geometry")
         return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "upstream_steps": upstream_steps or [failure_type],
                 "profile_action": profile_action, "diagnostic_error": ""}
     if "source date cells=fail" in evidence:
         failure_type, profile_action = "date_order", "repair_date_order"
@@ -2686,6 +2809,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         add_strategy("dual_date_geometry")
         add_strategy("value_date_unsigned")
         return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "upstream_steps": upstream_steps or [failure_type],
                 "profile_action": profile_action, "diagnostic_error": ""}
     if "source balance cells=fail" in evidence:
         failure_type, profile_action = "balance_direction", "repair_balance_direction"
@@ -2694,6 +2818,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         add_strategy("geometry_profile")
         add_strategy("running_balance_text")
         return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "upstream_steps": upstream_steps or [failure_type],
                 "profile_action": profile_action, "diagnostic_error": ""}
     if any(token in evidence for token in ("source narration cells=fail", "gate narration=fail")):
         failure_type, profile_action = "narration_coverage", "repair_continuations"
@@ -2701,6 +2826,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
             add_rule(name)
         add_strategy("geometry_profile")
         return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "upstream_steps": upstream_steps or [failure_type],
                 "profile_action": profile_action, "diagnostic_error": ""}
     if any(token in evidence for token in ("source record fingerprint=fail", "gate source_coverage=fail")):
         failure_type = "transaction_count"
@@ -2721,11 +2847,16 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
     # financial/narration failure. Choose one dominant repair family per
     # round—combining every library rule would recreate the broad retry that
     # this planner is intended to remove.
-    if any(token in evidence for token in ("decimal", "punctuation", "multiple points", "source totals conflict")):
-        failure_type = "source_totals"
+    if any(token in evidence for token in ("decimal", "punctuation", "multiple points")):
+        failure_type = "amount_normalization"
         for name in ("indian_money_punctuation", "amount_balance_consistency", "source_amount_geometry"):
             add_rule(name)
         add_strategy("source_amount_geometry")
+        add_strategy("geometry_profile")
+    elif any(token in evidence for token in ("b/f", "brought forward", "summary", "grand total", "page total")):
+        failure_type = "bf_summary"
+        for name in ("bf_preperiod_artifact", "terminal_row_before_summary", "footer_exclusion"):
+            add_rule(name)
         add_strategy("geometry_profile")
     elif any(token in evidence for token in ("narration", "particular", "continuation", "furniture", "footer")):
         failure_type, profile_action = "continuation", "repair_continuations"
@@ -2756,6 +2887,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         add_strategy("unsigned_running_balance_text")
 
     return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+            "upstream_steps": upstream_steps or [failure_type],
             "profile_action": profile_action, "diagnostic_error": ""}
 
 # A targeted repair plan may select only extraction modes that the local UPG
@@ -5368,6 +5500,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             f"UPG self-healing round {round_number}. No validated parser candidate has been found yet. "
             f"Prior expert diagnosis: {prior_investigation.get('failure_type', 'none')}; "
             f"safe corrective action: {prior_investigation.get('profile_action', 'none')}; "
+            f"upstream steps rechecked after final-gate regression: {', '.join(prior_investigation.get('upstream_steps', [])) or 'none'}; "
             f"validated layout rules to consider: {', '.join(diagnostic_rules) or 'none'}. "
             f"Immutable measured preflight plan: {preflight.get('plan_id', 'none')}; "
             f"selected source-proven rule bundle: {json.dumps(preflight.get('selected_rule_bundle', []), separators=(',', ':'))[-1000:] or 'none'}. "
@@ -5416,21 +5549,35 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             )
             if pending_targeted:
                 candidates = [(strategy, False) for strategy in pending_targeted]
+                record_step_learning(job_id, str(prior_investigation.get("failure_type", "column_geometry")),
+                                     "deterministic_addendum", targeted_repair_strategies)
                 patch_job(
                     job_id,
                     message=(f"UPG retry round {round_number}: applying targeted "
-                             f"{prior_investigation.get('failure_type', 'source')} repair "
+                             f"{prior_investigation.get('failure_type', 'source')} addendum "
                              f"from measured failure evidence before any new AI call."),
                 )
             else:
-                candidates = evidence_first_candidates(
-                    path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number,
-                    # A second AI call is deliberately a repaired layout map
-                    # based on the first failed extraction.  It is not consumed
-                    # by a separate diagnosis-only request.
-                    include_ai_addendum=("targeted_repair_profile" not in ai_call_purposes(job_id) and ai_calls_remaining(job_id) > 0),
-                    repair_module=str(prior_investigation.get("failure_type", "")),
-                )
+                # Do not leave a failed step for an unrelated later strategy.
+                # After its deterministic addenda are tested, that same step
+                # gets one narrowly scoped agent addendum, or the job stops.
+                blocked_type = str(prior_investigation.get("failure_type", "") or "")
+                if blocked_type:
+                    candidates = [(None, True)] if (
+                        "targeted_repair_profile" not in ai_call_purposes(job_id)
+                        and ai_calls_remaining(job_id) > 0
+                    ) else []
+                    if not candidates:
+                        empty_ai_diagnoses = max(empty_ai_diagnoses, 1)
+                        patch_job(job_id, message=(
+                            f"UPG remains blocked at {pipeline_step_key(blocked_type)}. "
+                            "No safe addendum remains for this step, so it will not advance to unrelated steps."
+                        ))
+                else:
+                    candidates = evidence_first_candidates(
+                        path, large_pdf, geometry_ready, validated_strategy, planned_strategies, round_number,
+                        include_ai_addendum=("targeted_repair_profile" not in ai_call_purposes(job_id) and ai_calls_remaining(job_id) > 0),
+                    )
         new_candidates_this_round = 0
         for strategy, force_ai_profile in candidates:
             try:
@@ -5526,6 +5673,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         capability_provenance=[
                             item for item in job_context.get("preflight_blueprint", {}).get("source_matched_capabilities", [])
                             if isinstance(item, dict)
+                        ],
+                        step_lessons=[
+                            item for item in job_context.get("pipeline_step_history", [])
+                            if isinstance(item, dict) and item.get("status") in {"blocked", "deterministic_addendum", "agent_repair_requested"}
                         ],
                     )
                     name = export_excel(tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_wd, declared_dp, statement_totals_valid, bool(columns.get("_source_balance_unreliable")))
@@ -5633,8 +5784,14 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         prior_investigation = {
             "failure_type": investigation.get("failure_type", "novel_layout"),
             "profile_action": investigation.get("profile_action", "reject_unsafe"),
+            "upstream_steps": [str(step) for step in investigation.get("upstream_steps", [])][:6],
             "diagnostic_error": diagnosis_error,
         }
+        # This is a pending lesson, not a change to an existing parser.  It is
+        # promoted into a reusable certified step lesson only if this job later
+        # passes every validation gate.
+        record_step_learning(job_id, str(prior_investigation["failure_type"]), "blocked",
+                             investigation.get("rules", []))
         if materially_new_rules or materially_new_strategies:
             detail += " UPG recorded a new layout investigation plan for the next round."
             empty_ai_diagnoses = 0
