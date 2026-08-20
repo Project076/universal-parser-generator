@@ -510,6 +510,43 @@ ALIASES = {
     "transaction_type": ["type", "dr/cr", "transaction type"],
 }
 
+
+def semantic_header_role(value: object) -> str | None:
+    """Return the canonical meaning of one source header label.
+
+    This is intentionally a vocabulary classifier, not a bank template.  A
+    newly uploaded statement is still measured from its own native grid/PDF
+    geometry; this helper merely tells the measured-grid code that phrases
+    such as ``Transaction Remarks`` and ``Debit Amount (INR)`` describe the
+    same concepts as ``Particulars`` and ``Withdrawal``.
+
+    Keeping this small, deterministic layer in front of the AI is important:
+    a spelling variation must not consume an expensive AI repair call or make
+    UPG borrow a different bank's column coordinates.
+    """
+    label = norm(value)
+    if not label:
+        return None
+    if "balance" in label or label in {"availableamount", "closingamount"}:
+        return "balance"
+    if any(token in label for token in ("withdraw", "debit", "amountdebited")) or label in {"dr", "dramount"}:
+        return "withdrawal"
+    if any(token in label for token in ("deposit", "credit", "amountcredited")) or label in {"cr", "cramount"}:
+        return "deposit"
+    if any(token in label for token in ("narration", "particular", "remark", "description", "detail", "transactioninfo")):
+        return "narration"
+    if any(token in label for token in ("cheque", "check", "instrument", "reference", "refno", "transactionid", "utr", "rrn")):
+        return "instrument_number"
+    if "date" in label:
+        # Value/settlement/effective dates are still dates; callers that can
+        # see the full measured header retain the Value Date preference.
+        return "date"
+    if "amount" in label:
+        return "amount"
+    if label in {"type", "transactiontype", "drcr"}:
+        return "transaction_type"
+    return None
+
 HTML = r'''<!doctype html><html><head><meta charset="utf-8"><title>Statement Normalizer</title><style>
 body{font-family:system-ui;max-width:860px;margin:50px auto;color:#172033;background:#f5f7fb}.card{background:white;padding:30px;border-radius:16px;box-shadow:0 4px 22px #1223}h1{margin-top:0}label{display:block;margin:16px 0 5px;font-weight:650}input,button{font:inherit;padding:10px}input{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:7px}button{margin-top:22px;background:#0f766e;color:white;border:0;border-radius:8px;cursor:pointer}.hint{color:#52606d}.result{margin-top:20px;padding:16px;border-radius:8px}.ok{background:#dcfce7}.fail{background:#fee2e2}.field{display:grid;grid-template-columns:1fr 1fr;gap:15px}</style></head><body><main class="card"><h1>Bank Statement Normalizer</h1><p class="hint">Upload a statement. Excel is created only after the declared balances reconcile with parsed transactions. For unfamiliar layouts, the configured AI parser generator may inspect the layout to create a profile; no export is released unless both checks pass.</p><form id="form"><label>Statement file</label><input name="file" type="file" accept=".csv,.xlsx,.xls,.txt,.pdf,.doc,.docx" required><div class="field"><div><label>Opening balance (optional fallback)</label><input name="opening" placeholder="Extracted from source when present"></div><div><label>Closing balance (optional fallback)</label><input name="closing" placeholder="Extracted from source when present"></div></div><label>PDF password (only if protected)</label><input name="password" type="password" autocomplete="off" placeholder="Used only in memory for this upload"><button>Parse and validate</button></form><section id="result"></section></main><script>
 const f=document.querySelector('#form'), r=document.querySelector('#result'), submit=f.querySelector('button');let activeJob=null,activeCancelToken=null;
@@ -621,6 +658,19 @@ def repair_indian_grouping_decimal(value: object, decimal_places: int | None) ->
     except InvalidOperation:
         return None
     return -amount if explicit_negative or debit_suffix else amount
+
+
+def source_money(value: object, decimal_places: int | None = 2) -> Decimal | None:
+    """Parse one measured money cell without changing its accounting side.
+
+    The normal parser accepts a conventional number first.  Only then does it
+    attempt the narrow, evidence-preserving Indian punctuation repair.  This
+    ensures a searchable PDF token such as ``-5.00.177.00`` is read as the
+    visible ``-5,00,177.00`` when the column's two-decimal convention proves
+    it, while a random dotted reference in Particulars can never become an
+    amount or create a counter-balancing movement.
+    """
+    return money(value) or repair_indian_grouping_decimal(value, decimal_places)
 
 def indian_amount(value: Decimal | int | float) -> str:
     """Format monetary values with Indian lakh/crore grouping."""
@@ -791,15 +841,9 @@ def map_headers(headers: list[object]) -> dict[str, int]:
     # Header wording varies by bank. These semantic fallbacks allow the parser
     # generator to discover a new layout without a bank-specific code change.
     for i, h in enumerate(headers):
-        header = norm(h)
-        if "balance" in header: mapped.setdefault("balance", i)
-        elif "withdraw" in header or "debit" in header or header.endswith("dr"): mapped.setdefault("withdrawal", i)
-        elif "deposit" in header or "credit" in header or header.endswith("cr"): mapped.setdefault("deposit", i)
-        elif any(word in header for word in ("narration", "particular", "remark", "description", "detail")): mapped.setdefault("narration", i)
-        elif any(word in header for word in ("cheque", "check", "instrument", "refno")): mapped.setdefault("instrument_number", i)
-        elif header in ("date", "trandate", "transactiondate", "valuedate"): mapped.setdefault("date", i)
-        elif "amount" in header: mapped.setdefault("amount", i)
-        elif header == "type": mapped.setdefault("transaction_type", i)
+        role = semantic_header_role(h)
+        if role:
+            mapped.setdefault(role, i)
     # Value Date labels often include a parenthesised format or abbreviations
     # (for example ``Value Date (DD/MM/YYYY)``).  It has priority over the
     # posting-date column for the exported canonical date.
@@ -3046,7 +3090,11 @@ def extract_dual_date_geometry_rows(path: Path, page_indices: set[int] | None = 
             anchors: list[tuple[float, str, str]] = []
             for word in words:
                 text = str(word["text"])
-                if not date_re.fullmatch(text) or float(word["x0"]) > post_x + 115:
+                # Only the left-hand (posting/transaction) date band creates
+                # a row anchor.  The paired Value Date proves that anchor but
+                # must never become a second transaction on the same visual
+                # baseline.
+                if not date_re.fullmatch(text) or float(word["x0"]) >= (post_x + value_x) / 2:
                     continue
                 top = float(word["top"])
                 peers = [other for other in words if abs(float(other["top"]) - top) <= 4 and value_x - 15 <= float(other["x0"]) <= value_x + 125 and date_re.fullmatch(str(other["text"]))]
@@ -3054,8 +3102,17 @@ def extract_dual_date_geometry_rows(path: Path, page_indices: set[int] | None = 
                     anchors.append((top, text, str(sorted(peers, key=lambda item: float(item["x0"]))[0]["text"])))
             anchors.sort(key=lambda item: item[0])
             for index, (top, _post_date, value_date) in enumerate(anchors):
-                next_top = anchors[index + 1][0] - 3 if index + 1 < len(anchors) else float(page.height) - 8
-                block = [word for word in words if top - 3 <= float(word["top"]) < next_top]
+                # A transaction's visible description often begins a few
+                # points *above* its date baseline, while same-date rows can
+                # be very close together.  Use the midpoint between measured
+                # date anchors as the row boundary instead of a fixed offset.
+                # This keeps wrapped narration with its own row and prevents
+                # text from a neighbouring same-date row leaking across.
+                prior_top = anchors[index - 1][0] if index else header_top + 8
+                following_top = anchors[index + 1][0] if index + 1 < len(anchors) else float(page.height) - 8
+                row_start = (prior_top + top) / 2 if index else min(top - 6, prior_top)
+                row_end = (top + following_top) / 2 if index + 1 < len(anchors) else following_top
+                block = [word for word in words if row_start <= float(word["top"]) < row_end]
                 # Source amount/balance cells belong to the anchor baseline.
                 line = [word for word in block if abs(float(word["top"]) - top) <= 5]
                 def cell(left: float, right: float) -> str:
@@ -3063,10 +3120,45 @@ def extract_dual_date_geometry_rows(path: Path, page_indices: set[int] | None = 
                 # A PDF writer can split one visual amount into separate
                 # glyph words (``6`` + ``500.00CR``). Numeric columns never
                 # need word spaces, so rejoin them before monetary parsing.
-                numeric_cell = lambda left, right: cell(left, right).replace(" ", "")
-                debit = money(numeric_cell(debit_x - 35, credit_x - 25)) or Decimal("0")
-                credit = money(numeric_cell(credit_x - 35, balance_x - 25)) or Decimal("0")
-                balance = money(numeric_cell(balance_x - 45, float(page.width) + 5))
+                def numeric_cell(left: float, right: float) -> str:
+                    """Return only numeric glyph tokens from one measured amount band.
+
+                    Descriptions in borderless PDFs can overflow through the
+                    visual whitespace before an amount.  They must not make a
+                    real amount look unparsable.  This preserves split amount
+                    glyphs (``6`` + ``500.00CR``) but excludes narration and
+                    reference text from the numeric field.
+                    """
+                    pieces = []
+                    for word in sorted(line, key=lambda item: float(item["x0"])):
+                        center = (float(word["x0"]) + float(word["x1"])) / 2
+                        text = str(word["text"])
+                        if left <= center < right and re.fullmatch(r"[-+()]?[\d,.]+(?:CR|DR)?", text, re.I):
+                            pieces.append(text)
+                    return "".join(pieces)
+                # Column labels are measured on this source page.  The
+                # midpoint between adjacent measured columns is the only safe
+                # boundary: fixed "wide" windows overlap when a bank places
+                # Debit and Credit labels close together, duplicating one
+                # movement into both columns.  Do not compensate with a
+                # fabricated amount; leave an ambiguous row for validation to
+                # reject instead.
+                debit_left = debit_x - 8
+                # Header labels are left aligned but numbers are normally
+                # right aligned.  Use the following measured column's left
+                # edge, rather than the midpoint of two label starts: the
+                # midpoint can slice a perfectly valid 1,005.00 amount.
+                debit_right = credit_x - 1
+                credit_left = credit_x - 8
+                credit_right = balance_x - 1
+                balance_left = balance_x - 8
+                # Use the same guarded Indian-number repair used by native
+                # rows.  This route previously called ``money`` directly,
+                # so a text-layer ``5.00.177.00`` was discarded even though
+                # the verified shared rule could restore it as 5,00,177.00.
+                debit = source_money(numeric_cell(debit_left, debit_right)) or Decimal("0")
+                credit = source_money(numeric_cell(credit_left, credit_right)) or Decimal("0")
+                balance = source_money(numeric_cell(balance_left, float(page.width) + 5))
                 if balance is None or (not debit and not credit):
                     continue
                 narration_words = [word for word in block if value_x + 95 <= float(word["x0"]) < debit_x - 20]
@@ -3092,20 +3184,22 @@ def has_standard_geometry_header_contract(raw: str) -> bool:
     a statement must use the measured original-PDF geometry path before any
     generic table/OCR or AI fallback is considered.
     """
-    field_patterns = (
-        r"\b(?:transaction\s+|posting\s+|value\s+)?date\b",
-        r"\b(?:particulars?|remarks?|narration|description|details)\b",
-        r"\b(?:withdrawals?|debits?)\b",
-        r"\b(?:deposits?|credits?)\b",
-        r"\b(?:running\s+)?balance\b",
-    )
-    cursor = 0
-    for pattern in field_patterns:
-        match = re.search(pattern, raw[cursor:], re.I)
-        if not match:
-            return False
-        cursor += match.end()
-    return True
+    # Text extraction order is not reliable evidence of visual header order:
+    # PDFs may emit a right-hand column before a left-hand one.  This helper
+    # is only a cheap route selector; the actual proof comes from the
+    # same-baseline original-PDF word geometry in
+    # ``extract_standard_column_geometry_rows``.  Therefore recognise the
+    # five concepts anywhere in a compact header window, without assuming one
+    # bank's wording or reading order.
+    compact = re.sub(r"\s+", " ", raw[:12000])
+    concepts = {
+        "date": r"\b(?:transaction|posting|value|settlement|effective)?\s*date\b",
+        "narration": r"\b(?:particulars?|remarks?|narration|description|details)\b",
+        "withdrawal": r"\b(?:withdrawals?|debits?|amount\s+debited)\b",
+        "deposit": r"\b(?:deposits?|credits?|amount\s+credited)\b",
+        "balance": r"\b(?:running|available|closing)?\s*balance\b",
+    }
+    return all(re.search(pattern, compact, re.I) for pattern in concepts.values())
 
 def has_dual_date_header_contract(headers: list[object]) -> bool:
     """Recognize a two-date ledger from measured header *cells*.
@@ -3163,18 +3257,21 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             # Remarks``, ``Withdrawal Amount (INR)`` and ``Deposit Amount
             # (INR)``.  Do not make a measured original-PDF geometry path
             # depend on a single bank's header vocabulary.
+            # Capture header *meaning* first, then use this page's physical
+            # coordinates.  Banks freely vary wording and wrap labels, but a
+            # vocabulary difference is not a new parser family.
             headers: dict[str, list[dict]] = {key: [] for key in ("date", "particulars", "withdrawals", "deposits", "balance")}
             for word in words:
-                key = re.sub(r"[^a-z]", "", str(word["text"]).lower())
-                if key in {"date", "transactiondate", "postingdate", "valuedate"}:
+                role = semantic_header_role(word["text"])
+                if role == "date":
                     headers["date"].append(word)
-                elif key in {"particular", "particulars", "remarks", "remark", "narration", "description", "details"}:
+                elif role == "narration":
                     headers["particulars"].append(word)
-                elif key in {"withdrawal", "withdrawals", "debit", "debits", "dr"}:
+                elif role == "withdrawal":
                     headers["withdrawals"].append(word)
-                elif key in {"deposit", "deposits", "credit", "credits", "cr"}:
+                elif role == "deposit":
                     headers["deposits"].append(word)
-                elif key in {"balance", "runningbalance", "closingbalance"}:
+                elif role == "balance":
                     headers["balance"].append(word)
             if not all(headers.get(key) for key in ("date", "particulars", "withdrawals", "deposits", "balance")):
                 continue
@@ -3204,7 +3301,7 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             value_date_headers = [
                 date_word for date_word in date_headers
                 if any(
-                    re.sub(r"[^a-z]", "", str(label["text"]).lower()) == "value"
+                    norm(label["text"]) in {"value", "settlement", "effective"}
                     and 0 <= float(date_word["x0"]) - float(label["x1"]) <= 28
                     for label in header_words
                 )

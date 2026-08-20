@@ -1,5 +1,8 @@
 openpyxl
-xlrd
+# Native reader for legacy binary Excel statements (.xls).  Pin to the
+# maintained 2.x line; without it an .xls upload must never be misrouted to a
+# PDF/OCR parser.
+xlrd>=2.0.1,<3
 pdfplumber
 pypdf
 PyMuPDF
