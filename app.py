@@ -376,6 +376,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "distinct_source_columns": "Each canonical transaction role must come from its own measured source column. Date, Particulars, Withdrawal, Deposit and Balance may never share a source index. The only supported alternative is one Amount column plus a separate Dr/Cr Type column; never reuse Balance, Narration or a movement column to fill another role.",
     "header_role_alignment": "When a native or measured source header explicitly identifies a role (for example Withdrawal Amount, Deposit Amount, Transaction Remarks, Value Date or Running Balance), that role must use that exact measured source column. A saved profile or AI addendum may fill only unlabelled roles; it may not move an explicit header to a different column.",
     "measured_column_evidence": "Before a layout map can be certified, its measured Date column must contain source dates, its movement columns (or Amount plus Dr/Cr Type) must contain source movements, and its Balance column must contain source balance evidence on dated rows. A header label alone is never proof of a usable column.",
+    "failure_specific_repair": "After a candidate fails, classify the exact failed source proof before repairing it: header alignment, measured-column evidence, date traceability, balance traceability, source count, narration coverage, amount totals, or unreliable balance. Change only that failed module; never repeat a broad parser attempt or weaken a release gate.",
     "numeric_date_geometry": "For original-PDF geometry, recognize both DD-Mon-YYYY and DD-MM-YYYY or DD/MM/YYYY transaction dates, but only inside the measured Date-column x-band. Keep the source Withdrawal and Deposit x-bands authoritative and exclude trailing system-generated footer text from the final narration.",
     "corrupt_balance_text_layer": "For a PDF whose visible balance is correct but whose searchable text corrupts its punctuation, keep the measured debit/credit amount authoritative. Repair a blanked balance only if the preceding movement and the next measured balance, or the independently printed final totals, prove exactly one balance; never invent the opposite movement to force reconciliation.",
     "indian_money_punctuation": "Infer decimal precision only from normal monetary cells in the same source column. If a damaged token has multiple full stops, repair it only when its final fractional group has that credible precision and all earlier groups exactly form Indian comma grouping; never change digits, sign, direction, or column.",
@@ -392,7 +393,7 @@ RULE_GROUPS = {
     "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date", "date_column_boundary", "numeric_date_geometry", "date_source_cell"},
     "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency", "source_amount_geometry", "balance_source_cell"},
     "endpoints_and_totals": {"summary_endpoints", "summary_total_warning"},
-    "validation": {"source_coverage", "narration_source_cell", "balance_source_cell", "date_source_cell", "distinct_source_columns", "header_role_alignment", "measured_column_evidence"},
+    "validation": {"source_coverage", "narration_source_cell", "balance_source_cell", "date_source_cell", "distinct_source_columns", "header_role_alignment", "measured_column_evidence", "failure_specific_repair"},
 }
 # Earlier certified profiles predate the structured rule-library fields.  They
 # are still useful evidence, but an empty historic `diagnostic_rules` list
@@ -2265,6 +2266,47 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
         # loop distinguish an AI/API failure from a genuine but empty plan.
         return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI diagnosis unavailable: " + safe_openai_error(error)}
 
+def candidate_failure_evidence(candidate: tuple | None) -> list[str]:
+    """Emit compact, non-sensitive proof for the one module that failed.
+
+    A validation result alone (for example ``financial=fail``) is downstream
+    evidence.  The repair planner needs the source-level reason so it can
+    change just the failing module on the next attempt instead of replaying a
+    general table candidate.  This metadata is job telemetry only; it never
+    contains statement text, transactions, account numbers, or amounts.
+    """
+    if candidate is None:
+        return []
+    try:
+        tx, _opening, _closing, _withdrawals, _deposits, _computed, financial, narration, _unmatched, _headers, columns, _parent, coverage, expected_count = candidate[:14]
+        columns = columns or {}
+    except (IndexError, TypeError, ValueError):
+        return []
+
+    evidence: list[str] = [
+        f"gate financial={'pass' if financial else 'fail'}",
+        f"gate narration={'pass' if narration else 'fail'}",
+        f"gate source_coverage={'pass' if coverage else 'fail'}",
+        f"count parsed={len(tx)} expected={expected_count}",
+    ]
+    proofs = {
+        "source columns distinct": columns.get("_source_columns_distinct", True),
+        "header roles aligned": columns.get("_source_header_roles_aligned", True),
+        "measured column evidence": columns.get("_source_column_evidence_valid", True),
+        "source date cells": columns.get("_source_date_cells_valid", True),
+        "source balance cells": columns.get("_source_balance_cells_valid", True),
+        "source narration cells": columns.get("_source_narration_cells_valid", True),
+        "source record fingerprint": columns.get("_source_record_fingerprint_valid", True),
+        "canonical output contract": columns.get("_canonical_contract_valid", True),
+    }
+    evidence.extend(f"proof {name}={'pass' if value else 'fail'}" for name, value in proofs.items())
+    if columns.get("_source_totals_conflict"):
+        evidence.append("proof printed source totals conflict")
+    if columns.get("_source_balance_unreliable"):
+        evidence.append("proof source balance unreliable")
+    return evidence
+
+
 def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str, object]:
     """Turn a failed candidate into one bounded, module-specific next plan.
 
@@ -2272,7 +2314,10 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
     for a revised measured layout map; this function keeps that repair focused
     on the failed module rather than retrying a vague "novel layout".
     """
-    evidence = " ".join(str(item) for item in errors[-6:]).lower()
+    # The structured candidate proof has eight small fields. Keep the full
+    # bounded set so an early but decisive header/column failure is not lost
+    # behind later aggregate gate messages.
+    evidence = " ".join(str(item) for item in errors[-20:]).lower()
     if candidate is not None:
         try:
             columns = candidate[10] or {}
@@ -2293,6 +2338,49 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
     def add_strategy(name: str) -> None:
         if name not in strategies:
             strategies.append(name)
+
+    # A failed source proof is more reliable than downstream aggregate gates.
+    # Repair only that module, in priority order.  This turns a failed
+    # candidate into a bounded next action and avoids the former broad
+    # "try another layout" behavior.
+    if any(token in evidence for token in ("header roles aligned=fail", "source columns distinct=fail", "measured column evidence=fail")):
+        failure_type, profile_action = "header_mapping", "repair_header_map"
+        for name in ("header_role_alignment", "distinct_source_columns", "measured_column_evidence"):
+            add_rule(name)
+        add_strategy("geometry_profile")
+        add_strategy("source_amount_geometry")
+        return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "profile_action": profile_action, "diagnostic_error": ""}
+    if "source date cells=fail" in evidence:
+        failure_type, profile_action = "date_order", "repair_date_order"
+        for name in ("date_column_boundary", "date_source_cell", "value_date"):
+            add_rule(name)
+        add_strategy("dual_date_geometry")
+        add_strategy("value_date_unsigned")
+        return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "profile_action": profile_action, "diagnostic_error": ""}
+    if "source balance cells=fail" in evidence:
+        failure_type, profile_action = "balance_direction", "repair_balance_direction"
+        for name in ("balance_source_cell", "signed_balance_text", "corrupt_balance_text_layer"):
+            add_rule(name)
+        add_strategy("geometry_profile")
+        add_strategy("running_balance_text")
+        return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "profile_action": profile_action, "diagnostic_error": ""}
+    if any(token in evidence for token in ("source narration cells=fail", "gate narration=fail")):
+        failure_type, profile_action = "narration_coverage", "repair_continuations"
+        for name in ("narration_source_cell", "continuation_merge", "multi_page_continuation", "footer_exclusion"):
+            add_rule(name)
+        add_strategy("geometry_profile")
+        return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "profile_action": profile_action, "diagnostic_error": ""}
+    if any(token in evidence for token in ("source record fingerprint=fail", "gate source_coverage=fail")):
+        failure_type = "transaction_count"
+        for name in ("source_coverage", "bf_preperiod_artifact"):
+            add_rule(name)
+        add_strategy("geometry_profile")
+        return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "profile_action": profile_action, "diagnostic_error": ""}
 
     # When all three release gates fail together, the source map itself is
     # unproven. Do not pretend that narration or endpoints alone are the
@@ -4630,6 +4718,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     columns["_measured_source_order"] = source_order
     columns["_balance_endpoint_derived"] = locals().get("endpoint_derived", "none")
     columns["_source_totals_conflict"] = source_totals_conflict
+    columns["_source_columns_distinct"] = source_columns_distinct
     columns["_canonical_contract_valid"] = canonical_contract_valid
     columns["_source_record_fingerprint_valid"] = source_fingerprint_valid
     columns["_balance_repaired_from_chain"] = balance_repaired_from_chain
@@ -5046,7 +5135,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # evidence plan tells it which module actually failed, without
         # spending a third API call on a diagnosis-only response.
         ai_purposes = ai_call_purposes(job_id)
-        investigation = evidence_repair_plan(errors + failure_evidence, latest)
+        # Supply source-proof telemetry from the latest failed candidate.  The
+        # next plan must repair the exact failed module, not infer a cause
+        # from aggregate financial/narration flags alone.
+        investigation = evidence_repair_plan(errors + failure_evidence + candidate_failure_evidence(latest), latest)
         if "targeted_repair_profile" in ai_purposes:
             investigation["profile_action"] = "targeted_layout_repair_tested"
         proposed_rules = {str(rule) for rule in investigation["rules"]}
