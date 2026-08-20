@@ -3886,6 +3886,32 @@ def reconstruct_unordered_balance_chain(transactions: list[dict], opening: Decim
         return None
     return ordered
 
+def measured_source_date_order(transactions: list[dict]) -> str:
+    """Classify the *measured* source order without rearranging source rows.
+
+    A bank may deliberately print newest-to-oldest, while PDF text extraction
+    can also serialise a visually ordered page incorrectly.  Dates alone can
+    prove only a consistently forward or consistently reverse presentation;
+    mixed dates are not evidence for a sort.  Same-day rows remain in their
+    original measured order in every case.
+    """
+    dates = [transaction_date_value(item.get("date")) for item in transactions]
+    dates = [value for value in dates if value is not None]
+    if len(dates) < 2:
+        return "undetermined"
+    comparisons = [
+        (later > earlier) - (later < earlier)
+        for earlier, later in zip(dates, dates[1:])
+        if later != earlier
+    ]
+    if not comparisons:
+        return "undetermined"
+    if all(direction >= 0 for direction in comparisons):
+        return "forward"
+    if all(direction <= 0 for direction in comparisons):
+        return "reverse"
+    return "mixed"
+
 def parse_statement(path: Path, fallback_open: str, fallback_close: str, strategy_override: str | None = None, force_ai_profile: bool = False, repair_context: str = "", job_id: str | None = None):
     if path.suffix.lower() == ".pdf":
         source_text = remove_page_furniture(cached_pdf_text(path))
@@ -4043,23 +4069,25 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
             # The first source row's running balance establishes the statement
             # opening balance when the PDF does not print a separate B/F row.
             opening = first["balance"] - first["deposit"] + first["withdrawal"]
-    # Retry candidate: many statements print newest transactions first. Reverse
-    # to chronological order and re-derive endpoints from running balances.
-    first_date = transaction_date_value(tx[0]["date"]) if tx else None
-    last_date = transaction_date_value(tx[-1]["date"]) if tx else None
-    if first_date and last_date and first_date > last_date:
-        tx.reverse()
-        if source_opening is None and tab_opening is None and tx[0]["balance"] is not None:
-            opening = tx[0]["balance"] - tx[0]["deposit"] + tx[0]["withdrawal"]
-        if source_closing is None and tx[-1]["balance"] is not None:
-            closing = tx[-1]["balance"]
+    # Keep the exact visual/measured source order in ``tx`` for export.  A
+    # genuinely newest-to-oldest statement gets a separate chronological
+    # validation sequence; a mixed order is never sorted from dates alone.
+    # This prevents same-date rows and PDF serialisation defects from being
+    # silently rearranged merely to make a balance equation pass.
+    source_order = measured_source_date_order(tx)
+    ledger_sequence = list(reversed(tx)) if source_order == "reverse" else tx
+    if source_order == "reverse":
+        if source_opening is None and tab_opening is None and ledger_sequence[0]["balance"] is not None:
+            opening = ledger_sequence[0]["balance"] - ledger_sequence[0]["deposit"] + ledger_sequence[0]["withdrawal"]
+        if source_closing is None and ledger_sequence[-1]["balance"] is not None:
+            closing = ledger_sequence[-1]["balance"]
     # The statement need not print a separate closing-balance label.  For a
     # normal oldest-to-newest ledger, the final real transaction's running
     # balance is the closing balance.  Previously this fallback existed only
     # for reverse-ordered statements, causing a correctly mapped table to be
     # rejected before financial validation even began.
-    if closing is None and tx and tx[-1]["balance"] is not None:
-        closing = tx[-1]["balance"]
+    if closing is None and ledger_sequence and ledger_sequence[-1]["balance"] is not None:
+        closing = ledger_sequence[-1]["balance"]
     opening = opening if opening is not None else money(fallback_open)
     closing = closing if closing is not None else money(fallback_close)
     if opening is None or closing is None: raise ValueError("Opening and closing balances could not be found. Supply them only as a fallback after confirming them from the source statement.")
@@ -4067,7 +4095,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # layers serialise same-date rows out of their visual order, so a uniquely
     # provable chain may be used *only* as an internal validation sequence. It
     # must never reorder, delete, or alter the source transaction rows.
-    validation_chain = tx
+    validation_chain = ledger_sequence
     if effective_strategy in ("geometry_profile", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
         reconstructed = reconstruct_unordered_balance_chain(tx, opening, closing)
         # In an unordered statement, the first displayed row is not reliable
@@ -4329,6 +4357,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # actual column mapping.  Consumers must never present it as a normal
     # balance-chain pass.
     columns["_source_balance_unreliable"] = source_balance_unreliable
+    columns["_measured_source_order"] = source_order
     columns["_balance_endpoint_derived"] = locals().get("endpoint_derived", "none")
     columns["_source_totals_conflict"] = source_totals_conflict
     columns["_canonical_contract_valid"] = canonical_contract_valid
