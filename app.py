@@ -1306,6 +1306,17 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         # before generic geometry or an AI layout call.  The parser still has
         # to pass all normal validation gates; this merely prevents a clearly
         # tabular statement from being treated as an unknown layout.
+        # A dual-date ledger needs its own original-PDF geometry route.  Do
+        # this *before* the general standard-table candidate: text-table
+        # extraction can merge the two date bands and then incorrectly report
+        # a date-order defect, even though the visual source is unambiguous.
+        dual_date_header = bool(re.search(
+            r"(?is)\b(?:TXN|POST(?:ING)?)\s+DATE\b[\s\S]{0,80}\bVALUE\s+DATE\b[\s\S]{0,240}"
+            r"\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,80}\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,80}\bBALANCE\b",
+            sample,
+        ))
+        if path.suffix.lower() == ".pdf" and dual_date_header:
+            add("dual_date_geometry", False, 1_300)
         if path.suffix.lower() == ".pdf" and has_standard_geometry_header_contract(sample):
             add("standard_column_geometry", False, 1_250)
         if re.search(r"(?i)\bvalue\s+date\b", sample):
@@ -1355,7 +1366,7 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
     # exact profile or this statement's original-PDF geometry.
     for lesson in certified_learning_context():
         strategy = str(lesson.get("strategy", ""))
-        if strategy in {"geometry_profile", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned"}:
+        if strategy in {"geometry_profile", "dual_date_geometry", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned"}:
             add(strategy, False, 350 + min(90, int(lesson.get("observations", 0) or 0) * 5))
 
     # A controlled AI layout blueprint is the first and only planning call for
@@ -2047,6 +2058,10 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         failure_type, profile_action = "date_order", "repair_date_order"
         for name in ("date_column_boundary", "value_date", "reference_date_boundary"):
             add_rule(name)
+        # Keep the repair on the source's visual date bands. Generic text
+        # extraction can flatten Post Date and Value Date into one stream and
+        # falsely report a date-order failure for an otherwise clear ledger.
+        add_strategy("dual_date_geometry")
         add_strategy("value_date_unsigned")
         add_strategy("geometry_profile")
     elif any(token in evidence for token in ("coverage", "transaction count", "source records")):
@@ -2881,8 +2896,13 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
     count = len(open_pdf_reader(path).pages)
     samples = set(sampled_page_indices(count))
     try:
-        if strategy in {"geometry_profile", "source_amount_geometry"}:
-            rows = (extract_standard_column_geometry_rows(path) if strategy == "source_amount_geometry" else extract_geometry_profile_rows(path, samples))
+        if strategy in {"geometry_profile", "source_amount_geometry", "dual_date_geometry"}:
+            if strategy == "source_amount_geometry":
+                rows = extract_standard_column_geometry_rows(path)
+            elif strategy == "dual_date_geometry":
+                rows = extract_dual_date_geometry_rows(path)
+            else:
+                rows = extract_geometry_profile_rows(path, samples)
         else:
             raw = sampled_pdf_text(path)
             if strategy == "value_date_unsigned":
@@ -3225,18 +3245,6 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
         # original-page x-bands; never reconstruct them from that bad chain.
         measured_rows = extract_standard_column_geometry_rows(path)
         return (measured_rows, raw) if measured_rows else (extract_geometry_profile_rows(path), raw)
-    standard_geometry_header = has_standard_geometry_header_contract(raw)
-    # ``standard_column_geometry`` is also a named candidate in the UPG
-    # planning loop.  It must take this exact route when explicitly selected;
-    # otherwise the named candidate falls through to generic table extraction
-    # while automatic parsing uses the measured route.  That discrepancy made
-    # a simple synonym-based ledger look like an AI-only unknown layout.
-    if strategy_override == "standard_column_geometry" or (
-        strategy_override is None and standard_geometry_header
-    ):
-        measured_rows = extract_standard_column_geometry_rows(path)
-        if measured_rows:
-            return measured_rows, raw
     # Some borderless statements expose two adjacent date columns.  Generic
     # table extraction commonly merges their headers (for example,
     # ``TXN DATE`` + ``VALUE DATE``), which prevents an otherwise exact saved
@@ -3249,11 +3257,27 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
         r"\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,80}\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,80}\bBALANCE\b",
         raw,
     ))
-    if strategy_override is None and dual_date_geometry_header:
+    # Prefer this route even where the header also meets the ordinary
+    # table-header contract. The ordinary extractor may select the first Date
+    # token; this extractor measures the Value Date band specifically.
+    if strategy_override == "dual_date_geometry" or (
+        strategy_override is None and dual_date_geometry_header
+    ):
         measured_rows = extract_dual_date_geometry_rows(path)
         if measured_rows:
             return measured_rows, raw
         return extract_geometry_profile_rows(path), raw
+    standard_geometry_header = has_standard_geometry_header_contract(raw)
+    # ``standard_column_geometry`` is also a named candidate in the UPG
+    # planning loop. It must take this exact route when explicitly selected;
+    # otherwise the named candidate falls through to generic table extraction
+    # while automatic parsing uses the measured route.
+    if strategy_override == "standard_column_geometry" or (
+        strategy_override is None and standard_geometry_header
+    ):
+        measured_rows = extract_standard_column_geometry_rows(path)
+        if measured_rows:
+            return measured_rows, raw
     if strategy_override == "page_text_unsigned":
         header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
         reader = open_pdf_reader(path)
