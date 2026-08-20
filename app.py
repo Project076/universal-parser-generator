@@ -1229,7 +1229,7 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
         {
             "capability": str(item.get("capability", "")),
             "rule_group": str(item.get("rule_group", "")),
-            "rule_modules": [str(rule) for rule in item.get("rule_modules", []) if str(rule) in DIAGNOSTIC_RULE_LIBRARY],
+            "rule_modules": [str(rule) for rule in item.get("selected_rule_modules", item.get("rule_modules", [])) if str(rule) in DIAGNOSTIC_RULE_LIBRARY],
             "provider_profile_ids": [str(profile_id) for profile_id in item.get("certified_profile_ids", [])][:4],
         }
         for item in (capability_provenance or []) if isinstance(item, dict) and item.get("capability")
@@ -1439,12 +1439,26 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
     selected: list[dict[str, object]] = []
     for capability, reason, strategy in signals:
         providers = providers_for(capability)
+        group = group_for_capability(capability)
+        default_rules = rules_for_capability(capability)
+        # Pick one strongest certified provider, then retain only rules that
+        # belong to this source-proven capability group.  A new statement may
+        # compose several groups, but it must never inherit an unbounded pile
+        # of unrelated rules from every vaguely similar profile.
+        best_provider = providers[0] if providers else {}
+        provider_rules = [
+            str(rule) for rule in best_provider.get("reusable_rules", [])
+            if str(rule) in RULE_GROUPS.get(group, set())
+        ] if isinstance(best_provider, dict) else []
+        selected_rules = list(dict.fromkeys([*default_rules, *provider_rules]))[:5]
         selected.append({
             "capability": capability,
-            "rule_group": group_for_capability(capability),
+            "rule_group": group,
             "reason": reason,
             "preferred_strategy": strategy,
-            "rule_modules": rules_for_capability(capability),
+            "rule_modules": default_rules,
+            "selected_rule_modules": selected_rules,
+            "selected_provider_profile_id": str(best_provider.get("profile_id", "")) if isinstance(best_provider, dict) else "",
             "certified_profile_ids": [provider["profile_id"] for provider in providers],
             "certified_rule_modules": providers,
             "instruction": DIAGNOSTIC_RULE_LIBRARY.get(capability, capability),
@@ -4992,15 +5006,9 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         if not isinstance(capability_plan, dict):
             continue
         diagnostic_rules.update(
-            str(rule) for rule in capability_plan.get("rule_modules", [])
+            str(rule) for rule in capability_plan.get("selected_rule_modules", capability_plan.get("rule_modules", []))
             if str(rule) in DIAGNOSTIC_RULE_LIBRARY
         )
-        for provider in capability_plan.get("certified_rule_modules", []):
-            if isinstance(provider, dict):
-                diagnostic_rules.update(
-                    str(rule) for rule in provider.get("reusable_rules", [])
-                    if str(rule) in DIAGNOSTIC_RULE_LIBRARY
-                )
     rounds_this_lease = 0
     while True:
         round_number += 1
