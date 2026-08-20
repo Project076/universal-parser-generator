@@ -2120,7 +2120,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
                 "upg_learning": compact_ai_learning_packet(source_path, rows[0] if rows else None, raw)}
     instruction = (AI_LAYOUT_CONTRACT + "\nIdentify one transaction-table header row and map "
         "its zero-based column positions to date, narration, withdrawal, deposit, instrument_number, "
-        "and balance. These are the only allowed transaction outputs. Interpret unfamiliar header wording semantically from the measured source header: for example Transaction Remarks/Description/Details means narration; Debit/Withdrawal means withdrawal; Credit/Deposit means deposit; Post/Transaction/Booking Date and Value Date are date fields (Value Date wins for output). Do not map account metadata, totals, page furniture, or a word outside the measured table header. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. The source_matched_certified_capabilities are reusable behaviours only: apply one only when the supplied source evidence proves it, and never copy another profile's coordinates, code, or field indexes. Use -1 when a field is absent. If failure evidence is supplied, return a revised measured header/column mapping that directly repairs that failure. Do not extract transactions, invent values, or change validation rules."
+        "and balance. These are the only allowed transaction outputs. Interpret unfamiliar header wording semantically from the measured source header: for example Transaction Remarks/Description/Details means narration; Debit/Withdrawal means withdrawal; Credit/Deposit means deposit; Post/Transaction/Booking Date and Value Date are date fields (Value Date wins for output). Do not map account metadata, totals, page furniture, or a word outside the measured table header. Use the original_pdf_geometry_samples as primary evidence; do not infer a column from character order alone. The source_matched_certified_capabilities are reusable behaviours only: apply one only when the supplied source evidence proves it, and never copy another profile's coordinates, code, or field indexes. Use -1 when a field is absent. If failure evidence is supplied, return a revised measured header/column mapping that directly repairs that failure. The previous targeted repairs and failed layout maps are evidence of actions already tested: do not repeat them. Change only a source role which the measured geometry or grid proves should change; if no such source evidence exists, do not invent a map. Do not extract transactions, invent values, or change validation rules."
     )
     payload = {
         "model": AI_MODEL,
@@ -4906,6 +4906,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
     targeted_repair_strategies: list[str] = [
         str(item) for item in saved_state.get("targeted_repair_strategies", [])
     ]
+    targeted_repair_history: list[dict[str, object]] = [
+        dict(item) for item in saved_state.get("targeted_repair_history", [])
+        if isinstance(item, dict)
+    ][-6:]
     # Retrying is required only while the AI can propose a materially new,
     # supported path.  Persist this across fair worker leases so an empty AI
     # diagnosis can never turn into an infinite queue-consuming loop.
@@ -4984,7 +4988,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             f"safe corrective action: {prior_investigation.get('profile_action', 'none')}; "
             f"validated layout rules to consider: {', '.join(diagnostic_rules) or 'none'}. "
             f"Preflight closest profiles: {', '.join(preflight.get('closest_profile_ids', [])) or 'none'}; "
-            f"measured fields: {', '.join(preflight.get('header_fields', [])) or 'unresolved'}."
+            f"measured fields: {', '.join(preflight.get('header_fields', [])) or 'unresolved'}. "
+            f"Previously tested targeted repairs: {json.dumps(targeted_repair_history, separators=(',', ':'))[-1000:] or 'none'}."
         )
         # On a long statement, candidate parsing already works from cached
         # full-document evidence.  Diagnostic AI needs only representative
@@ -5140,12 +5145,25 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                 failed_candidates.add(signature)
                 if not force_ai_profile:
                     failed_strategy_keys.add(strategy_key)
+                candidate_proof = candidate_failure_evidence(candidate)
                 failure_evidence.append(
                     f"validation failure: financial={'pass' if candidate[6] else 'fail'}; "
                     f"narration={'pass' if candidate[7] else 'fail'}; "
                     f"source_coverage={'pass' if candidate[12] else 'fail'}; "
                     f"transactions={len(candidate[0])}; source_records={candidate[13]}"
                 )
+                # Persist compact repair outcomes, never rows or statement
+                # text.  A later AI repair can see exactly which deterministic
+                # module has already been measured and rejected, so it does
+                # not repeat an equivalent map just because the worker was
+                # handed off between rounds.
+                if not force_ai_profile and strategy in targeted_repair_strategies:
+                    targeted_repair_history.append({
+                        "strategy": strategy,
+                        "failure_type": str(prior_investigation.get("failure_type", "source")),
+                        "proof": candidate_proof[:12],
+                    })
+                    targeted_repair_history = targeted_repair_history[-6:]
                 totals_evidence = ("CONFLICT: Grand Total and summed Page Totals agree with each other but differ from parsed amounts; "
                     "inspect duplicate rows, cross-page continuations, footer/header furniture, and amount-column mapping."
                     if candidate[10].get("_source_totals_conflict") else "no independently confirmed printed-total conflict")
@@ -5255,6 +5273,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             "failed_strategy_keys": sorted(failed_strategy_keys),
                             "diagnostic_rules": sorted(diagnostic_rules), "planned_strategies": planned_strategies,
                             "targeted_repair_strategies": targeted_repair_strategies,
+                            "targeted_repair_history": targeted_repair_history,
                             "empty_ai_diagnoses": empty_ai_diagnoses, "investigation": prior_investigation,
                             "last_candidate_errors": (candidate_history + errors)[-8:]})
                 JOBS[job_id] = job
@@ -5277,6 +5296,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         "diagnostic_rules": sorted(diagnostic_rules),
                         "planned_strategies": planned_strategies,
                         "targeted_repair_strategies": targeted_repair_strategies,
+                        "targeted_repair_history": targeted_repair_history,
                         "empty_ai_diagnoses": empty_ai_diagnoses,
                         "last_candidate_errors": errors[-8:]})
             job["investigation"] = prior_investigation
