@@ -1709,6 +1709,11 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
         raise ValueError("Step 44 capability application receipt rejected profile: " + json.dumps(application_receipt, separators=(",", ":")))
     certification_validation = validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}
     effectiveness_feedback = capability_effectiveness_feedback(application_receipt, certification_validation)
+    certification_audit_ok, certification_audit = final_certification_audit(
+        certification_validation, application_receipt, effectiveness_feedback
+    )
+    if not certification_audit_ok:
+        raise ValueError("Step 50 final certification audit withheld profile: " + json.dumps(certification_audit, separators=(",", ":")))
     version = int(prior.get("version", 0)) + 1
     # A step lesson is stored only with a certified profile.  It contains no
     # statement text or transactions: just the named step, bounded rule IDs,
@@ -1737,7 +1742,7 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
             certified_step_lessons.append(item)
     certified_step_lessons = certified_step_lessons[-24:]
     code_sha256 = hashlib.sha256((detection_code + "\n/*UPG-CODE-BOUNDARY*/\n" + parser_code).encode("utf-8")).hexdigest()
-    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "certified_capability_provenance": provenance_guard, "capability_composition_safety": composition_guard, "capability_application_receipt": application_receipt, "capability_effectiveness_feedback": effectiveness_feedback, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "certified_lineage_integrity": lineage_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": certification_validation, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
+    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "certified_capability_provenance": provenance_guard, "capability_composition_safety": composition_guard, "capability_application_receipt": application_receipt, "capability_effectiveness_feedback": effectiveness_feedback, "final_certification_audit": certification_audit, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "certified_lineage_integrity": lineage_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": certification_validation, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
     _matchable, layout_match = certified_layout_match_contract(data)
     data["layout_match"] = layout_match
     if not _matchable:
@@ -2062,6 +2067,10 @@ STEP_NAMES = {
     "capability_application_receipt": (44, "CAPABILITY_APPLICATION_RECEIPT"),
     "capability_effectiveness_feedback": (45, "CAPABILITY_EFFECTIVENESS_FEEDBACK"),
     "capability_drift_detection": (46, "CAPABILITY_DRIFT_DETECTION"),
+    "module_level_repair_routing": (47, "MODULE_LEVEL_REPAIR_ROUTING"),
+    "candidate_evidence_comparison": (48, "CANDIDATE_EVIDENCE_COMPARISON"),
+    "cost_and_retry_budget_control": (49, "COST_AND_RETRY_BUDGET_CONTROL"),
+    "final_certification_audit": (50, "FINAL_CERTIFICATION_AUDIT"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -3462,6 +3471,120 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
     return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
             "upstream_steps": upstream_steps or [failure_type],
             "profile_action": profile_action, "diagnostic_error": ""}
+
+
+def module_level_repair_route(investigation: dict[str, object],
+                              capability_drift: dict[str, object] | None = None) -> dict[str, object]:
+    """Step 47: route a failure to one additive rule module, never a replacement parser.
+
+    A late financial or coverage failure can reveal an earlier interpretation
+    defect.  This route preserves the existing certified parser and confines
+    the next repair to the named upstream module and its source-proven rules.
+    """
+    failure_type = str(investigation.get("failure_type") or "column_geometry")
+    rules = [str(rule) for rule in investigation.get("rules", [])
+             if str(rule) in DIAGNOSTIC_RULE_LIBRARY][:6]
+    upstream = [str(step) for step in investigation.get("upstream_steps", []) if str(step)][:6]
+    affected_groups = rule_groups_for(rules)
+    drift_findings = []
+    if isinstance(capability_drift, dict):
+        drift_findings = [str(item) for item in capability_drift.get("findings", []) if str(item)][:4]
+    return {
+        "step": pipeline_step_key("module_level_repair_routing"),
+        "blocked_step": pipeline_step_key(failure_type),
+        "failure_type": failure_type,
+        "target_rule_modules": rules,
+        "target_rule_groups": affected_groups,
+        "upstream_steps_rechecked": upstream or [failure_type],
+        "capability_drift_findings": drift_findings,
+        "repair_mode": "additive_module_addendum",
+        "forbidden": ["replace_certified_parser", "copy_foreign_geometry", "weaken_release_gates"],
+        "outcome": "routed",
+    }
+
+
+def candidate_evidence_score(candidate: tuple | None) -> tuple[int, dict[str, object]]:
+    """Step 48: compare candidates by independently measured proof only.
+
+    This is a tie-breaker for the next repair context, never a certification
+    shortcut: the ordinary complete release gates remain mandatory.
+    """
+    if candidate is None:
+        return -10**9, {"outcome": "unavailable"}
+    try:
+        tx, _op, _cl, _wd, _dp, _computed, financial, narration, _unmatched, _headers, columns, _parent, coverage, expected = candidate[:14]
+        columns = columns or {}
+        parsed = len(tx)
+        expected = int(expected or 0)
+    except (IndexError, TypeError, ValueError):
+        return -10**9, {"outcome": "malformed"}
+    source_proofs = {
+        "columns_distinct": bool(columns.get("_source_columns_distinct", True)),
+        "header_roles": bool(columns.get("_source_header_roles_aligned", True)),
+        "column_evidence": bool(columns.get("_source_column_evidence_valid", True)),
+        "date_cells": bool(columns.get("_source_date_cells_valid", True)),
+        "balance_cells": bool(columns.get("_source_balance_cells_valid", True)),
+        "narration_cells": bool(columns.get("_source_narration_cells_valid", True)),
+        "record_fingerprint": bool(columns.get("_source_record_fingerprint_valid", True)),
+        "canonical_contract": bool(columns.get("_canonical_contract_valid", True)),
+    }
+    coverage_ratio = min(1.0, parsed / expected) if expected else (1.0 if parsed else 0.0)
+    score = (
+        (100000 if financial else 0) + (100000 if narration else 0) +
+        (100000 if coverage else 0) + sum(5000 for value in source_proofs.values() if value) +
+        int(coverage_ratio * 1000) + min(parsed, 1000)
+    )
+    return score, {
+        "step": pipeline_step_key("candidate_evidence_comparison"),
+        "score": score,
+        "parsed_records": parsed,
+        "expected_records": expected,
+        "coverage_ratio": round(coverage_ratio, 4),
+        "financial_pass": bool(financial), "narration_pass": bool(narration),
+        "coverage_pass": bool(coverage), "source_proofs": source_proofs,
+        "selection_policy": "release_gates_then_source_proofs_then_coverage",
+        "outcome": "compared",
+    }
+
+
+def cost_and_retry_budget_control(job_id: str | None, round_number: int,
+                                  targeted_pending: object = None) -> dict[str, object]:
+    """Step 49: expose a strict, quality-preserving AI/retry budget decision."""
+    pending = [str(item) for item in (targeted_pending or []) if str(item)]
+    remaining = ai_calls_remaining(job_id)
+    return {
+        "step": pipeline_step_key("cost_and_retry_budget_control"),
+        "round": int(round_number),
+        "max_ai_calls": MAX_AI_CALLS_PER_JOB,
+        "remaining_ai_calls": remaining,
+        "deterministic_repairs_pending": pending,
+        "agentic_call_policy": (
+            "withhold_until_targeted_deterministic_addenda_are_tested" if pending
+            else "one_evidence_led_targeted_repair_only" if remaining else "budget_exhausted"
+        ),
+        "quality_policy": "release_gates_never_relaxed",
+        "outcome": "controlled",
+    }
+
+
+def final_certification_audit(validation: dict[str, object], receipt: dict[str, object],
+                              effectiveness: dict[str, object]) -> tuple[bool, dict[str, object]]:
+    """Step 50: final independent release audit before a profile is persisted."""
+    checks = {
+        "financial": bool(validation.get("financial_pass")),
+        "narration": bool(validation.get("narration_pass")),
+        "source_coverage": bool(validation.get("source_coverage_pass", True)),
+        "canonical_contract": bool(validation.get("canonical_output_contract_pass", True)),
+        "application_receipt": str(receipt.get("outcome", "")) == "pass",
+        "capability_effectiveness": str(effectiveness.get("outcome", "")) == "pass",
+    }
+    ok = all(checks.values())
+    return ok, {
+        "step": pipeline_step_key("final_certification_audit"),
+        "checks": checks,
+        "policy": "all_release_gates_and_capability_receipts_required",
+        "outcome": "certified" if ok else "withheld",
+    }
 
 # A targeted repair plan may select only extraction modes that the local UPG
 # engine actually implements.  The list deliberately contains *strategies*,
@@ -6219,7 +6342,12 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             })
             JOBS[job_id] = job
             persist_job_locked(job_id)
+        # Step 48 keeps the strongest measured candidate for diagnosis.  It
+        # never promotes a merely high-scoring candidate: certification below
+        # still requires every release gate to pass.
         latest = None
+        best_candidate_score = -10**9
+        candidate_scorecards: list[dict[str, object]] = []
         errors = []
         failure_evidence: list[str] = []
         repair_context = (
@@ -6274,6 +6402,8 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
             pending_targeted = pending_targeted_repair_strategies(
                 targeted_repair_strategies, failed_strategy_keys
             )
+            budget_control = cost_and_retry_budget_control(job_id, round_number, pending_targeted)
+            patch_job(job_id, cost_and_retry_budget_control=budget_control)
             if pending_targeted:
                 candidates = [(strategy, False) for strategy in pending_targeted]
                 record_step_learning(job_id, str(prior_investigation.get("failure_type", "column_geometry")),
@@ -6357,7 +6487,6 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                               message="UPG job was cancelled safely after the current extraction step.")
                     clear_pdf_password(path)
                     return
-                latest = candidate
                 # A failed mapping/strategy combination is never tested again
                 # within this UPG job. AI addenda must propose a materially new
                 # layout mapping before they receive another validation attempt.
@@ -6365,6 +6494,14 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                 if signature in failed_candidates:
                     skipped_candidates += 1
                     continue
+                candidate_score, scorecard = candidate_evidence_score(candidate)
+                scorecard.update({"candidate": candidate_name, "strategy": strategy or "detected_table",
+                                  "agentic_addendum": bool(force_ai_profile)})
+                candidate_scorecards.append(scorecard)
+                candidate_scorecards = candidate_scorecards[-8:]
+                if latest is None or candidate_score > best_candidate_score:
+                    latest = candidate
+                    best_candidate_score = candidate_score
                 new_candidates_this_round += 1
                 attempted_candidates += 1
                 promotion_ok, promotion_metadata = certification_promotion_gate(candidate)
@@ -6391,6 +6528,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "capability_composition_safety", "certified")
                     record_step_learning(job_id, "capability_application_receipt", "certified")
                     record_step_learning(job_id, "capability_effectiveness_feedback", "certified")
+                    record_step_learning(job_id, "capability_drift_detection", "certified")
+                    record_step_learning(job_id, "module_level_repair_routing", "certified")
+                    record_step_learning(job_id, "candidate_evidence_comparison", "certified")
+                    record_step_learning(job_id, "cost_and_retry_budget_control", "certified")
+                    record_step_learning(job_id, "final_certification_audit", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     # An execution-repair request may contribute a certified
@@ -6444,7 +6586,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             "Transaction-level checks passed, so UPG has not treated the printed summary as absolute truth."
                             if columns.get("_source_totals_conflict") else "")
                         JOBS[job_id] = {"processing": False, "valid": True, "message": f"Validated after {round_number} UPG retry rounds. Parsed {len(tx)} transactions. Opening {indian_amount(op)} − withdrawals {indian_amount(wd)} + deposits {indian_amount(dp)} = {indian_amount(calculated)}; declared closing balance is {indian_amount(cl)}. Source coverage: PASS. Financial validation: PASS. Narration validation: PASS.{balance_note}{totals_note}", "download": "/download/" + name}
-                        JOBS[job_id].update({"status": "completed", "profile_id": profile_id, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates})
+                        JOBS[job_id].update({"status": "completed", "profile_id": profile_id, "retry_round": round_number, "attempted_candidates": attempted_candidates, "skipped_candidates": skipped_candidates, "candidate_evidence_comparison": {"step": pipeline_step_key("candidate_evidence_comparison"), "best_score": best_candidate_score, "candidates": candidate_scorecards, "outcome": "selected_for_certification"}})
                         persist_job_locked(job_id)
                     post_completion_webhook(job_id, "completed", profile_id)
                     clear_pdf_password(path)
@@ -6527,6 +6669,11 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # next plan must repair the exact failed module, not infer a cause
         # from aggregate financial/narration flags alone.
         investigation = evidence_repair_plan(errors + failure_evidence + candidate_failure_evidence(latest), latest)
+        module_repair_route = module_level_repair_route(
+            investigation,
+            preflight.get("capability_drift_detection") if isinstance(preflight, dict) else {},
+        )
+        investigation["module_repair_route"] = module_repair_route
         if "targeted_repair_profile" in ai_purposes:
             investigation["profile_action"] = "targeted_layout_repair_tested"
         proposed_rules = {str(rule) for rule in investigation["rules"]}
@@ -6544,11 +6691,13 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         targeted_repair_strategies = pending_targeted_repair_strategies(
             proposed_strategies, failed_strategy_keys
         )
+        budget_control = cost_and_retry_budget_control(job_id, round_number, targeted_repair_strategies)
         diagnosis_error = str(investigation.get("diagnostic_error", "") or "")
         prior_investigation = {
             "failure_type": investigation.get("failure_type", "novel_layout"),
             "profile_action": investigation.get("profile_action", "reject_unsafe"),
             "upstream_steps": [str(step) for step in investigation.get("upstream_steps", [])][:6],
+            "module_repair_route": module_repair_route,
             "diagnostic_error": diagnosis_error,
         }
         # This is a pending lesson, not a change to an existing parser.  It is
@@ -6556,6 +6705,15 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         # passes every validation gate.
         record_step_learning(job_id, str(prior_investigation["failure_type"]), "blocked",
                              investigation.get("rules", []))
+        record_step_learning(job_id, "module_level_repair_routing", "blocked",
+                             module_repair_route.get("target_rule_modules", []))
+        patch_job(job_id,
+                  candidate_evidence_comparison={"step": pipeline_step_key("candidate_evidence_comparison"),
+                                                 "best_score": best_candidate_score,
+                                                 "candidates": candidate_scorecards,
+                                                 "outcome": "retained_for_targeted_repair"},
+                  module_level_repair_route=module_repair_route,
+                  cost_and_retry_budget_control=budget_control)
         if materially_new_rules or materially_new_strategies:
             detail += " UPG recorded a new layout investigation plan for the next round."
             empty_ai_diagnoses = 0
