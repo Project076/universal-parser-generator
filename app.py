@@ -1354,6 +1354,44 @@ def certified_lineage_integrity_guard(parent_profile: str | None) -> tuple[bool,
         current = str(data.get("parent_profile") or "").strip()
     return True, {**base, "chain_profile_ids": chain}
 
+def certified_capability_provenance_guard(provenance: list[dict[str, object]]) -> tuple[bool, dict[str, object]]:
+    """Step 42: permit reusable modules only from certified provider profiles."""
+    provider_ids = sorted({
+        str(profile_id) for item in provenance if isinstance(item, dict)
+        for profile_id in item.get("provider_profile_ids", []) if str(profile_id)
+    })
+    base = {
+        "step": pipeline_step_key("certified_capability_provenance"),
+        "provider_profile_ids": provider_ids,
+        "verified_provider_profile_ids": [],
+        "outcome": "pass",
+    }
+    for provider_id in provider_ids:
+        path = PROFILES / f"{Path(provider_id).name}.json"
+        if not path.exists():
+            return False, {**base, "outcome": "blocked",
+                           "reason": f"capability provider {provider_id} is missing"}
+        try:
+            provider = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False, {**base, "outcome": "blocked",
+                           "reason": f"capability provider {provider_id} is unreadable"}
+        validation = provider.get("validation") if isinstance(provider.get("validation"), dict) else {}
+        activation = provider.get("profile_activation") if isinstance(provider.get("profile_activation"), dict) else {}
+        certification = provider.get("certification") if isinstance(provider.get("certification"), dict) else {}
+        certified = (
+            str(validation.get("status", "")).lower() == "pass"
+            and bool(validation.get("financial_pass", False))
+            and bool(validation.get("narration_pass", False))
+            and str(activation.get("outcome", "active")) == "active"
+            and str(certification.get("status", "certified")).lower() == "certified"
+        )
+        if not certified:
+            return False, {**base, "outcome": "blocked",
+                           "reason": f"capability provider {provider_id} is not certified"}
+        base["verified_provider_profile_ids"].append(provider_id)
+    return True, base
+
 def certified_profile_export_guard(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
     """Step 31: prevent incomplete profiles from crossing the UPG API boundary.
 
@@ -1482,6 +1520,9 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
         }
         for item in (capability_provenance or []) if isinstance(item, dict) and item.get("capability")
     ][:12]
+    provenance_ok, provenance_guard = certified_capability_provenance_guard(provenance)
+    if not provenance_ok:
+        raise ValueError("Step 42 capability provenance guard rejected profile: " + json.dumps(provenance_guard, separators=(",", ":")))
     version = int(prior.get("version", 0)) + 1
     # A step lesson is stored only with a certified profile.  It contains no
     # statement text or transactions: just the named step, bounded rule IDs,
@@ -1510,7 +1551,7 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
             certified_step_lessons.append(item)
     certified_step_lessons = certified_step_lessons[-24:]
     code_sha256 = hashlib.sha256((detection_code + "\n/*UPG-CODE-BOUNDARY*/\n" + parser_code).encode("utf-8")).hexdigest()
-    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "certified_lineage_integrity": lineage_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
+    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "certified_capability_provenance": provenance_guard, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "certified_lineage_integrity": lineage_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
     _matchable, layout_match = certified_layout_match_contract(data)
     data["layout_match"] = layout_match
     if not _matchable:
@@ -1809,6 +1850,7 @@ STEP_NAMES = {
     "addendum_regression_guard": (39, "ADDENDUM_REGRESSION_GUARD"),
     "profile_revision_atomicity": (40, "CERTIFIED_REVISION_ATOMICITY"),
     "certified_lineage_integrity": (41, "CERTIFIED_LINEAGE_INTEGRITY"),
+    "certified_capability_provenance": (42, "CERTIFIED_CAPABILITY_PROVENANCE"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5766,6 +5808,7 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "addendum_regression_guard": data.get("addendum_regression_guard", {}),
         "certified_revision_atomicity": data.get("certified_revision_atomicity", {}),
         "certified_lineage_integrity": data.get("certified_lineage_integrity", {}),
+        "certified_capability_provenance": data.get("certified_capability_provenance", {}),
         "parent_profile_id": data.get("parent_profile"),
         "certification": data.get("certification", {"status": "certified", "source": data.get("upg_source", "upg_native")}),
         "profile_origin": data.get("upg_source", "upg_native"),
@@ -6126,6 +6169,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "addendum_regression_guard", "certified")
                     record_step_learning(job_id, "profile_revision_atomicity", "certified")
                     record_step_learning(job_id, "certified_lineage_integrity", "certified")
+                    record_step_learning(job_id, "certified_capability_provenance", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     # An execution-repair request may contribute a certified
