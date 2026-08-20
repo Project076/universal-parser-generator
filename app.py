@@ -1287,6 +1287,32 @@ def certified_profile_export_guard(data: dict[str, object]) -> tuple[bool, dict[
         "outcome": "exportable" if eligible else "withheld",
     }
 
+def certified_code_integrity_guard(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
+    """Step 32: prove that exported code is exactly the certified revision.
+
+    A parser can be valid in principle yet unsafe if a later sync overwrote
+    either JavaScript string.  Seal both code strings together and compare the
+    seal at every export.  The seal covers code only; it contains no customer
+    statement data.
+    """
+    detection = str(data.get("detection_code") or "")
+    parser = str(data.get("parser_code") or "")
+    actual = hashlib.sha256((detection + "\n/*UPG-CODE-BOUNDARY*/\n" + parser).encode("utf-8")).hexdigest()
+    certification = data.get("certification") if isinstance(data.get("certification"), dict) else {}
+    expected = str(certification.get("code_sha256") or "")
+    # Profiles certified before Step 32 have no seal.  Their code is sealed
+    # once, only after they have already passed Steps 30 and 31; later changes
+    # will then be detected rather than silently exported.
+    legacy_seal = not expected
+    integrity_pass = bool((expected == actual) if expected else actual)
+    return integrity_pass, {
+        "step": pipeline_step_key("code_integrity"),
+        "algorithm": "sha256",
+        "code_sha256": actual,
+        "legacy_seal_created": legacy_seal,
+        "outcome": "sealed" if integrity_pass else "withheld",
+    }
+
 def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None, capability_tags: list[str] | None = None, capability_provenance: list[dict[str, object]] | None = None, step_lessons: list[dict[str, object]] | None = None) -> str:
     """Persist validated learning additively; never discard a certified revision.
 
@@ -1361,7 +1387,8 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
             seen_step_lessons.add(key)
             certified_step_lessons.append(item)
     certified_step_lessons = certified_step_lessons[-24:]
-    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "profile_activation": activation, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
+    code_sha256 = hashlib.sha256((detection_code + "\n/*UPG-CODE-BOUNDARY*/\n" + parser_code).encode("utf-8")).hexdigest()
+    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "profile_activation": activation, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
@@ -1620,6 +1647,7 @@ STEP_NAMES = {
     "certification_promotion": (29, "CERTIFIED_LESSON_PROMOTION"),
     "profile_activation": (30, "PROFILE_ACTIVATION_GUARD"),
     "profile_export": (31, "CERTIFIED_EXPORT_CONTRACT"),
+    "code_integrity": (32, "CERTIFIED_CODE_INTEGRITY"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5547,6 +5575,15 @@ def api_profile_payload(profile_id: str) -> dict | None:
     exportable, export_metadata = certified_profile_export_guard(data)
     if not exportable:
         return None
+    integrity_ok, integrity_metadata = certified_code_integrity_guard(data)
+    if not integrity_ok:
+        return None
+    if integrity_metadata["legacy_seal_created"]:
+        certification = data.get("certification") if isinstance(data.get("certification"), dict) else {}
+        certification = {**certification, "status": certification.get("status", "certified"),
+                         "code_sha256": integrity_metadata["code_sha256"]}
+        data["certification"] = certification
+        profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return {
         "profile_id": profile_id,
         "version": int(data.get("version", 1)),
@@ -5560,6 +5597,7 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "rules": data.get("rules", {}),
         "validation": data.get("validation", {"status": "pass"}),
         "profile_export": export_metadata,
+        "code_integrity": integrity_metadata,
         "parent_profile_id": data.get("parent_profile"),
         "certification": data.get("certification", {"status": "certified", "source": data.get("upg_source", "upg_native")}),
         "profile_origin": data.get("upg_source", "upg_native"),
@@ -5864,6 +5902,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     # capability donor only.
                     record_step_learning(job_id, "profile_activation", "certified")
                     record_step_learning(job_id, "profile_export", "certified")
+                    record_step_learning(job_id, "code_integrity", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     profile_id = save_profile(
@@ -6503,13 +6542,15 @@ class App(BaseHTTPRequestHandler):
                 if missing:
                     raise ValueError("Missing required fields: " + ", ".join(missing))
                 profile_id = str(incoming.get("profile_id") or hashlib.sha256((incoming["bank_name"] + incoming["format_name"] + incoming["detection_code"] + incoming["parser_code"]).encode()).hexdigest()[:16])
+                imported_code_sha256 = hashlib.sha256((str(incoming["detection_code"]) + "\n/*UPG-CODE-BOUNDARY*/\n" + str(incoming["parser_code"])).encode("utf-8")).hexdigest()
+                incoming_certification = incoming.get("certification") if isinstance(incoming.get("certification"), dict) else {}
                 stored = {
                     "version": int(incoming.get("version", 1)), "bank_name": incoming["bank_name"], "format_name": incoming["format_name"],
                     "layout_fingerprint": incoming.get("layout_fingerprint", ""), "detection_code": incoming["detection_code"], "parser_code": incoming["parser_code"],
                     "last_validated_strategy": incoming.get("extraction_strategy", incoming.get("strategy", "text-column-offsets")),
                     "columns": incoming.get("columns", {}), "rules": incoming.get("rules", {}),
                     "validation": {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True, "transaction_count": incoming.get("certification", {}).get("transaction_count")},
-                    "certification": incoming.get("certification", {}), "parent_profile": incoming.get("parent_profile_id") or incoming.get("evolved_from_profile_id"), "upg_source": "bs_analyzer_import",
+                    "certification": {**incoming_certification, "status": incoming_certification.get("status", "certified"), "code_sha256": imported_code_sha256}, "parent_profile": incoming.get("parent_profile_id") or incoming.get("evolved_from_profile_id"), "upg_source": "bs_analyzer_import",
                 }
                 (PROFILES / f"{profile_id}.json").write_text(json.dumps(stored, indent=2), encoding="utf-8")
                 self.json(api_profile_payload(profile_id), HTTPStatus.CREATED)

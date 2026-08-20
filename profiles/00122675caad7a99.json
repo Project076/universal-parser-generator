@@ -61,6 +61,7 @@
   "certification": {
     "status": "certified",
     "source": "upg_native",
-    "certified_at": "2026-08-14T08:42:54Z"
+    "certified_at": "2026-08-14T08:42:54Z",
+    "code_sha256": "1db138cac9a5e81d2d1a198b9b2fcbbd53853de24a6e8cbd288e614472bbcf94"
   }
 }

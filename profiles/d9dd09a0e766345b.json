@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 6,
   "header_signature": [
     "Date",
     "Narration",
@@ -21,5 +21,20 @@
   "validated_observations": 4,
   "last_validated_strategy": "unsigned_running_balance_text",
   "self_healed_addendum": false,
-  "diagnostic_rules": []
+  "diagnostic_rules": [],
+  "detection_code": "function detect(text) {\n  const normalized = String(text || '').toLowerCase().replace(/\\s+/g, ' ');\n  const anchors = [\"date\", \"narration\", \"balance\", \"withdrawal\", \"deposit\"];\n  const hasNarration = normalized.includes('narration') || normalized.includes('particular') || normalized.includes('description');\n  const hasDebit = normalized.includes('withdrawal') || normalized.includes('debit') || normalized.includes('dr');\n  const hasCredit = normalized.includes('deposit') || normalized.includes('credit') || normalized.includes('cr');\n  return normalized.includes('date') && normalized.includes('balance') && hasNarration && hasDebit && hasCredit && anchors.length >= 2;\n}",
+  "parser_code": "function parse(text, options) {\n  const blocks = String(text || '').split(/(?=^\\s*\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}\\b)/m);\n  const dateToken = '\\d{1,2}[\\/-](?:\\d{1,2}|[A-Za-z]{3})[\\/-]\\d{2,4}';\n  const dateRe = new RegExp('^\\s*(' + dateToken + ')(?:\\s+(' + dateToken + '))?\\b');\n  const moneyRe = /-?\\d[\\d,]*\\.\\d{2}/g;\n  const asNumber = (value) => Number(String(value).replace(/,/g, ''));\n  const rows = []; let previous = Number(options && options.openingBalance); if (!Number.isFinite(previous)) previous = null;\n  for (const block of blocks) {\n    const match = block.match(dateRe); if (!match || /\\bB\\/F\\b/i.test(block) || /^(?:page total|grand total)/im.test(block)) continue;\n    const signed = [...block.matchAll(/(-?[\\d,]+\\.\\d{2})\\s*(Dr|Cr)\\b/ig)]; const values = [...block.matchAll(moneyRe)];\n    if (!signed.length || values.length < 2) continue;\n    const balanceToken = signed[signed.length - 1], balance = asNumber(balanceToken[1]) * (balanceToken[2].toLowerCase() === 'dr' ? -1 : 1);\n    const amountToken = values.filter((value) => value.index < balanceToken.index).pop(); if (!amountToken) continue;\n    const amount = Math.abs(asNumber(amountToken[0])); const particulars = block.slice(match[0].length, amountToken.index).replace(/\\s+/g, ' ').trim();\n    const refs = particulars.match(/\\b\\d{6,}\\b/g) || []; const p = match[1].split(/[\\/-]/); const year = p[2].length === 2 ? `20${p[2]}` : p[2];\n    const delta = previous == null ? amount : balance - previous;\n    rows.push({date:`${p[0].padStart(2,'0')}/${p[1].padStart(2,'0')}/${year}`, particulars, withdrawal:delta < 0 ? -delta : 0, deposit:delta > 0 ? delta : 0, balance, chqNo:refs.length ? refs[refs.length - 1] : ''}); previous = balance;\n  } return rows;\n}",
+  "bank_name": "Unknown",
+  "format_name": "PDF Statement",
+  "validation": {
+    "status": "pass",
+    "financial_pass": true,
+    "narration_pass": true,
+    "balance_chain_pass": true,
+    "transaction_count": 4
+  },
+  "certification": {
+    "status": "certified",
+    "code_sha256": "3b3a38b26b4f4973b8d0f9accc931d4a9788b857de2cb5b2d03baa9bc33b9e31"
+  }
 }
