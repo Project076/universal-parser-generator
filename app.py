@@ -356,6 +356,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "summary_endpoints": "Use the printed statement-summary opening and closing balances as endpoints.",
     "balance_delta": "Classify a single unsigned amount column from running-balance movement.",
     "continuation_merge": "Join narration and transaction fragments across rows or pages.",
+    "narration_source_cell": "Export Particulars only from the same measured source Particulars cell (plus source-proven continuation text). A blank Particulars cell stays blank; never copy a Withdrawal, Deposit, Balance, Date, Instrument, header, footer, or adjacent-row token into narration.",
     "footer_exclusion": "Exclude totals, closing labels, disclaimers, and page furniture.",
     "terminal_row_before_summary": "When statement-summary labels begin after the final dated row, seal that dated row before ignoring summary/footer text; never let a later opening/closing/total label contaminate its date or narration.",
     "reverse_order": "Reverse newest-first statements before reconciliation.",
@@ -381,12 +382,12 @@ DIAGNOSTIC_RULE_LIBRARY = {
 # still measured from the submitted file.  This is an explainable retrieval
 # system--not a blind whole-parser copy or an untrained "deep learning" claim.
 RULE_GROUPS = {
-    "narration": {"continuation_merge", "multi_page_continuation", "reference_date_boundary"},
+    "narration": {"continuation_merge", "multi_page_continuation", "reference_date_boundary", "narration_source_cell"},
     "furniture": {"footer_exclusion", "terminal_row_before_summary", "bf_preperiod_artifact", "headerless_layout"},
     "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date", "date_column_boundary", "numeric_date_geometry"},
     "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency", "source_amount_geometry"},
     "endpoints_and_totals": {"summary_endpoints", "summary_total_warning"},
-    "validation": {"source_coverage"},
+    "validation": {"source_coverage", "narration_source_cell"},
 }
 # Earlier certified profiles predate the structured rule-library fields.  They
 # are still useful evidence, but an empty historic `diagnostic_rules` list
@@ -733,6 +734,38 @@ def coordinate_narrations_traceable(transactions: list[dict], raw: str) -> bool:
         if score >= 0.70:
             strong_rows += 1
     return narrated_rows > 0 and strong_rows / narrated_rows >= 0.95
+
+def narration_source_cells_traceable(transactions: list[dict]) -> bool:
+    """Prove every exported narration came from its own Particulars cell.
+
+    This is deliberately row-local.  Finding words merely *somewhere* in a
+    statement is not enough: a withdrawal, deposit, balance, instrument or
+    neighbouring row can otherwise leak into Particulars and still make the
+    financial equation reconcile.  A blank source Particulars cell is valid,
+    but it must remain blank in the output.
+
+    The check accepts source-cell punctuation/whitespace differences and
+    cleaned page furniture, but not invented text.  It is only used for a
+    measured native/source table; generated canonical rows have already lost
+    their original cell identity and use the stricter geometry trace route.
+    """
+    checked = 0
+    for transaction in transactions:
+        if "_source_narration" not in transaction:
+            continue
+        checked += 1
+        parsed = str(transaction.get("narration") or "").strip()
+        source = str(transaction.get("_source_narration") or "").strip()
+        if not parsed:
+            continue
+        if not source:
+            return False
+        parsed_norm, source_norm = normalize_narration(parsed), normalize_narration(source)
+        # The parser may remove a header/furniture fragment from a source cell,
+        # but it may never add a token from an adjacent financial column.
+        if not parsed_norm or parsed_norm not in source_norm:
+            return False
+    return checked > 0
 
 def clean_narration(s: str) -> str:
     """Keep only the statement's Particulars, never amounts or page furniture."""
@@ -4101,7 +4134,8 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
                 deposit = amount if "CR" in kind else Decimal("0")
         if withdrawal is None: withdrawal = Decimal("0")
         if deposit is None: deposit = Decimal("0")
-        narration = clean_narration(str(cell("narration") or ""))
+        source_narration = str(cell("narration") or "")
+        narration = clean_narration(source_narration)
         # B/F is the statement opening anchor, not a movement.  Its Credit
         # cell may look exactly like a deposit, so exclude it before totals,
         # chain validation, and profile certification.
@@ -4125,7 +4159,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
                 printed_amount = money(row[len(CANONICAL)])
                 if printed_amount is not None:
                     source_amount = printed_amount
-            tx.append({"date": display_date(table_date), "narration": narration, "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": monetary_cell("balance"), "source_amount": source_amount})
+            tx.append({"date": display_date(table_date), "narration": narration, "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": monetary_cell("balance"), "source_amount": source_amount, "_source_narration": source_narration})
     # Transaction extraction uses the furniture-cleaned text, but statement
     # endpoints must come from the original PDF text.  A repeated J&K Bank
     # header block can sit before B/F and the final Grand Total; cleaning it is
@@ -4471,6 +4505,9 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     normalized_source = normalize_narration(raw)
     unmatched = [x["narration"] for x in tx if normalize_narration(x["narration"]) and normalize_narration(x["narration"]) not in normalized_source]
     malformed_narrations = [x["narration"] for x in tx if re.fullmatch(r"\s*[\d,.]+\s*", x["narration"] or "")]
+    source_narration_valid = (
+        True if generated_canonical_headers(headers) else narration_source_cells_traceable(tx)
+    )
     # The ordinary path requires exact normalized source order.  Original-PDF
     # geometry has an additional, stricter-than-guessing route for statements
     # whose embedded text layer serialises Particulars out of visual order.
@@ -4483,7 +4520,8 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         and source_amount_valid
         and coordinate_narrations_traceable(tx, raw)
     )
-    narration_valid = (not unmatched or coordinate_trace_valid) and not malformed_narrations and coverage_valid and canonical_contract_valid
+    narration_valid = (not unmatched or coordinate_trace_valid) and not malformed_narrations and source_narration_valid and coverage_valid and canonical_contract_valid
+    columns["_source_narration_cells_valid"] = source_narration_valid
     return tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_withdrawals, declared_deposits, statement_totals_valid
 
 def export_excel(tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_withdrawals=None, declared_deposits=None, statement_totals_valid=True, source_balance_unreliable=False):
