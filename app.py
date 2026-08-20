@@ -3314,6 +3314,33 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             x_wd = float(same_line("withdrawals")["x0"])
             x_dp = float(same_line("deposits")["x0"])
             x_bal = float(same_line("balance")["x0"])
+            # Do not assume that every bank prints Debit before Credit and
+            # Balance at the far right.  The *meaning* of each column came
+            # from the measured header; its source band must now be bounded
+            # by the next measured column on this particular page.  This
+            # supports layouts such as Date | Details | Credit | Debit |
+            # Balance without borrowing another bank's positions or swapping
+            # the two sides to force reconciliation.
+            measured_starts = {
+                "date": x_date,
+                "narration": x_part,
+                "withdrawal": x_wd,
+                "deposit": x_dp,
+                "balance": x_bal,
+            }
+            ordered_fields = sorted(measured_starts, key=measured_starts.get)
+            field_bands: dict[str, tuple[float, float]] = {}
+            for position, field in enumerate(ordered_fields):
+                start = measured_starts[field]
+                next_start = (
+                    measured_starts[ordered_fields[position + 1]]
+                    if position + 1 < len(ordered_fields)
+                    else float(page.width) + 5
+                )
+                # Header text often starts a little to the right of a
+                # right-aligned currency value.  The small lead-in retains
+                # that value while the next measured start prevents overlap.
+                field_bands[field] = (start - 10, next_start - 1)
             # A header can start to the right of the first actual narration
             # glyph.  The common ``Cheque Number | Transaction Remarks``
             # layout is an example: the data narration begins immediately
@@ -3385,7 +3412,7 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 # broad bands could read the same deposit once as deposit and
                 # again as the final balance, which then tempted later logic
                 # to repair a ledger that was actually read incorrectly.
-                withdrawal_text = band(x_wd - 10, x_dp - 10).replace(" ", "")
+                withdrawal_text = band(*field_bands["withdrawal"]).replace(" ", "")
                 # Some original PDFs let the final word of a narration range
                 # overlap the debit column (``to17-3,894.00``).  The final
                 # currency token is still source text in the debit band; do
@@ -3394,8 +3421,8 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 trailing_amount = re.search(r"(\d[\d,]*\.\d{2})$", withdrawal_text)
                 if trailing_amount and not re.fullmatch(r"-?\d[\d,]*\.\d{2}", withdrawal_text):
                     withdrawal_text = trailing_amount.group(1)
-                deposit_text = band(x_dp - 10, x_bal - 10).replace(" ", "")
-                balance_text = band(x_bal - 10, float(page.width) + 5).replace(" ", "")
+                deposit_text = band(*field_bands["deposit"]).replace(" ", "")
+                balance_text = band(*field_bands["balance"]).replace(" ", "")
                 # Preserve raw monetary source cells.  The statement-level
                 # normalizer can infer the column's decimal precision from
                 # every valid row, then safely repair an isolated text-layer
@@ -3406,7 +3433,18 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 # an unusable balance cannot erase it or change its direction.
                 if not withdrawal and not deposit:
                     continue
-                narration_words = [word for word in block if x_narration_left <= float(word["x0"]) < x_wd - 10]
+                # Particulars is a measured cell, never the remainder of the
+                # page.  Its right edge is the first financial/balance column
+                # to its right on this source page.  This prevents a reversed
+                # Credit/Debit layout from leaking a printed amount into the
+                # narration field.
+                narration_right_candidates = [
+                    measured_starts[field] - 10
+                    for field in ("withdrawal", "deposit", "balance")
+                    if measured_starts[field] > x_narration_left
+                ]
+                narration_right = min(narration_right_candidates, default=float(page.width) + 5)
+                narration_words = [word for word in block if x_narration_left <= float(word["x0"]) < narration_right]
                 narration = clean_narration(" ".join(str(word["text"]) for word in sorted(narration_words, key=lambda item: (float(item["top"]), float(item["x0"])))) )
                 narration = re.split(
                     r"(?i)\b(?:opening\s+balance|total|grand\s+total|"
