@@ -1305,6 +1305,55 @@ def addendum_regression_guard(headers: list[object], columns: dict[str, object],
         }
     return True, base
 
+def certified_lineage_integrity_guard(parent_profile: str | None) -> tuple[bool, dict[str, object]]:
+    """Step 41: verify the complete immutable parent chain of an addendum."""
+    parent_id = str(parent_profile or "").strip()
+    base = {
+        "step": pipeline_step_key("certified_lineage_integrity"),
+        "root_profile": not bool(parent_id),
+        "chain_profile_ids": [],
+        "max_supported_depth": 8,
+        "outcome": "pass",
+    }
+    if not parent_id:
+        return True, base
+    seen: set[str] = set()
+    chain: list[str] = []
+    current = parent_id
+    while current:
+        if current in seen:
+            return False, {**base, "chain_profile_ids": chain, "outcome": "blocked",
+                           "reason": "circular parent/addendum lineage"}
+        if len(chain) >= 8:
+            return False, {**base, "chain_profile_ids": chain, "outcome": "blocked",
+                           "reason": "parent/addendum lineage exceeds supported depth"}
+        seen.add(current)
+        path = PROFILES / f"{Path(current).name}.json"
+        if not path.exists():
+            return False, {**base, "chain_profile_ids": chain, "outcome": "blocked",
+                           "reason": f"lineage profile {current} is missing"}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False, {**base, "chain_profile_ids": chain, "outcome": "blocked",
+                           "reason": f"lineage profile {current} is unreadable"}
+        validation = data.get("validation") if isinstance(data.get("validation"), dict) else {}
+        activation = data.get("profile_activation") if isinstance(data.get("profile_activation"), dict) else {}
+        certification = data.get("certification") if isinstance(data.get("certification"), dict) else {}
+        certified = (
+            str(validation.get("status", "")).lower() == "pass"
+            and bool(validation.get("financial_pass", False))
+            and bool(validation.get("narration_pass", False))
+            and str(activation.get("outcome", "active")) == "active"
+            and str(certification.get("status", "certified")).lower() == "certified"
+        )
+        chain.append(current)
+        if not certified:
+            return False, {**base, "chain_profile_ids": chain, "outcome": "blocked",
+                           "reason": f"lineage profile {current} is no longer certified"}
+        current = str(data.get("parent_profile") or "").strip()
+    return True, {**base, "chain_profile_ids": chain}
+
 def certified_profile_export_guard(data: dict[str, object]) -> tuple[bool, dict[str, object]]:
     """Step 31: prevent incomplete profiles from crossing the UPG API boundary.
 
@@ -1412,6 +1461,9 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     )
     if not regression_ok:
         raise ValueError("Step 39 addendum regression guard rejected profile: " + json.dumps(regression_guard, separators=(",", ":")))
+    lineage_ok, lineage_guard = certified_lineage_integrity_guard(parent_profile)
+    if not lineage_ok:
+        raise ValueError("Step 41 certified lineage guard rejected profile: " + json.dumps(lineage_guard, separators=(",", ":")))
     activation_ok, activation = profile_activation_guard(headers, columns, layout_fingerprint, parent_profile, validation)
     if not activation_ok:
         raise ValueError("Step 30 profile activation guard rejected incomplete certification: " + json.dumps(activation, separators=(",", ":")))
@@ -1458,7 +1510,7 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
             certified_step_lessons.append(item)
     certified_step_lessons = certified_step_lessons[-24:]
     code_sha256 = hashlib.sha256((detection_code + "\n/*UPG-CODE-BOUNDARY*/\n" + parser_code).encode("utf-8")).hexdigest()
-    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
+    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "certified_lineage_integrity": lineage_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
     _matchable, layout_match = certified_layout_match_contract(data)
     data["layout_match"] = layout_match
     if not _matchable:
@@ -1756,6 +1808,7 @@ STEP_NAMES = {
     "addendum_lineage_selection": (38, "ADDENDUM_LINEAGE_SELECTION"),
     "addendum_regression_guard": (39, "ADDENDUM_REGRESSION_GUARD"),
     "profile_revision_atomicity": (40, "CERTIFIED_REVISION_ATOMICITY"),
+    "certified_lineage_integrity": (41, "CERTIFIED_LINEAGE_INTEGRITY"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5712,6 +5765,7 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "layout_match": layout_match,
         "addendum_regression_guard": data.get("addendum_regression_guard", {}),
         "certified_revision_atomicity": data.get("certified_revision_atomicity", {}),
+        "certified_lineage_integrity": data.get("certified_lineage_integrity", {}),
         "parent_profile_id": data.get("parent_profile"),
         "certification": data.get("certification", {"status": "certified", "source": data.get("upg_source", "upg_native")}),
         "profile_origin": data.get("upg_source", "upg_native"),
@@ -6071,6 +6125,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "addendum_lineage_selection", "certified")
                     record_step_learning(job_id, "addendum_regression_guard", "certified")
                     record_step_learning(job_id, "profile_revision_atomicity", "certified")
+                    record_step_learning(job_id, "certified_lineage_integrity", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     # An execution-repair request may contribute a certified
