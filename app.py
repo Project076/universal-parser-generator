@@ -1405,20 +1405,6 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     profile_path = PROFILES / f"{ident}.json"
     try: prior = json.loads(profile_path.read_text(encoding="utf-8"))
     except (OSError, ValueError): prior = {}
-    if prior:
-        # The active file is a convenience pointer for fast exact-layout
-        # lookup.  Before it is advanced, retain the prior certified parser as
-        # an immutable revision.  This lets old statements continue to use the
-        # historical, source-proven mapping and stops a new lesson from
-        # rewriting history for a different layout variant.
-        prior_version = max(1, int(prior.get("version", 1) or 1))
-        revision_path = PROFILE_REVISIONS / f"{ident}.v{prior_version}.json"
-        if not revision_path.exists():
-            snapshot = dict(prior)
-            snapshot["immutable_revision"] = True
-            snapshot["revision_of"] = ident
-            snapshot["archived_at"] = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-            revision_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
     observations = int(prior.get("validated_observations", 0)) + 1
     detection_code, parser_code = certified_javascript_code(headers, strategy)
     regression_ok, regression_guard = addendum_regression_guard(
@@ -1475,7 +1461,36 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "step_lessons": certified_step_lessons, "profile_activation": activation, "addendum_regression_guard": regression_guard, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z", "code_sha256": code_sha256}}
     _matchable, layout_match = certified_layout_match_contract(data)
     data["layout_match"] = layout_match
-    profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    if not _matchable:
+        raise ValueError("Step 40 certified revision guard rejected non-matchable profile: " + json.dumps(layout_match, separators=(",", ":")))
+    revision_atomicity = {
+        "step": pipeline_step_key("profile_revision_atomicity"),
+        "release_gates_passed_before_revision": True,
+        "prior_revision_preserved": bool(prior),
+        "write_mode": "atomic_replace",
+        "outcome": "active",
+    }
+    data["certified_revision_atomicity"] = revision_atomicity
+    if prior:
+        # Archive only after every release gate for the new revision passes.
+        # A rejected candidate must leave no apparent revision advance behind.
+        prior_version = max(1, int(prior.get("version", 1) or 1))
+        revision_path = PROFILE_REVISIONS / f"{ident}.v{prior_version}.json"
+        if not revision_path.exists():
+            snapshot = dict(prior)
+            snapshot["immutable_revision"] = True
+            snapshot["revision_of"] = ident
+            snapshot["archived_at"] = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+            revision_temp = revision_path.with_name(f".{revision_path.name}.{uuid.uuid4().hex}.tmp")
+            revision_temp.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+            os.replace(revision_temp, revision_path)
+    temp_path = profile_path.with_name(f".{profile_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(temp_path, profile_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
     try: ledger = json.loads(LEARNING_LEDGER.read_text(encoding="utf-8"))
@@ -1740,6 +1755,7 @@ STEP_NAMES = {
     "execution_failure_addendum": (36, "EXECUTION_FAILURE_ADDENDUM_ROUTING"),
     "addendum_lineage_selection": (38, "ADDENDUM_LINEAGE_SELECTION"),
     "addendum_regression_guard": (39, "ADDENDUM_REGRESSION_GUARD"),
+    "profile_revision_atomicity": (40, "CERTIFIED_REVISION_ATOMICITY"),
 }
 
 def pipeline_step_key(failure_type: str) -> str:
@@ -5695,6 +5711,7 @@ def api_profile_payload(profile_id: str) -> dict | None:
         "code_integrity": integrity_metadata,
         "layout_match": layout_match,
         "addendum_regression_guard": data.get("addendum_regression_guard", {}),
+        "certified_revision_atomicity": data.get("certified_revision_atomicity", {}),
         "parent_profile_id": data.get("parent_profile"),
         "certification": data.get("certification", {"status": "certified", "source": data.get("upg_source", "upg_native")}),
         "profile_origin": data.get("upg_source", "upg_native"),
@@ -6053,6 +6070,7 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                     record_step_learning(job_id, "execution_failure_addendum", "certified")
                     record_step_learning(job_id, "addendum_lineage_selection", "certified")
                     record_step_learning(job_id, "addendum_regression_guard", "certified")
+                    record_step_learning(job_id, "profile_revision_atomicity", "certified")
                     with JOBS_LOCK:
                         job_context = JOBS.get(job_id, {})
                     # An execution-repair request may contribute a certified
