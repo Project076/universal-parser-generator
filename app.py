@@ -1210,7 +1210,7 @@ def certified_feature_vector(headers: list[object], columns: dict[str, int], str
         "challenge_ids": sorted(challenges),
     }
 
-def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None, capability_tags: list[str] | None = None) -> str:
+def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None, capability_tags: list[str] | None = None, capability_provenance: list[dict[str, object]] | None = None) -> str:
     """Persist only validated, privacy-safe layout learning; never source rows."""
     if generated_canonical_headers(headers) and not layout_fingerprint: return ""
     ident = profile_id(headers, layout_fingerprint)
@@ -1223,13 +1223,30 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
     features = certified_feature_vector(headers, columns, strategy, diagnostic_rules, challenges, capability_tags)
     learned_rule_ids = sorted({*(diagnostic_rules or []), *challenges, *(capability_tags or [])})
     rule_groups = rule_groups_for(learned_rule_ids)
-    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
+    # Keep only the identity of reusable behaviours/providers.  Never retain
+    # statement rows, text, account data, balances, or coordinates here.
+    provenance = [
+        {
+            "capability": str(item.get("capability", "")),
+            "rule_group": str(item.get("rule_group", "")),
+            "rule_modules": [str(rule) for rule in item.get("rule_modules", []) if str(rule) in DIAGNOSTIC_RULE_LIBRARY],
+            "provider_profile_ids": [str(profile_id) for profile_id in item.get("certified_profile_ids", [])][:4],
+        }
+        for item in (capability_provenance or []) if isinstance(item, dict) and item.get("capability")
+    ][:12]
+    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
     try: ledger = json.loads(LEARNING_LEDGER.read_text(encoding="utf-8"))
     except (OSError, ValueError): ledger = {"validated_profiles": {}}
-    ledger.setdefault("validated_profiles", {})[ident] = {"observations": observations, "strategy": data["last_validated_strategy"], "self_healed_addendum": data["self_healed_addendum"], "diagnostic_rules": data["diagnostic_rules"], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "parent_profile": parent_profile}
+    ledger.setdefault("validated_profiles", {})[ident] = {"observations": observations, "strategy": data["last_validated_strategy"], "self_healed_addendum": data["self_healed_addendum"], "diagnostic_rules": data["diagnostic_rules"], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "parent_profile": parent_profile}
+    # A rule earns preference only after a full certified outcome.  This is a
+    # bounded aggregate scorecard, not ML training and not statement storage.
+    scorecard = ledger.setdefault("certified_rule_successes", {})
+    for rule in learned_rule_ids:
+        if rule in DIAGNOSTIC_RULE_LIBRARY:
+            scorecard[rule] = int(scorecard.get(rule, 0) or 0) + 1
     LEARNING_LEDGER.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     return ident
 
@@ -1277,6 +1294,31 @@ def certified_learning_context(limit: int = 8) -> list[dict[str, object]]:
         })
     return lessons
 
+def certified_rule_successes() -> dict[str, int]:
+    """Return only bounded, certification-earned reusable rule scores."""
+    try:
+        ledger = json.loads(LEARNING_LEDGER.read_text(encoding="utf-8"))
+        raw = ledger.get("certified_rule_successes", {})
+    except (OSError, ValueError):
+        ledger = {}
+        raw = {}
+    scores = {
+        str(rule): int(count or 0) for rule, count in raw.items()
+        if str(rule) in DIAGNOSTIC_RULE_LIBRARY and int(count or 0) > 0
+    }
+    # Backfill score evidence from profiles certified before this scorecard
+    # existed.  They are already safe lessons, so no reprocessing or source
+    # data is required to make their reusable rules available immediately.
+    if not scores:
+        for summary in (ledger.get("validated_profiles", {}) if isinstance(ledger, dict) else {}).values():
+            if not isinstance(summary, dict):
+                continue
+            for rule in [*summary.get("diagnostic_rules", []), *summary.get("challenge_history", [])]:
+                rule = str(rule)
+                if rule in DIAGNOSTIC_RULE_LIBRARY:
+                    scores[rule] = scores.get(rule, 0) + 1
+    return scores
+
 def closest_certified_lessons(path: Path | None, headers: list[object] | None = None, limit: int = 3) -> list[dict[str, object]]:
     """Find the closest certified layouts using this source's safe structure."""
     target_headers = {norm(item) for item in (headers or []) if norm(item)}
@@ -1314,6 +1356,7 @@ def ai_learning_packet(path: Path | None = None, headers: list[object] | None = 
             "narration_rule": "Use only the source Particulars cell; blank is allowed; furniture and numeric cells are forbidden.",
         },
         "permanent_historical_lessons": HISTORICAL_CHALLENGE_LESSONS,
+        "certified_rule_successes": certified_rule_successes(),
         "closest_certified_layouts": closest_certified_lessons(path, headers),
         "certified_profile_lessons": certified_learning_context(),
     }
@@ -1346,6 +1389,7 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
         signals.append(("balance_delta", "Source exposes an unsigned running-balance column; infer direction only from balance movement.", "unsigned_running_balance_text"))
 
     certified = certified_learning_context(limit=64)
+    success_scores = certified_rule_successes()
 
     def providers_for(capability: str) -> list[dict[str, object]]:
         """Return compact certified rule modules for one source-proven need.
@@ -1387,7 +1431,9 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
                 "reusable_rules": reusable_rules[:4],
                 "rule_groups": list(lesson.get("rule_groups", []))[:4],
                 "challenges_solved": [str(item) for item in lesson.get("challenge_history", [])][:3],
+                "certified_success_score": sum(success_scores.get(rule, 0) for rule in reusable_rules),
             })
+        providers.sort(key=lambda provider: int(provider.get("certified_success_score", 0) or 0), reverse=True)
         return providers[:4]
 
     selected: list[dict[str, object]] = []
@@ -5129,6 +5175,10 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                         format_name=f"{path.suffix.lower().lstrip('.') or 'pdf'} statement".upper(),
                         challenge_history=sorted(diagnostic_rules | {str(prior_investigation.get("failure_type", ""))}),
                         capability_tags=[str(item.get("capability")) for item in job_context.get("preflight_blueprint", {}).get("source_matched_capabilities", []) if isinstance(item, dict) and item.get("capability")],
+                        capability_provenance=[
+                            item for item in job_context.get("preflight_blueprint", {}).get("source_matched_capabilities", [])
+                            if isinstance(item, dict)
+                        ],
                     )
                     name = export_excel(tx, op, cl, wd, dp, calculated, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_wd, declared_dp, statement_totals_valid, bool(columns.get("_source_balance_unreliable")))
                     with JOBS_LOCK:
