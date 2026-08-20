@@ -685,7 +685,17 @@ def clean_narration(s: str) -> str:
     furniture = ("jammu and kashmir bank", "statement of account", "page total", "grand total", "printed by", "ifsc code", "micr code", "unless the constituent", "customer id", "currency code", "a/c no", "interest rate", "no nomination", "c kyc", "ckyc")
     for line in s.splitlines():
         compact = re.sub(r"\s+", " ", line).strip()
-        if compact and not any(marker in compact.lower() for marker in furniture): lines.append(compact)
+        # A bank name is furniture only when it is part of the page header.
+        # It may legitimately occur inside a payment description (for
+        # example, an IMPS beneficiary at J&K Bank).  Retaining that source
+        # narration is safer than blanking a genuine Particular merely
+        # because it contains the issuing bank's name.
+        looks_like_transaction = bool(re.search(
+            r"(?i)\b(?:imps|upi|neft|rtgs|pos|atm|rrn\s*:|from\s*:|to\s*:|cheque)\b",
+            compact,
+        ))
+        if compact and (looks_like_transaction or not any(marker in compact.lower() for marker in furniture)):
+            lines.append(compact)
     result = " ".join(lines)
     result = re.sub(r"-{5,}", " ", result)
     # Some PDF text layers collapse a multi-line page header into a single
@@ -1778,9 +1788,40 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     # The first AI call creates an evidence-led layout blueprint.  Once that
     # map has been tested and failed, the final call must create a *revised
     # map* from the measured failure evidence--not merely diagnose it.
+    prior_purposes = ai_call_purposes(job_id)
     purpose = "targeted_repair_profile" if (
-        job_id and repair_context and "layout_blueprint" in ai_call_purposes(job_id)
+        job_id and repair_context and (
+            "layout_blueprint" in prior_purposes
+            or "deterministic_geometry_preflight" in prior_purposes
+        )
     ) else "layout_blueprint"
+    # A complete semantic PDF ledger header is already stronger evidence than
+    # an LLM's generic 0..5 column map.  Previously we spent the first AI call
+    # asking it to rediscover that obvious map, then rejected the repeated
+    # canonical answer as not materially new.  Defer the expert call until a
+    # deterministic extraction has produced concrete failed validation
+    # evidence.  The deferred call is then a single targeted repair rather
+    # than a planning call plus a duplicate-map repair.
+    if (
+        purpose == "layout_blueprint"
+        and source_path is not None
+        and source_path.suffix.lower() == ".pdf"
+        and has_standard_geometry_header_contract(cached_pdf_text(source_path))
+    ):
+        if job_id:
+            with JOBS_LOCK:
+                job = JOBS.get(job_id, {})
+                history = [str(item) for item in job.get("ai_call_purposes", [])][-5:]
+                if "deterministic_geometry_preflight" not in history:
+                    history.append("deterministic_geometry_preflight")
+                job["ai_call_purposes"] = history
+                job["ai_layout_error"] = (
+                    "AI layout planning deferred: measured Date/Particulars/"
+                    "Withdrawal/Deposit/Balance geometry is available."
+                )
+                JOBS[job_id] = job
+                persist_job_locked(job_id)
+        return None
     if not reserve_ai_call(job_id, purpose):
         record_failure("AI call budget is exhausted before a layout map could be generated.")
         return None
@@ -3013,8 +3054,28 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             )]
             if not candidates:
                 continue
-            date_header = max(candidates, key=lambda word: float(word["top"]))
-            header_top = float(date_header["top"])
+            # A bank may print both ``Transaction Date`` and ``Value Date``.
+            # Treating both physical date cells as record anchors splits every
+            # row in two and makes the first line of a narration appear to
+            # belong to the next transaction.  Prefer the measured Value Date
+            # column when it is explicitly labelled, otherwise use the
+            # leftmost date column.  This is a column decision, never a guess
+            # based on date-looking text in narration.
+            header_top = float(max(candidates, key=lambda word: float(word["top"]))["top"])
+            header_words = [word for word in words if abs(float(word["top"]) - header_top) <= 12]
+            date_headers = sorted(
+                (word for word in headers["date"] if abs(float(word["top"]) - header_top) <= 12),
+                key=lambda word: float(word["x0"]),
+            )
+            value_date_headers = [
+                date_word for date_word in date_headers
+                if any(
+                    re.sub(r"[^a-z]", "", str(label["text"]).lower()) == "value"
+                    and 0 <= float(date_word["x0"]) - float(label["x1"]) <= 28
+                    for label in header_words
+                )
+            ]
+            date_header = value_date_headers[0] if value_date_headers else date_headers[0]
             def same_line(key: str):
                 return min((word for word in headers[key] if abs(float(word["top"]) - header_top) <= 12), key=lambda word: float(word["x0"]))
             x_date = float(date_header["x0"])
@@ -3029,7 +3090,6 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             # Use the right edge of that preceding reference header as a
             # measured lower narration boundary; never expand into the Date
             # or amount columns.
-            header_words = [word for word in words if abs(float(word["top"]) - header_top) <= 12]
             reference_right_edges = [
                 float(word["x1"])
                 for word in header_words
@@ -3041,14 +3101,39 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 x_part - 20,
                 max(reference_right_edges) + 1 if reference_right_edges else x_part - 20,
             )
+            prior_date_headers = [float(word["x0"]) for word in date_headers if float(word["x0"]) < x_date - 8]
+            subsequent_header_starts = [
+                float(word["x0"]) for word in header_words
+                if float(word["x0"]) > x_date + 12
+                and re.sub(r"[^a-z]", "", str(word["text"]).lower()) not in {"date", "value"}
+            ]
+            # The midpoint to the adjacent measured header keeps only the
+            # selected Date/Value Date physical column.  It prevents the
+            # other date column (or a date inside narration) from becoming a
+            # second transaction boundary.
+            date_left = ((max(prior_date_headers) + x_date) / 2 if prior_date_headers else x_date - 55)
+            date_right = ((x_date + min(subsequent_header_starts)) / 2 if subsequent_header_starts else x_part - 20)
             anchors = sorted(
                 [(float(word["top"]), str(word["text"])) for word in words
-                 if date_re.fullmatch(str(word["text"])) and float(word["x0"]) < x_part - 20 and float(word["top"]) > header_top + 12],
+                 if date_re.fullmatch(str(word["text"]))
+                 and date_left <= float(word["x0"]) < date_right
+                 and float(word["top"]) > header_top + 12],
                 key=lambda item: item[0],
             )
             for index, (top, date_text) in enumerate(anchors):
+                # A number of bank PDFs place the first narration line a few
+                # points *above* its date/amount baseline.  Splitting simply
+                # at the next Date anchor then assigns that line to the
+                # previous transaction.  Partition the measured source rows
+                # at the midpoint between consecutive Date/Value Date cells:
+                # it keeps every word with the physical row it is closest to
+                # and does not rely on OCR/reading order or an AI guess.
+                if index:
+                    block_start = (anchors[index - 1][0] + top) / 2
+                else:
+                    block_start = header_top + 12
                 if index + 1 < len(anchors):
-                    next_top = anchors[index + 1][0] - 3
+                    next_top = (top + anchors[index + 1][0]) / 2
                 else:
                     # The final transaction may be followed by a Total row
                     # and legal/footer furniture.  Neither belongs to the
@@ -3061,12 +3146,7 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                                        "www.", "please", "never", "disclaimer",
                                    }]
                     next_top = min(footer_tops) if footer_tops else float(page.height) - 6
-                # Some exports put the first short narration line a few points
-                # above the date/amount baseline (``Credit trxn`` above its
-                # own date). Keep that measured near-row continuation, while
-                # the next Date anchor still provides the hard transaction
-                # boundary.
-                block = [word for word in words if top - 7 <= float(word["top"]) < next_top]
+                block = [word for word in words if block_start <= float(word["top"]) < next_top]
                 line = [word for word in block if abs(float(word["top"]) - top) <= 5]
                 def band(left: float, right: float, source=line) -> str:
                     return " ".join(str(word["text"]) for word in sorted(source, key=lambda item: float(item["x0"])) if left <= (float(word["x0"]) + float(word["x1"])) / 2 < right)
