@@ -387,6 +387,18 @@ RULE_GROUPS = {
     "endpoints_and_totals": {"summary_endpoints", "summary_total_warning"},
     "validation": {"source_coverage"},
 }
+# Earlier certified profiles predate the structured rule-library fields.  They
+# are still useful evidence, but an empty historic `diagnostic_rules` list
+# must not make a source-proven capability look like it has no reusable rule.
+# These are capability modules, never foreign parser coordinates or code.
+CAPABILITY_DEFAULT_RULES = {
+    "value_date": ("value_date", "dual_date_running_balance", "date_column_boundary", "reference_date_boundary"),
+    "bf_preperiod_artifact": ("bf_preperiod_artifact", "terminal_row_before_summary", "summary_endpoints"),
+    "footer_exclusion": ("footer_exclusion", "terminal_row_before_summary", "summary_endpoints"),
+    "multi_page_continuation": ("multi_page_continuation", "continuation_merge", "footer_exclusion"),
+    "signed_balance_text": ("signed_balance_text", "balance_delta", "amount_balance_consistency"),
+    "balance_delta": ("balance_delta", "amount_balance_consistency", "indian_money_punctuation"),
+}
 
 def rule_groups_for(rule_ids: object) -> list[str]:
     """Return deterministic capability groups for stored/retrieved lessons."""
@@ -399,6 +411,11 @@ def group_for_capability(capability: str) -> str:
         "footer_exclusion": "furniture", "multi_page_continuation": "narration",
         "signed_balance_text": "money_and_balance", "balance_delta": "money_and_balance",
     }.get(capability, "validation")
+
+def rules_for_capability(capability: str) -> list[str]:
+    """Return the certified reusable module IDs for a source capability."""
+    return [rule for rule in CAPABILITY_DEFAULT_RULES.get(capability, ())
+            if rule in DIAGNOSTIC_RULE_LIBRARY]
 PARSER_GENERATOR_POLICY = """
 Bank statement extraction policy:
 - Transaction output is a strict whitelist only: Date, Particulars/Narration, Withdrawal, Deposit, Running/Closing Balance, and optional Instrument/Cheque Number. Date, Particulars/Narration, Withdrawal, Deposit, and Balance are the five mandatory transaction fields. A parser profile may map only these fields; every other PDF object is non-transaction evidence unless it directly proves one of the permitted fields.
@@ -1148,6 +1165,11 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
                 continue
             reusable_rules = [str(rule) for rule in lesson.get("diagnostic_rules", [])
                               if str(rule) in DIAGNOSTIC_RULE_LIBRARY]
+            # Legacy profiles were certified before rule modules were
+            # persisted.  Use only the capability's deterministic library
+            # fallback; never invent a whole-parser match from bank name.
+            if not reusable_rules:
+                reusable_rules = rules_for_capability(capability)
             providers.append({
                 "profile_id": str(lesson.get("profile_id")),
                 "strategy_family": str(lesson.get("strategy", "")),
@@ -1165,6 +1187,7 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
             "rule_group": group_for_capability(capability),
             "reason": reason,
             "preferred_strategy": strategy,
+            "rule_modules": rules_for_capability(capability),
             "certified_profile_ids": [provider["profile_id"] for provider in providers],
             "certified_rule_modules": providers,
             "instruction": DIAGNOSTIC_RULE_LIBRARY.get(capability, capability),
@@ -4233,6 +4256,24 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         }
         patch_job(job_id, preflight_blueprint=preflight, evidence_index=evidence_index,
                   message="UPG completed its preflight audit: measured source layout, compared certified profiles, and planned parser candidates before extraction.")
+    # Compose the rule plan before candidate generation.  This makes a new
+    # source start with the relevant certified modules (Value Date, B/F,
+    # furniture, continuation, balance handling) instead of making the AI
+    # rediscover each one after an avoidable failed parse.  Persisting the
+    # IDs means a successful profile teaches the next statement as well.
+    for capability_plan in preflight.get("source_matched_capabilities", []):
+        if not isinstance(capability_plan, dict):
+            continue
+        diagnostic_rules.update(
+            str(rule) for rule in capability_plan.get("rule_modules", [])
+            if str(rule) in DIAGNOSTIC_RULE_LIBRARY
+        )
+        for provider in capability_plan.get("certified_rule_modules", []):
+            if isinstance(provider, dict):
+                diagnostic_rules.update(
+                    str(rule) for rule in provider.get("reusable_rules", [])
+                    if str(rule) in DIAGNOSTIC_RULE_LIBRARY
+                )
     rounds_this_lease = 0
     while True:
         round_number += 1
