@@ -62,12 +62,13 @@ DATA_ROOT = Path(os.environ.get("UPG_DATA_DIR") or ("/data" if Path("/data").exi
 UPLOADS = DATA_ROOT / "uploads"
 EXPORTS = DATA_ROOT / "exports"
 PROFILES = DATA_ROOT / "profiles"
+PROFILE_REVISIONS = PROFILES / "revisions"
 JOBS_DIR = DATA_ROOT / "jobs"
 LEARNING_LEDGER = PROFILES / "validated_learning.json"
 UPG_API_KEY = os.environ.get("UPG_API_KEY", "")
 UPG_WEBHOOK_URL = os.environ.get("UPG_WEBHOOK_URL", "")
 UPG_WEBHOOK_SECRET = os.environ.get("UPG_WEBHOOK_SECRET", "")
-for folder in (UPLOADS, EXPORTS, PROFILES, JOBS_DIR):
+for folder in (UPLOADS, EXPORTS, PROFILES, PROFILE_REVISIONS, JOBS_DIR):
     folder.mkdir(exist_ok=True)
 
 # Seed a new persistent volume with the validated profiles shipped in the
@@ -1215,12 +1216,32 @@ def certified_feature_vector(headers: list[object], columns: dict[str, int], str
     }
 
 def save_profile(headers: list[object], columns: dict[str, int], parent_profile: str | None = None, strategy: str | None = None, self_healed: bool = False, layout_fingerprint: str = "", diagnostic_rules: list[str] | None = None, validation: dict | None = None, bank_name: str = "Unknown", format_name: str = "PDF Statement", challenge_history: list[str] | None = None, capability_tags: list[str] | None = None, capability_provenance: list[dict[str, object]] | None = None) -> str:
-    """Persist only validated, privacy-safe layout learning; never source rows."""
+    """Persist validated learning additively; never discard a certified revision.
+
+    A later statement can add a capability or a self-healing addendum, but it
+    may never erase the exact profile evidence that certified an older layout.
+    Previous revisions are immutable snapshots under ``profiles/revisions``;
+    the active profile remains the latest certified revision for normal lookup.
+    """
     if generated_canonical_headers(headers) and not layout_fingerprint: return ""
     ident = profile_id(headers, layout_fingerprint)
     profile_path = PROFILES / f"{ident}.json"
     try: prior = json.loads(profile_path.read_text(encoding="utf-8"))
     except (OSError, ValueError): prior = {}
+    if prior:
+        # The active file is a convenience pointer for fast exact-layout
+        # lookup.  Before it is advanced, retain the prior certified parser as
+        # an immutable revision.  This lets old statements continue to use the
+        # historical, source-proven mapping and stops a new lesson from
+        # rewriting history for a different layout variant.
+        prior_version = max(1, int(prior.get("version", 1) or 1))
+        revision_path = PROFILE_REVISIONS / f"{ident}.v{prior_version}.json"
+        if not revision_path.exists():
+            snapshot = dict(prior)
+            snapshot["immutable_revision"] = True
+            snapshot["revision_of"] = ident
+            snapshot["archived_at"] = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+            revision_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
     observations = int(prior.get("validated_observations", 0)) + 1
     detection_code, parser_code = certified_javascript_code(headers, strategy)
     challenges = sorted({str(item) for item in (challenge_history or []) if str(item) and str(item) != "none"})
@@ -1238,7 +1259,8 @@ def save_profile(headers: list[object], columns: dict[str, int], parent_profile:
         }
         for item in (capability_provenance or []) if isinstance(item, dict) and item.get("capability")
     ][:12]
-    data = {"version": int(prior.get("version", 0)) + 1, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
+    version = int(prior.get("version", 0)) + 1
+    data = {"version": version, "header_signature": [str(h) for h in headers], "layout_fingerprint": layout_fingerprint, "columns": columns, "parent_profile": parent_profile, "validated_observations": observations, "last_validated_strategy": strategy or "detected_table", "self_healed_addendum": bool(self_healed), "diagnostic_rules": diagnostic_rules or [], "challenge_history": challenges, "rule_groups": rule_groups, "feature_vector": features, "capability_provenance": provenance, "bank_name": bank_name or prior.get("bank_name", "Unknown"), "format_name": format_name or prior.get("format_name", "PDF Statement"), "detection_code": detection_code, "parser_code": parser_code, "validation": validation or {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True}, "learning_lineage": {"mode": "additive_immutable_revisions", "previous_revision": f"{ident}.v{version - 1}" if prior else None, "preserves_prior_certified_learning": True}, "certification": {"status": "certified", "source": "upg_native", "certified_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"}}
     profile_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     # Aggregate learning intentionally contains only layout signatures and
     # validation outcomes, never account, narration, balances, or transactions.
@@ -1473,22 +1495,73 @@ def source_capability_plan(raw: str = "", headers: list[object] | None = None) -
         })
     return selected
 
-def compact_ai_learning_packet(path: Path | None = None, headers: list[object] | None = None, raw: str = "") -> dict[str, object]:
-    """Small, reusable AI context for a single constrained layout decision.
+STEP_NAMES = {
+    "source_intake": (1, "SOURCE_INTAKE"),
+    "native_structure": (2, "NATIVE_STRUCTURE_READ"),
+    "column_geometry": (5, "COLUMN_GEOMETRY_MAP"),
+    "header_mapping": (4, "HEADER_SEMANTICS"),
+    "date_order": (11, "DATE_SELECTION_AND_NORMALIZATION"),
+    "continuation": (7, "NARRATION_ASSEMBLY"),
+    "page_furniture": (8, "FURNITURE_REMOVAL"),
+    "balance_direction": (10, "BALANCE_INTERPRETATION"),
+    "unreliable_balance": (10, "BALANCE_INTERPRETATION"),
+    "endpoint": (16, "FINANCIAL_RECONCILIATION"),
+    "source_totals": (16, "FINANCIAL_RECONCILIATION"),
+    "narration_coverage": (14, "SOURCE_COVERAGE_CHECK"),
+    "transaction_count": (15, "TRANSACTION_COUNT_CHECK"),
+    "novel_layout": (20, "PARSER_PLAN_COMPOSITION"),
+}
 
-    Full profile history is useful to deterministic matching, but repeatedly
-    sending it to a model is costly and does not improve a header-map decision.
-    This retains only the closest layouts and concise rule names.
+def compact_ai_learning_packet(path: Path | None = None, headers: list[object] | None = None,
+                               raw: str = "", failure_type: str = "column_geometry") -> dict[str, object]:
+    """Return source-scoped certified knowledge for one named pipeline step.
+
+    This is Step 27 (AI_CONTEXT_SCOPE).  The model receives only capabilities
+    proven by the new source, their certified rule modules, and the closest
+    matching certified lessons.  It never receives the full unrelated rule
+    library, which reduces cost and prevents a geometry repair from being
+    distracted by, for example, a B/F or narration-only lesson.
     """
+    step_number, step_name = STEP_NAMES.get(failure_type, STEP_NAMES["column_geometry"])
+    capabilities = source_capability_plan(raw, headers)
+    selected_rules = list(dict.fromkeys(
+        rule for item in capabilities if isinstance(item, dict)
+        for rule in item.get("selected_rule_modules", [])
+        if rule in DIAGNOSTIC_RULE_LIBRARY
+    ))
+    # Every AI decision needs a small structural safety baseline.  This is not
+    # a broad history dump: it is the current step's deterministic contract.
+    baseline = {
+        "column_geometry": ["distinct_source_columns", "header_role_alignment", "measured_column_evidence"],
+        "header_mapping": ["header_role_alignment", "measured_column_evidence", "distinct_source_columns"],
+        "date_order": ["date_column_boundary", "date_source_cell", "reverse_order"],
+        "continuation": ["continuation_merge", "narration_source_cell", "reference_date_boundary"],
+        "page_furniture": ["footer_exclusion", "terminal_row_before_summary", "multi_page_continuation"],
+        "balance_direction": ["balance_delta", "amount_balance_consistency", "balance_source_cell"],
+        "unreliable_balance": ["source_amount_geometry", "summary_total_warning", "balance_source_cell"],
+        "endpoint": ["summary_endpoints", "balance_source_cell", "source_coverage"],
+        "source_totals": ["summary_total_warning", "source_amount_geometry", "amount_balance_consistency"],
+        "narration_coverage": ["narration_source_cell", "continuation_merge", "source_coverage"],
+        "transaction_count": ["source_coverage", "date_source_cell", "measured_column_evidence"],
+        "novel_layout": ["distinct_source_columns", "header_role_alignment", "measured_column_evidence"],
+    }.get(failure_type, ["distinct_source_columns", "header_role_alignment", "measured_column_evidence"])
+    allowed_rules = list(dict.fromkeys([*baseline, *selected_rules]))
     closest = closest_certified_lessons(path, headers, limit=3)
     return {
+        "ai_context_scope": {
+            "pipeline_step": f"S{step_number:02d}_{step_name}",
+            "failure_type": failure_type,
+            "mode": "source_proven_rules_and_closest_certified_lessons_only",
+            "included_rule_count": len(allowed_rules),
+            "excluded": "unrelated rule libraries, foreign parser code, coordinates, transaction data, and unproven capabilities",
+        },
         "output_contract": {
             "required": list(MANDATORY_TRANSACTION_FIELDS),
             "optional": list(OPTIONAL_TRANSACTION_FIELDS),
             "value_date_priority": True,
             "date_format": "DD/MM/YYYY",
         },
-        "key_lessons": HISTORICAL_CHALLENGE_LESSONS[:8],
+        "allowed_rule_modules": {rule: DIAGNOSTIC_RULE_LIBRARY[rule] for rule in allowed_rules},
         "closest_layouts": [{
             "profile_id": item.get("profile_id"),
             "strategy": item.get("strategy"),
@@ -1496,7 +1569,7 @@ def compact_ai_learning_packet(path: Path | None = None, headers: list[object] |
             "challenge_history": item.get("challenge_history", [])[:4],
             "rule_groups": item.get("rule_groups", [])[:4],
         } for item in closest],
-        "source_matched_certified_capabilities": source_capability_plan(raw, headers),
+        "source_matched_certified_capabilities": capabilities,
     }
 
 def find_related_profile(headers: list[object]) -> tuple[str | None, dict[str, int]]:
@@ -1819,21 +1892,59 @@ def source_preflight_snapshot(path: Path, large_pdf: bool) -> dict[str, object]:
     evidence needed for planning. It is passed to candidate ranking directly,
     never stored in a parser profile or learning record.
     """
-    geometry = sampled_geometry_profile(path) if path.suffix.lower() == ".pdf" else None
+    geometry = None
+    source_error = ""
+    try:
+        geometry = sampled_geometry_profile(path) if path.suffix.lower() == ".pdf" else None
+    except (OSError, ValueError, RuntimeError) as error:
+        source_error = re.sub(r"\s+", " ", str(error)).strip()[:220]
     try:
         if path.suffix.lower() == ".pdf":
             source_sample = sampled_pdf_text(path) if large_pdf else cached_pdf_text(path)
         else:
             _, source_sample = load_rows(path)
             source_sample = source_sample[:60000]
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError) as error:
         source_sample = ""
-    return {"geometry": geometry, "sample": source_sample}
+        if not source_error:
+            source_error = re.sub(r"\s+", " ", str(error)).strip()[:220]
+    return {"geometry": geometry, "sample": source_sample, "source_error": source_error}
+
+def preflight_step_gate(path: Path, snapshot: dict[str, object]) -> dict[str, object]:
+    """Apply the first two named pipeline steps as hard evidence gates.
+
+    No column, narration, amount, validation, or AI step may run until the
+    source has first been accepted and then read through its native evidence
+    path.  A blank/corrupt upload is not a later ``column_geometry`` problem.
+    It is repaired or reported at S01/S02 without guessing downstream data.
+    """
+    supported = {".pdf", ".csv", ".xlsx", ".xls", ".txt", ".doc", ".docx"}
+    if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+        return {"passed": False, "step": "S01_SOURCE_INTAKE", "number": 1,
+                "reason": "The upload is missing or empty.",
+                "repair": "Re-upload the original populated bank statement before parsing."}
+    if path.suffix.lower() not in supported:
+        return {"passed": False, "step": "S01_SOURCE_INTAKE", "number": 1,
+                "reason": f"Unsupported source type: {path.suffix or 'no extension'}.",
+                "repair": "Upload PDF, DOCX, Excel, CSV, or TXT source evidence."}
+    sample = str(snapshot.get("sample", "")).strip()
+    geometry = snapshot.get("geometry")
+    # An image-only PDF can legitimately have no native text. It remains at
+    # S02 and will use the existing coordinate-preserving OCR route when it is
+    # available; it must not be mistaken for a later parser failure.
+    if not sample and not geometry and not (path.suffix.lower() == ".pdf" and ocr_is_available()):
+        detail = str(snapshot.get("source_error", "") or "no native rows, text, or measured page structure were readable")
+        return {"passed": False, "step": "S02_NATIVE_STRUCTURE_READ", "number": 2,
+                "reason": detail,
+                "repair": "Export a populated, readable source file or provide an OCR-readable PDF."}
+    return {"passed": True, "step": "S02_NATIVE_STRUCTURE_READ", "number": 2,
+            "reason": "Original source evidence is available.", "repair": ""}
 
 def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: str | None,
                               planned_strategies: list[str]) -> dict[str, object]:
     """Create one evidence-led parser plan before any full-file extraction."""
     snapshot = source_preflight_snapshot(path, large_pdf)
+    step_gate = preflight_step_gate(path, snapshot)
     geometry = snapshot["geometry"]
     headers = geometry[0] if geometry else []
     source_sample = str(snapshot["sample"])
@@ -1842,7 +1953,7 @@ def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: s
     candidates = evidence_first_candidates(
         path, large_pdf, bool(geometry), validated_strategy, planned_strategies, 1,
         source_sample=source_sample, source_geometry=geometry,
-    )
+    ) if step_gate["passed"] else []
     selected_rule_bundle = [
         {
             "capability": str(item.get("capability", "")),
@@ -1867,6 +1978,7 @@ def build_preflight_blueprint(path: Path, large_pdf: bool, validated_strategy: s
         "source_matched_capabilities": capabilities,
         "selected_rule_bundle": selected_rule_bundle,
         "candidate_plan": ["ai_layout_addendum" if ai else (strategy or "detected_table") for strategy, ai in candidates],
+        "step_gate": step_gate,
         "full_source_validation_required": True,
     }
     plan["plan_id"] = preflight_plan_id(plan)
@@ -2415,6 +2527,30 @@ def safe_openai_error(error: Exception) -> str:
         return f"OpenAI network error: {type(error.reason).__name__}."
     return f"OpenAI response error: {type(error).__name__}."
 
+def failure_type_from_evidence(failure: str) -> str:
+    """Classify a failed gate before selecting an AI repair scope.
+
+    This keeps S27 from receiving a broad library and, more importantly,
+    prevents a failure in an earlier measured step from being 'repaired' by a
+    later unrelated rule such as furniture cleanup or financial reconciliation.
+    """
+    evidence = (failure or "").lower()
+    if any(token in evidence for token in ("header", "column", "geometry", "grid", "source columns")):
+        return "column_geometry"
+    if any(token in evidence for token in ("date", "value date", "chronolog", "reverse order")):
+        return "date_order"
+    if any(token in evidence for token in ("narration", "particular", "continuation")):
+        return "continuation"
+    if any(token in evidence for token in ("footer", "furniture", "page total", "summary")):
+        return "page_furniture"
+    if any(token in evidence for token in ("running balance", "balance direction", "balance chain")):
+        return "balance_direction"
+    if "transaction count" in evidence or "source coverage" in evidence:
+        return "transaction_count"
+    if any(token in evidence for token in ("opening", "closing", "financial", "endpoint", "total")):
+        return "endpoint"
+    return "novel_layout"
+
 def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None, job_id: str | None = None) -> dict[str, object]:
     """Use the final AI call for a concrete, safe repair plan.
 
@@ -2426,14 +2562,17 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
         return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI diagnosis unavailable: OPENAI_API_KEY is not configured."}
     if not reserve_ai_call(job_id, "targeted_repair_plan"):
         return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI call budget reached for this job; no new evidence-led repair remains."}
+    scoped_failure_type = failure_type_from_evidence(failure)
+    learning_packet = compact_ai_learning_packet(source_path, raw=raw, failure_type=scoped_failure_type)
+    allowed_rules = list(learning_packet.get("allowed_rule_modules", {}).keys())
     safe_strategies = ["geometry_profile", "source_amount_geometry", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
-        "rules": {"type": "array", "items": {"type": "string", "enum": list(DIAGNOSTIC_RULE_LIBRARY)}, "maxItems": 5},
+        "rules": {"type": "array", "items": {"type": "string", "enum": allowed_rules}, "maxItems": 5},
         "strategies": {"type": "array", "items": {"type": "string", "enum": safe_strategies}, "maxItems": 4},
         "failure_type": {"type": "string", "enum": ["column_geometry", "header_mapping", "date_order", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "novel_layout"]},
         "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
-    prompt = AI_LAYOUT_CONTRACT + "\nThis is the final AI decision for this job and it is being made AFTER the first source-layout extraction failed. Produce one targeted, evidence-led repair plan: select a materially different safe action and priority list of already-supported deterministic strategies. Do not write code or transactions, do not relax validation, and do not request another AI layout addendum. If evidence is insufficient, choose reject_unsafe.\nRules: " + json.dumps(DIAGNOSTIC_RULE_LIBRARY) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(compact_ai_learning_packet(source_path, raw=raw)) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
+    prompt = AI_LAYOUT_CONTRACT + "\nThis is the final AI decision for this job and it is being made AFTER the first source-layout extraction failed. Repair only " + str(learning_packet["ai_context_scope"]["pipeline_step"]) + ". Do not move downstream until this step has source proof. Produce one targeted, evidence-led repair plan using only the supplied certified modules and strategies. Do not write code or transactions, do not relax validation, and do not request another AI layout addendum. If evidence is insufficient, choose reject_unsafe.\nScoped rules: " + json.dumps(learning_packet["allowed_rule_modules"]) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(learning_packet) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
     payload = {"model": AI_MODEL, "input": prompt, "max_output_tokens": AI_MAX_OUTPUT_TOKENS, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
     request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     try:
@@ -2441,9 +2580,12 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
         output = next((item["text"] for item_out in result.get("output", []) for item in item_out.get("content", []) if item.get("type") == "output_text"), "")
         plan = json.loads(output)
         return {
-            "rules": [rule for rule in plan["rules"] if rule in DIAGNOSTIC_RULE_LIBRARY],
+            "rules": [rule for rule in plan["rules"] if rule in allowed_rules],
             "strategies": [strategy for strategy in plan["strategies"] if strategy in safe_strategies],
-            "failure_type": str(plan["failure_type"]),
+            # The deterministic source evidence owns the current pipeline
+            # step.  The AI may choose an action inside that step, but cannot
+            # relabel an upstream failure as a downstream one to bypass it.
+            "failure_type": scoped_failure_type,
             "profile_action": str(plan["profile_action"]),
             "diagnostic_error": "",
         }
@@ -5160,6 +5302,29 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
         }
         patch_job(job_id, preflight_blueprint=preflight, evidence_index=evidence_index,
                   message="UPG completed its preflight audit: measured source layout, compared certified profiles, and planned parser candidates before extraction.")
+    # S01/S02 are hard gates.  A job must not move to S07 narration, S08
+    # furniture, S09 amounts, S16 validation, or S27 AI context when its
+    # original upload has not yet produced trustworthy native evidence.
+    # The native reader already performs its bounded local retry in
+    # ``source_preflight_snapshot``; proceeding after that would only turn an
+    # intake/read problem into invented downstream parser work.
+    step_gate = preflight.get("step_gate") if isinstance(preflight.get("step_gate"), dict) else None
+    if step_gate is None:
+        step_gate = preflight_step_gate(path, source_preflight_snapshot(path, large_pdf))
+        preflight["step_gate"] = step_gate
+        patch_job(job_id, preflight_blueprint=preflight)
+    if not step_gate.get("passed"):
+        blocked_step = str(step_gate.get("step", "S02_NATIVE_STRUCTURE_READ"))
+        message = (
+            f"UPG stopped at {blocked_step}: {step_gate.get('reason', 'source evidence could not be read')}. "
+            f"It did not advance to later parser, narration, validation, or AI steps. "
+            f"Repair at this step: {step_gate.get('repair', 'supply readable original source evidence.')}"
+        )
+        patch_job(job_id, processing=False, valid=False, status="failed", blocked_pipeline_step=blocked_step,
+                  message=message, investigation={"failure_type": "source_intake" if blocked_step.startswith("S01") else "native_structure",
+                                                  "profile_action": "repair_current_step_only"})
+        clear_pdf_password(path)
+        return
     # Compose the rule plan before candidate generation.  This makes a new
     # source start with the relevant certified modules (Value Date, B/F,
     # furniture, continuation, balance handling) instead of making the AI
