@@ -368,6 +368,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "multi_page_continuation": "Preserve a dated transaction whose narration or amount cells continue across a page boundary, excluding page headers and footers between its parts.",
     "summary_total_warning": "Keep inconsistent printed debit or credit totals as a warning when transaction count, balance chain, and endpoint reconciliation independently pass.",
     "amount_balance_consistency": "When a source row visibly prints its transaction amount, require that amount to agree with the running-balance movement; reject a layout that only reconciles after replacing source amounts.",
+    "balance_source_cell": "A normal running balance must be read from the same measured source Balance cell on the dated row. It may be repaired only when the damaged source token and adjacent source movements prove one unique value; never manufacture a balance merely to reconcile totals.",
     "source_amount_geometry": "When the running-balance chain is unreliable but separate Withdrawal and Deposit columns are measurable, use original-PDF column geometry for the printed movements; classify neither from balance deltas nor from narration.",
     "reference_date_boundary": "When full-year transaction dates are used, do not split a row at a short date embedded in narration or a reversal/reference number; retain the complete source row and its printed amount.",
     "date_column_boundary": "A date starts a transaction only when it is in the measured Date column at the row boundary. Any date-like text to the right, including narration/reference dates, remains Particulars text.",
@@ -385,9 +386,9 @@ RULE_GROUPS = {
     "narration": {"continuation_merge", "multi_page_continuation", "reference_date_boundary", "narration_source_cell"},
     "furniture": {"footer_exclusion", "terminal_row_before_summary", "bf_preperiod_artifact", "headerless_layout"},
     "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date", "date_column_boundary", "numeric_date_geometry"},
-    "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency", "source_amount_geometry"},
+    "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency", "source_amount_geometry", "balance_source_cell"},
     "endpoints_and_totals": {"summary_endpoints", "summary_total_warning"},
-    "validation": {"source_coverage", "narration_source_cell"},
+    "validation": {"source_coverage", "narration_source_cell", "balance_source_cell"},
 }
 # Earlier certified profiles predate the structured rule-library fields.  They
 # are still useful evidence, but an empty historic `diagnostic_rules` list
@@ -765,6 +766,30 @@ def narration_source_cells_traceable(transactions: list[dict]) -> bool:
         # but it may never add a token from an adjacent financial column.
         if not parsed_norm or parsed_norm not in source_norm:
             return False
+    return checked > 0
+
+def balance_source_cells_traceable(transactions: list[dict]) -> bool:
+    """Require normal exported balances to be source-cell values.
+
+    A running balance is evidence, not a field UPG may invent to force the
+    opening/withdrawal/deposit/closing equation.  The sole permitted
+    exception is a separately recorded, uniquely-proven repair of a damaged
+    source token; the caller surfaces that condition to the reviewer.
+    """
+    checked = 0
+    for transaction in transactions:
+        if "_source_balance_value" not in transaction:
+            continue
+        checked += 1
+        balance = transaction.get("balance")
+        source_balance = transaction.get("_source_balance_value")
+        if balance is None:
+            return False
+        if source_balance is not None and Decimal(balance).quantize(Decimal(".01")) == Decimal(source_balance).quantize(Decimal(".01")):
+            continue
+        if transaction.get("_balance_repaired_from_chain") is True:
+            continue
+        return False
     return checked > 0
 
 def clean_narration(s: str) -> str:
@@ -4159,7 +4184,8 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
                 printed_amount = money(row[len(CANONICAL)])
                 if printed_amount is not None:
                     source_amount = printed_amount
-            tx.append({"date": display_date(table_date), "narration": narration, "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": monetary_cell("balance"), "source_amount": source_amount, "_source_narration": source_narration})
+            source_balance_value = monetary_cell("balance")
+            tx.append({"date": display_date(table_date), "narration": narration, "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": source_balance_value, "source_amount": source_amount, "_source_narration": source_narration, "_source_balance_value": source_balance_value})
     # Transaction extraction uses the furniture-cleaned text, but statement
     # endpoints must come from the original PDF text.  A repeated J&K Bank
     # header block can sit before B/F and the final Grand Total; cleaning it is
@@ -4301,6 +4327,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
                 proved = candidate_balance.quantize(Decimal(".01")) == declared_endpoint.quantize(Decimal(".01"))
             if proved:
                 transaction["balance"] = candidate_balance
+                transaction["_balance_repaired_from_chain"] = True
                 balance_repaired_from_chain += 1
         # A repaired final row is stronger endpoint evidence than the prior
         # readable balance in a damaged text layer.  Promote it only where the
@@ -4468,7 +4495,8 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # furniture, a numeric amount, or a second date into a canonical row.  The
     # contract check is independent of monetary validation and applies to every
     # strategy, including a saved profile and an AI-generated addendum.
-    canonical_contract_valid = bool(tx) and all(canonical_transaction_contract_valid(item) for item in tx)
+    source_balance_cells_valid = balance_source_cells_traceable(tx)
+    canonical_contract_valid = bool(tx) and source_balance_cells_valid and all(canonical_transaction_contract_valid(item) for item in tx)
     # A strict money parser deliberately blanks malformed values such as
     # ``-5.00.177.00``.  For this narrowly proven source-balance exception,
     # permit those blank balances only after exact printed debit/credit totals,
@@ -4522,6 +4550,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     )
     narration_valid = (not unmatched or coordinate_trace_valid) and not malformed_narrations and source_narration_valid and coverage_valid and canonical_contract_valid
     columns["_source_narration_cells_valid"] = source_narration_valid
+    columns["_source_balance_cells_valid"] = source_balance_cells_valid
     return tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, unmatched, headers, columns, parent_profile, coverage_valid, expected_source_count, layout_fingerprint, declared_withdrawals, declared_deposits, statement_totals_valid
 
 def export_excel(tx, opening, closing, total_w, total_d, computed, financial_valid, narration_valid, coverage_valid, expected_source_count, declared_withdrawals=None, declared_deposits=None, statement_totals_valid=True, source_balance_unreliable=False):
