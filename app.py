@@ -2293,8 +2293,8 @@ REPAIR_MODULE_STRATEGIES: dict[str, frozenset[str]] = {
     # measured strict-date-boundary assembly before asking an agent to move
     # columns.  It attaches undated Particulars fragments only to the dated
     # row immediately above them, rather than splitting them by a midpoint.
-    "continuation": frozenset({"narration_geometry"}),
-    "narration_coverage": frozenset({"narration_geometry"}),
+    "continuation": frozenset({"narration_geometry", "narration_anchor_geometry"}),
+    "narration_coverage": frozenset({"narration_geometry", "narration_anchor_geometry"}),
     "page_furniture": frozenset({"geometry_profile", "standard_column_geometry", "page_text_unsigned"}),
     "source_totals": frozenset({"source_amount_geometry", "geometry_profile", "standard_column_geometry"}),
     "balance_direction": frozenset({"running_balance_text", "unsigned_running_balance_text", "page_text_unsigned", "geometry_profile"}),
@@ -2310,6 +2310,9 @@ REPAIR_MODULE_STRATEGIES: dict[str, frozenset[str]] = {
 STRATEGY_CAPABILITY_COVERAGE: dict[str, frozenset[str]] = {
     "geometry_profile": frozenset({"header_mapping", "column_geometry", "narration", "furniture", "bf_preperiod_artifact"}),
     "narration_geometry": frozenset({"narration", "continuation", "furniture"}),
+    # A date-looking fragment is not enough to start a row.  This measured
+    # addendum requires a source movement or source balance in the same row.
+    "narration_anchor_geometry": frozenset({"narration", "continuation", "furniture", "transaction_count"}),
     "standard_column_geometry": frozenset({"header_mapping", "column_geometry", "narration", "furniture"}),
     "source_amount_geometry": frozenset({"header_mapping", "column_geometry", "amounts", "balance"}),
     "dual_date_geometry": frozenset({"value_date", "date_order", "column_geometry"}),
@@ -3412,7 +3415,7 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
     scoped_failure_type = failure_type_from_evidence(failure)
     learning_packet = compact_ai_learning_packet(source_path, raw=raw, failure_type=scoped_failure_type)
     allowed_rules = list(learning_packet.get("allowed_rule_modules", {}).keys())
-    safe_strategies = ["narration_geometry", "geometry_profile", "source_amount_geometry", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"]
+    safe_strategies = ["narration_geometry", "narration_anchor_geometry", "geometry_profile", "source_amount_geometry", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "rules": {"type": "array", "items": {"type": "string", "enum": allowed_rules}, "maxItems": 5},
         "strategies": {"type": "array", "items": {"type": "string", "enum": safe_strategies}, "maxItems": 4},
@@ -3560,6 +3563,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
             for name in ("narration_source_cell", "continuation_merge", "multi_page_continuation", "footer_exclusion"):
                 add_rule(name)
             add_strategy("narration_geometry")
+            add_strategy("narration_anchor_geometry")
             add_strategy("geometry_profile")
         elif '"financial_pass":false' in evidence:
             failure_type, profile_action = "endpoint", "repair_balance_direction"
@@ -3610,6 +3614,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         for name in ("narration_source_cell", "continuation_merge", "multi_page_continuation", "footer_exclusion"):
             add_rule(name)
         add_strategy("narration_geometry")
+        add_strategy("narration_anchor_geometry")
         add_strategy("geometry_profile")
         return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
                 "upstream_steps": upstream_steps or [failure_type],
@@ -3649,6 +3654,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         for name in ("continuation_merge", "multi_page_continuation", "footer_exclusion", "terminal_row_before_summary"):
             add_rule(name)
         add_strategy("narration_geometry")
+        add_strategy("narration_anchor_geometry")
         add_strategy("geometry_profile")
     elif any(token in evidence for token in ("date", "value date", "out-of-fy", "out of fy", "reverse order")):
         failure_type, profile_action = "date_order", "repair_date_order"
@@ -3798,6 +3804,7 @@ def final_certification_audit(validation: dict[str, object], receipt: dict[str, 
 TARGETED_REPAIR_STRATEGIES = frozenset({
     "geometry_profile",
     "narration_geometry",
+    "narration_anchor_geometry",
     "source_amount_geometry",
     "dual_date_geometry",
     "value_date_unsigned",
@@ -4571,7 +4578,8 @@ def extract_ocr_geometry_rows(path: Path, page_numbers: set[int] | None = None) 
 
 
 def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = None,
-                                  narration_mode: str = "midpoint") -> list[list[object]]:
+                                  narration_mode: str = "midpoint",
+                                  require_ledger_anchor: bool = False) -> list[list[object]]:
     """Apply sampled column bands without table rediscovery.
 
     `page_numbers` is a zero-based representative-page set used for fast
@@ -4664,7 +4672,24 @@ def extract_geometry_profile_rows(path: Path, page_numbers: set[int] | None = No
                         continue
                 if not any(cells) or len(map_headers(cells)) >= 3:
                     continue
-                if transaction_date_value(cells[date_index]):
+                # S07/S14 source-anchor addendum. A date-looking token alone
+                # must not split a narration: it is a transaction start only
+                # when its *measured source row* also has a withdrawal,
+                # deposit, or running-balance value. This preserves a genuine
+                # date in a multi-line Particulars field while keeping the
+                # source's own Date/amount/balance contract intact.
+                is_transaction_anchor = bool(transaction_date_value(cells[date_index]))
+                if is_transaction_anchor and require_ledger_anchor:
+                    withdrawal_index = column_map.get("withdrawal")
+                    deposit_index = column_map.get("deposit")
+                    balance_index = column_map.get("balance")
+                    has_movement = bool(
+                        (withdrawal_index is not None and withdrawal_index < len(cells) and money(cells[withdrawal_index]) is not None)
+                        or (deposit_index is not None and deposit_index < len(cells) and money(cells[deposit_index]) is not None)
+                    )
+                    has_balance = balance_index is not None and balance_index < len(cells) and money(cells[balance_index]) is not None
+                    is_transaction_anchor = has_movement or has_balance
+                if is_transaction_anchor:
                     if current is not None:
                         # Split fragments at the midpoint between two dated
                         # transaction anchors.  This preserves ordinary
@@ -4740,13 +4765,15 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
     try:
         count = len(open_pdf_reader(path).pages)
         samples = set(sampled_page_indices(count))
-        if strategy in {"geometry_profile", "narration_geometry", "source_amount_geometry", "dual_date_geometry"}:
+        if strategy in {"geometry_profile", "narration_geometry", "narration_anchor_geometry", "source_amount_geometry", "dual_date_geometry"}:
             if strategy == "source_amount_geometry":
                 rows = extract_standard_column_geometry_rows(path)
             elif strategy == "dual_date_geometry":
                 rows = extract_dual_date_geometry_rows(path, samples)
             elif strategy == "narration_geometry":
                 rows = extract_geometry_profile_rows(path, samples, narration_mode="strict_prior")
+            elif strategy == "narration_anchor_geometry":
+                rows = extract_geometry_profile_rows(path, samples, narration_mode="strict_prior", require_ledger_anchor=True)
             else:
                 rows = extract_geometry_profile_rows(path, samples)
         else:
@@ -4800,6 +4827,7 @@ def deterministic_strategy_requires_source_proof(path: Path, strategy: str | Non
     return strategy in {
         "geometry_profile",
         "narration_geometry",
+        "narration_anchor_geometry",
         "source_amount_geometry",
         "dual_date_geometry",
         "running_balance_text",
@@ -5295,6 +5323,13 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
         # S07 narration-boundary repair.  Keep the same original-PDF column
         # bands and change only how undated Particulars fragments are joined.
         return extract_geometry_profile_rows(path, narration_mode="strict_prior"), raw
+    if strategy_override == "narration_anchor_geometry":
+        # A narrower S07 addendum for false transaction splits: preserve the
+        # same measured columns, but require source movement/balance evidence
+        # alongside the Date-column anchor before beginning a new row.
+        return extract_geometry_profile_rows(
+            path, narration_mode="strict_prior", require_ledger_anchor=True
+        ), raw
     if strategy_override == "source_amount_geometry":
         # The engine selected this only after evidence of an unreliable balance
         # chain.  Preserve the separately printed debit/credit movements from
@@ -5985,7 +6020,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # provable chain may be used *only* as an internal validation sequence. It
     # must never reorder, delete, or alter the source transaction rows.
     validation_chain = ledger_sequence
-    if effective_strategy in ("geometry_profile", "narration_geometry", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
+    if effective_strategy in ("geometry_profile", "narration_geometry", "narration_anchor_geometry", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
         reconstructed = reconstruct_unordered_balance_chain(tx, opening, closing)
         # In an unordered statement, the first displayed row is not reliable
         # opening evidence. A printed Grand Total can instead derive opening,
@@ -6169,7 +6204,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # even though this J&K layout has no table borders or reusable headers.
     # Reserve that expensive structural check for a geometry/table candidate.
     table_count = None
-    if effective_strategy in ("geometry_profile", "narration_geometry", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
+    if effective_strategy in ("geometry_profile", "narration_geometry", "narration_anchor_geometry", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry"):
         table_count = structured_source_count(path)
         if table_count is not None:
             expected_source_count = table_count
@@ -6307,7 +6342,7 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # It remains gated by complete records, source amounts and the measured
     # narration column; it never applies to generic text-layout parsing.
     coordinate_trace_valid = (
-        effective_strategy in ("geometry_profile", "narration_geometry", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry")
+        effective_strategy in ("geometry_profile", "narration_geometry", "narration_anchor_geometry", "dual_date_geometry", "standard_column_geometry", "source_amount_geometry")
         and path.suffix.lower() == ".pdf"
         and coverage_valid
         and source_amount_valid
