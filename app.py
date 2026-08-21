@@ -4813,17 +4813,33 @@ def sample_candidate_plausible(path: Path, strategy: str | None) -> bool:
                 # a large PDF. Geometry/AI candidates are stronger evidence.
                 rows = []
         fields = map_headers(rows[0]) if rows else {}
-        if len(rows) < 3 or not {"date", "withdrawal", "deposit", "balance"}.issubset(fields):
+        # A source with one unsigned movement Amount column is a valid ledger
+        # shape.  Its debit/credit direction is intentionally derived later
+        # from the *measured* balance movement by the balance-delta module.
+        # Requiring both Withdrawal and Deposit headers here used to reject
+        # precisely those value-date + unsigned-balance candidates before
+        # their full, source-native extraction could run.  This is a sampler
+        # admission rule only: certification still requires complete source
+        # coverage, narration, financial, and balance checks.
+        has_separate_movements = {"withdrawal", "deposit"}.issubset(fields)
+        has_unsigned_movement = "amount" in fields
+        if (len(rows) < 3 or not {"date", "balance"}.issubset(fields)
+                or not (has_separate_movements or has_unsigned_movement)):
             result = False
         else:
             date_index = fields["date"]
             balance_index = fields["balance"]
+            movement_indexes = [fields[name] for name in ("withdrawal", "deposit", "amount")
+                                if isinstance(fields.get(name), int)]
             dated_rows = [row for row in rows[1:] if transaction_date_value(row[date_index] if date_index < len(row) else "")]
             # This is only a cheap source-shape gate. Full source coverage,
             # narration, financial and balance-chain validation still decide
             # certification after the complete extraction.
             result = len(dated_rows) >= 2 and all(
                 balance_index < len(row) and money(row[balance_index]) is not None
+                for row in dated_rows
+            ) and any(
+                any(index < len(row) and money(row[index]) is not None for index in movement_indexes)
                 for row in dated_rows
             )
     except Exception:
