@@ -3844,6 +3844,10 @@ TARGETED_REPAIR_STRATEGIES = frozenset({
     "source_amount_geometry",
     "dual_date_geometry",
     "dual_date_narration_geometry",
+    # S07/S14 strict source-boundary addendum.  This must remain executable
+    # when selected by the repair planner; otherwise it can be recorded as a
+    # plan but silently filtered out before the worker tests it.
+    "dual_date_narration_anchor_geometry",
     "value_date_unsigned",
     "unsigned_running_balance_text",
     "running_balance_text",
@@ -4960,8 +4964,8 @@ def extract_dual_date_geometry_rows(path: Path, page_indices: set[int] | None = 
             # A date pair alone is not proof of a ledger row: reference text
             # and wrapped narration can contain two date-shaped tokens in the
             # same visual bands.  For the strict addendum, prove that the
-            # *same original-PDF baseline* also carries a numeric movement or
-            # running-balance cell before it is allowed to divide narration.
+            # *same original-PDF baseline* carries both a numeric movement and
+            # a running-balance cell before it is allowed to divide narration.
             # This is intentionally source-native and has no bank name,
             # imported offset, inferred amount, or guessed transaction.
             def is_measured_ledger_baseline(top: float) -> bool:
@@ -4979,7 +4983,12 @@ def extract_dual_date_geometry_rows(path: Path, page_indices: set[int] | None = 
                         cells[1].append(token)
                     elif balance_x - 8 <= center < float(page.width) + 5:
                         cells[2].append(token)
-                return any(source_money("".join(parts)) is not None for parts in cells if parts)
+                has_movement = any(
+                    source_money("".join(parts)) is not None
+                    for parts in cells[:2] if parts
+                )
+                has_balance = bool(cells[2]) and source_money("".join(cells[2])) is not None
+                return has_movement and has_balance
 
             anchors: list[tuple[float, str, str]] = []
             for word in words:
