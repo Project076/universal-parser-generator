@@ -1052,13 +1052,51 @@ def generated_canonical_headers(headers: list[object]) -> bool:
     """Do not learn a profile from our own synthetic fallback header."""
     return [norm(h) for h in headers] == [norm(h) for h in ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]]
 
+def normalized_profile_columns(raw_columns: object) -> dict[str, int] | None:
+    """Return only executable field-to-index mappings from a saved profile.
+
+    Certified profiles deliberately retain rich audit facts beside their column
+    map (for example ``_addendum_compatibility``).  Those facts are dictionaries,
+    not source indexes.  Older reload paths attempted ``int(value)`` for every
+    key and therefore crashed a later job after an otherwise valid addendum.
+
+    A profile may use either the compact ``{"balance": 5}`` representation or
+    the explicit ``{"balance": {"index": 5}}`` form supplied by an external
+    integration.  Everything else is metadata and must never enter a parser
+    column map.  Returning ``None`` means a claimed source field was malformed,
+    so the profile is skipped safely rather than guessed from.
+    """
+    if not isinstance(raw_columns, dict):
+        return None
+    executable: dict[str, int] = {}
+    allowed_fields = set(CANONICAL) | {"amount", "transaction_type"}
+    for name, raw_value in raw_columns.items():
+        field = str(name)
+        if field.startswith("_") or field not in allowed_fields:
+            # Audit/certification metadata belongs in the profile but is not a
+            # physical source column.  Ignore it during execution.
+            continue
+        value = raw_value
+        if isinstance(value, dict):
+            value = next((value.get(key) for key in ("index", "column_index", "column", "position")
+                          if value.get(key) is not None), None)
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return None
+        if index >= 0:
+            executable[field] = index
+    return executable
+
 def load_profile(headers: list[object], layout_fingerprint: str = "") -> dict[str, int] | None:
     if generated_canonical_headers(headers) and not layout_fingerprint: return None
     profile = PROFILES / f"{profile_id(headers, layout_fingerprint)}.json"
     if not profile.exists(): return None
     try:
         data = json.loads(profile.read_text(encoding="utf-8"))
-        return {k: int(v) for k, v in data["columns"].items()}
+        return normalized_profile_columns(data.get("columns"))
     except (OSError, ValueError, KeyError): return None
 
 def certified_javascript_code(headers: list[object], strategy: str | None) -> tuple[str, str]:
@@ -2263,8 +2301,9 @@ def find_related_profile(headers: list[object]) -> tuple[str | None, dict[str, i
                 continue
             prior = "|".join(norm(h) for h in data.get("header_signature", []))
             score = SequenceMatcher(None, current, prior).ratio()
-            if score > best_score:
-                best_id, best_columns, best_score = profile.stem, {k: int(v) for k, v in data["columns"].items()}, score
+            columns = normalized_profile_columns(data.get("columns"))
+            if score > best_score and columns is not None:
+                best_id, best_columns, best_score = profile.stem, columns, score
         except (OSError, ValueError, KeyError):
             continue
     return (best_id, best_columns) if best_score >= 0.62 else (None, {})
@@ -3180,11 +3219,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
             prior = prior_maps[-1]
             try:
                 replay_header = int(prior["header_row"])
-                replay_columns = {
-                    name: int(index)
-                    for name, index in dict(prior.get("columns", {})).items()
-                    if name in CANONICAL and int(index) >= 0
-                }
+                replay_columns = normalized_profile_columns(prior.get("columns")) or {}
             except (KeyError, TypeError, ValueError):
                 replay_header, replay_columns = -1, {}
             if 0 <= replay_header < len(rows) and len(replay_columns) >= 3:
@@ -3220,7 +3255,10 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     try:
         generated = request_openai_schema(request, job_id, purpose)
         header_row = int(generated["header_row"])
-        columns = {name: int(index) for name, index in generated["columns"].items() if int(index) >= 0}
+        columns = normalized_profile_columns(generated.get("columns"))
+        if columns is None:
+            record_failure("AI returned a malformed field-to-column map; this candidate was rejected safely.")
+            return None
         if not (0 <= header_row < len(rows)):
             record_failure("AI returned a header row outside the measured source grid.")
             return None
@@ -7930,11 +7968,14 @@ class App(BaseHTTPRequestHandler):
                 profile_id = str(incoming.get("profile_id") or hashlib.sha256((incoming["bank_name"] + incoming["format_name"] + incoming["detection_code"] + incoming["parser_code"]).encode()).hexdigest()[:16])
                 imported_code_sha256 = hashlib.sha256((str(incoming["detection_code"]) + "\n/*UPG-CODE-BOUNDARY*/\n" + str(incoming["parser_code"])).encode("utf-8")).hexdigest()
                 incoming_certification = incoming.get("certification") if isinstance(incoming.get("certification"), dict) else {}
+                incoming_columns = normalized_profile_columns(incoming.get("columns", {}))
+                if incoming_columns is None:
+                    raise ValueError("Profile columns must be integer indexes or {index: integer}; nested audit objects do not belong in the executable column map")
                 stored = {
                     "version": int(incoming.get("version", 1)), "bank_name": incoming["bank_name"], "format_name": incoming["format_name"],
                     "layout_fingerprint": incoming.get("layout_fingerprint", ""), "detection_code": incoming["detection_code"], "parser_code": incoming["parser_code"],
                     "last_validated_strategy": incoming.get("extraction_strategy", incoming.get("strategy", "text-column-offsets")),
-                    "columns": incoming.get("columns", {}), "rules": incoming.get("rules", {}),
+                    "columns": incoming_columns, "rules": incoming.get("rules", {}),
                     "validation": {"status": "pass", "financial_pass": True, "narration_pass": True, "balance_chain_pass": True, "transaction_count": incoming.get("certification", {}).get("transaction_count")},
                     "certification": {**incoming_certification, "status": incoming_certification.get("status", "certified"), "code_sha256": imported_code_sha256}, "parent_profile": incoming.get("parent_profile_id") or incoming.get("evolved_from_profile_id"), "upg_source": "bs_analyzer_import",
                 }
