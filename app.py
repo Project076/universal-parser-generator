@@ -638,12 +638,15 @@ def inferred_column_decimal_places(rows: list[list[object]], header_at: int, col
 
 
 def repair_indian_grouping_decimal(value: object, decimal_places: int | None) -> Decimal | None:
-    """Repair only an exact, structurally valid dot-for-comma Indian amount.
+    """Repair a proven Indian grouping punctuation corruption in one money cell.
 
-    No digit, sign, direction or column is changed.  The final full stop is
-    accepted only when it has the credible decimal width learned from valid
-    cells in that same column; preceding full stops must form a valid Indian
-    integer grouping (3 digits at the right, 2-digit lakh/crore groups).
+    A searchable PDF can change *some* grouping commas to full stops, so both
+    ``-5.00.177.00`` and ``-4.92,894.00`` can represent visible Indian values
+    ``-5,00,177.00`` and ``-4,92,894.00``.  The source digits, sign, and
+    debit/credit side are preserved exactly.  This is allowed only in a
+    measured monetary column whose normal cells independently established the
+    final decimal width; arbitrary dotted text in a narration can never enter
+    this repair path.
     """
     if value is None or decimal_places is None or decimal_places < 1:
         return None
@@ -654,9 +657,13 @@ def repair_indian_grouping_decimal(value: object, decimal_places: int | None) ->
     source = re.sub(r"(?:DR|CR)$", "", source, flags=re.I)
     explicit_negative = source.startswith("-") or (source.startswith("(") and source.endswith(")"))
     source = source.strip("-()")
-    if source.count(".") < 2 or "," in source:
+    # A conventional number has already been accepted by ``money``.  What
+    # reaches here must contain an interior full stop *and* a final decimal
+    # separator, or a mixed comma/full-stop grouping that a conventional
+    # decimal parser rejected.
+    if source.count(".") < 2:
         return None
-    groups = source.split(".")
+    groups = re.split(r"[.,]", source)
     integer_groups, fraction = groups[:-1], groups[-1]
     if len(fraction) != decimal_places or not fraction.isdigit() or not all(group.isdigit() for group in integer_groups):
         return None
@@ -2444,6 +2451,14 @@ def evidence_first_candidates(path: Path, large_pdf: bool, geometry_ready: bool,
         if path.suffix.lower() == ".pdf" and dual_date_header:
             add("dual_date_geometry", False, 1_300)
         if path.suffix.lower() == ".pdf" and has_standard_geometry_header_contract(sample):
+            # This is not a generic table guess.  The complete source header
+            # contract proves distinct date, narration, withdrawal, deposit
+            # and balance bands.  Prefer the source-amount variant because it
+            # preserves the printed movement cells even if the source running
+            # balance later proves unreliable.  The normal release gates still
+            # reject any incomplete or financially inconsistent extraction;
+            # ``standard_column_geometry`` remains a compatibility fallback.
+            add("source_amount_geometry", False, 1_310)
             add("standard_column_geometry", False, 1_250)
         if re.search(r"(?i)\bvalue\s+date\b", sample):
             add("value_date_unsigned", False, 520)
@@ -5151,7 +5166,11 @@ def has_standard_geometry_header_contract(raw: str) -> bool:
     compact = re.sub(r"\s+", " ", raw[:12000])
     concepts = {
         "date": r"\b(?:transaction|posting|value|settlement|effective)?\s*date\b",
-        "narration": r"\b(?:particulars?|remarks?|narration|description|details)\b",
+        # PDF text layers frequently concatenate adjacent visual header cells
+        # (for example ``PARTICULARSDATE``).  The start boundary is enough for
+        # a header-label signal here; source-word geometry still has to prove
+        # the actual columns before rows are accepted.
+        "narration": r"\b(?:particulars?|remarks?|narration|description|details)",
         "withdrawal": r"\b(?:withdrawals?|debits?|amount\s+debited)\b",
         "deposit": r"\b(?:deposits?|credits?|amount\s+credited)\b",
         "balance": r"\b(?:running|available|closing)?\s*balance\b",
@@ -5538,7 +5557,7 @@ def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: s
     # planning loop. It must take this exact route when explicitly selected;
     # otherwise the named candidate falls through to generic table extraction
     # while automatic parsing uses the measured route.
-    if strategy_override == "standard_column_geometry" or (
+    if strategy_override in {"standard_column_geometry", "source_amount_geometry"} or (
         strategy_override is None and standard_geometry_header
     ):
         measured_rows = extract_standard_column_geometry_rows(path)
@@ -6001,6 +6020,14 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # are correctly measured, but narration traceability is evaluated as if
     # they came from the weaker generic table extractor.
     effective_strategy = strategy_override
+    # ``raw`` is the row-oriented extraction evidence.  Some PDF readers omit
+    # or split the visual header there even though the original PDF text still
+    # proves it.  Strategy selection must use both forms of source evidence;
+    # otherwise a correct measured extractor can be downgraded to a generic
+    # parser during validation.
+    header_evidence = raw
+    if path.suffix.lower() == ".pdf":
+        header_evidence = f"{raw}\n{source_text}"
     if (
         effective_strategy is None
         and path.suffix.lower() == ".pdf"
@@ -6008,16 +6035,22 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
         r"(?is)\b(?:(?:TRANSACTION|TXN|POST(?:ING)?)\s*)?DATE\b[\s\S]{0,100}"
         r"\bVALUE\s+DATE\b[\s\S]{0,280}\b(?:DEBITS?|WITHDRAWALS?)\b[\s\S]{0,100}"
         r"\b(?:CREDITS?|DEPOSITS?)\b[\s\S]{0,100}\b(?:RUNNING\s+)?BALANCE\b",
-            raw,
+            header_evidence,
         )
     ):
         effective_strategy = "dual_date_geometry"
     elif (
         effective_strategy is None
         and path.suffix.lower() == ".pdf"
-        and has_standard_geometry_header_contract(raw)
+        and has_standard_geometry_header_contract(header_evidence)
     ):
-        effective_strategy = "standard_column_geometry"
+        # A full measured five-field header contract means debit and credit
+        # are source cells, not inferred balance deltas.  Carry this stronger
+        # interpretation into validation so an objectively unreliable running
+        # balance cannot discard otherwise complete source movements.  This
+        # is universally guarded by source geometry and all certification
+        # gates; it does not depend on a bank name or a saved parser.
+        effective_strategy = "source_amount_geometry"
     header_at = next((i for i, row in enumerate(rows[:20]) if len(map_headers(row)) >= 3), None)
     ai_columns = None
     # Deterministic candidates must be genuinely deterministic.  Previously a
