@@ -362,6 +362,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
     "balance_delta": "Classify a single unsigned amount column from running-balance movement.",
     "continuation_merge": "Join narration and transaction fragments across rows or pages.",
     "narration_source_cell": "Export Particulars only from the same measured source Particulars cell (plus source-proven continuation text). A blank Particulars cell stays blank; never copy a Withdrawal, Deposit, Balance, Date, Instrument, header, footer, or adjacent-row token into narration.",
+    "date_anchor_source_window": "For a PDF ledger, each valid Date-column anchor owns the original source lines from that anchor up to, but not including, the next valid Date-column anchor. A wrapped amount or balance line below its date remains with that same transaction. Never midpoint-group, sum, or move numeric cells between two dated transactions; an ambiguous multi-amount source window must fail for targeted repair.",
     "footer_exclusion": "Exclude totals, closing labels, disclaimers, and page furniture.",
     "terminal_row_before_summary": "When statement-summary labels begin after the final dated row, seal that dated row before ignoring summary/footer text; never let a later opening/closing/total label contaminate its date or narration.",
     "reverse_order": "Reverse newest-first statements before reconciliation.",
@@ -393,7 +394,7 @@ DIAGNOSTIC_RULE_LIBRARY = {
 # still measured from the submitted file.  This is an explainable retrieval
 # system--not a blind whole-parser copy or an untrained "deep learning" claim.
 RULE_GROUPS = {
-    "narration": {"continuation_merge", "multi_page_continuation", "reference_date_boundary", "narration_source_cell"},
+    "narration": {"continuation_merge", "multi_page_continuation", "reference_date_boundary", "narration_source_cell", "date_anchor_source_window"},
     "furniture": {"footer_exclusion", "terminal_row_before_summary", "bf_preperiod_artifact", "headerless_layout"},
     "dates": {"value_date", "dual_date_running_balance", "reverse_order", "truncated_table_date", "date_column_boundary", "numeric_date_geometry", "date_source_cell"},
     "money_and_balance": {"balance_delta", "signed_balance_text", "corrupt_balance_text_layer", "indian_money_punctuation", "unordered_balance_chain", "amount_balance_consistency", "source_amount_geometry", "balance_source_cell"},
@@ -437,6 +438,7 @@ Bank statement extraction policy:
 - Ignore logos, seals, images, QR codes, coloured banners, decorative lines, account-holder/address blocks, bank/branch contact information, page numbers, generated-on stamps, signatures, legal notices, repeated headings, and empty visual cells. Images and logos are never narration or an instrument number.
 - Particulars/Narration is source text from its own transaction cell only. Do not fill it using numbers, balances, dates, bank names, logos, headers, or nearby furniture. Keep it blank if the actual particulars cell is blank.
 - Use the original PDF's word coordinates, column x-ranges, and row y-ranges as the primary evidence for creating and reusing a parser profile. A date starts a transaction only when it occurs in the measured Date-column band at a row boundary; a date-looking token elsewhere is narration/reference text, never a record split. Use extracted text only to join narration continuations, provide validation evidence, or as a fallback when usable PDF geometry is absent. For a fixed-width text layout, the equivalent boundary is the leading date at the start of a source row.
+- A valid measured Date-column anchor owns its source row window from that Date through the line immediately before the next valid measured Date-column anchor. A wrapped amount/balance line below the date is part of that same transaction. Never use a midpoint to group nearby dated transactions, never sum two printed movement cells into one record, and never transfer an amount to the next date row. If one Date-to-Date window contains multiple candidate movement or balance baselines in the same measured column, reject the candidate for a targeted source-layout repair rather than guessing.
 - For a DOCX statement that has no actual Word table or cell coordinates, preserve paragraph order and leading spaces exactly and treat it as a fixed-width text layout. Derive columns from the source heading and aligned amount/balance positions; merge wrapped continuation lines. Never claim PDF-style geometry for such a DOCX, and do not discard whitespace before extraction.
 - B/F, opening balance, and brought-forward entries are statement metadata, never transactions. Narrow exception: an OCR-dated B/F-area artifact that has a source-proven transaction amount included in the printed Grand Total must not be deleted. Only when statement-period evidence, B/F context, and printed-total reconciliation jointly prove this case, pin its date to the period start and clear its B/F balance so it cannot become an opening/closing anchor; retain the source-proven amount and narration. Otherwise reject the ambiguity rather than guessing.
 - A row without a valid transaction date is statement furniture, a page/transaction total, or a balance label; never treat it as a transaction merely because it contains amounts.
@@ -5420,19 +5422,19 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 key=lambda item: item[0],
             )
             for index, (top, date_text) in enumerate(anchors):
-                # A number of bank PDFs place the first narration line a few
-                # points *above* its date/amount baseline.  Splitting simply
-                # at the next Date anchor then assigns that line to the
-                # previous transaction.  Partition the measured source rows
-                # at the midpoint between consecutive Date/Value Date cells:
-                # it keeps every word with the physical row it is closest to
-                # and does not rely on OCR/reading order or an AI guess.
-                if index:
-                    block_start = (anchors[index - 1][0] + top) / 2
-                else:
-                    block_start = header_top + 12
+                # S27 exact-ledger-window addendum.  A measured Date-column
+                # anchor starts a transaction; it owns every source line from
+                # that anchor until (but never including) the next measured
+                # Date-column anchor.  Do *not* split at a midpoint.  In a
+                # very common wrapped layout, the date/narration line is at
+                # y=55, the amount/balance line is at y=65, and the next date
+                # is at y=75.  A midpoint split assigns the first movement to
+                # the following transaction and can silently merge it with
+                # that row's movement.  Transaction records must mirror the
+                # source ledger, never be grouped to make reconciliation fit.
+                block_start = top - 0.25
                 if index + 1 < len(anchors):
-                    next_top = (top + anchors[index + 1][0]) / 2
+                    next_top = anchors[index + 1][0] - 0.25
                 else:
                     # The final transaction may be followed by a Total row
                     # and legal/footer furniture.  Neither belongs to the
@@ -5446,14 +5448,44 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                                    }]
                     next_top = min(footer_tops) if footer_tops else float(page.height) - 6
                 block = [word for word in words if block_start <= float(word["top"]) < next_top]
-                line = [word for word in block if abs(float(word["top"]) - top) <= 5]
+                # Amounts and running balance can be printed on a wrapped
+                # physical line below the Date cell.  Read them from this
+                # transaction's own source window, not only the date line.
+                line = block
                 def band(left: float, right: float, source=line) -> str:
                     return " ".join(str(word["text"]) for word in sorted(source, key=lambda item: float(item["x0"])) if left <= (float(word["x0"]) + float(word["x1"])) / 2 < right)
+                def measured_money_cell(left: float, right: float) -> str | None:
+                    """Return one proven monetary cell from this source row.
+
+                    Separate transaction rows must never be coalesced.  If a
+                    Date-to-Date source window contains two distinct numeric
+                    baselines in one money column, this extractor cannot
+                    safely decide which belongs to the anchor and must leave
+                    the candidate for a targeted geometry repair rather than
+                    summing or moving either amount.
+                    """
+                    by_baseline: dict[int, list[dict]] = {}
+                    for word in line:
+                        center = (float(word["x0"]) + float(word["x1"])) / 2
+                        token = str(word["text"])
+                        if (left <= center < right
+                                and re.fullmatch(r"[-+()]?[\d,.]+(?:CR|DR)?", token, re.I)):
+                            by_baseline.setdefault(round(float(word["top"]) * 2), []).append(word)
+                    candidates: list[str] = []
+                    for tokens in by_baseline.values():
+                        raw = "".join(str(word["text"]) for word in sorted(tokens, key=lambda item: float(item["x0"])))
+                        if money(raw) is not None or repair_indian_grouping_decimal(raw, 2) is not None:
+                            candidates.append(raw)
+                    return candidates[0] if len(candidates) == 1 else None
                 # Do not overlap adjacent measured money columns.  Earlier
                 # broad bands could read the same deposit once as deposit and
                 # again as the final balance, which then tempted later logic
                 # to repair a ledger that was actually read incorrectly.
-                withdrawal_text = band(*field_bands["withdrawal"]).replace(" ", "")
+                withdrawal_text = measured_money_cell(*field_bands["withdrawal"])
+                if withdrawal_text is None:
+                    # An empty source cell is normal; two candidates are not.
+                    raw_withdrawal = band(*field_bands["withdrawal"]).replace(" ", "")
+                    withdrawal_text = "" if not raw_withdrawal else "__AMBIGUOUS__"
                 # Some original PDFs let the final word of a narration range
                 # overlap the debit column (``to17-3,894.00``).  The final
                 # currency token is still source text in the debit band; do
@@ -5462,8 +5494,14 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 trailing_amount = re.search(r"(\d[\d,]*\.\d{2})$", withdrawal_text)
                 if trailing_amount and not re.fullmatch(r"-?\d[\d,]*\.\d{2}", withdrawal_text):
                     withdrawal_text = trailing_amount.group(1)
-                deposit_text = band(*field_bands["deposit"]).replace(" ", "")
-                balance_text = band(*field_bands["balance"]).replace(" ", "")
+                deposit_text = measured_money_cell(*field_bands["deposit"])
+                if deposit_text is None:
+                    raw_deposit = band(*field_bands["deposit"]).replace(" ", "")
+                    deposit_text = "" if not raw_deposit else "__AMBIGUOUS__"
+                balance_text = measured_money_cell(*field_bands["balance"])
+                if balance_text is None:
+                    raw_balance = band(*field_bands["balance"]).replace(" ", "")
+                    balance_text = "" if not raw_balance else "__AMBIGUOUS__"
                 # Preserve raw monetary source cells.  The statement-level
                 # normalizer can infer the column's decimal precision from
                 # every valid row, then safely repair an isolated text-layer
