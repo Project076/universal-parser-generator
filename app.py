@@ -6756,6 +6756,20 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
             expected_source_count = native_dual_count
         else:
             expected_source_count = table_count if table_count is not None else grid_source_count
+    # For a native, measured table the source movement multiset is stronger
+    # than a date/coordinate counter.  It is built from the original source
+    # cells (date, debit-or-credit side, amount) before canonical rows are
+    # accepted, and its Counter comparison below requires every occurrence --
+    # including duplicate-looking same-day postings -- to be reproduced.
+    #
+    # Do not overwrite that proof with a lower coordinate count.  A PDF text
+    # layer can split one amount across words or omit a date glyph on a valid
+    # row, making a date-window counter too small.  Using this only when the
+    # exact multiset exists keeps S15 fail-closed: an omitted, duplicated, or
+    # moved source amount still makes ``source_fingerprint_valid`` false.
+    source_fingerprint_count = sum(source_fingerprint.values()) if source_fingerprint is not None else 0
+    if source_fingerprint_count >= 3:
+        expected_source_count = source_fingerprint_count
     # B/F is an opening anchor, not a movement.  Some independent date-only
     # source counts include it even though the stricter table count excludes
     # it.  Correct only the exact one-row discrepancy that this metadata can
