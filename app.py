@@ -115,6 +115,7 @@ EXTRACTION_CACHE_LOCK = threading.Lock()
 PDF_TEXT_CACHE: dict[str, str] = {}
 PDF_SAMPLE_CACHE: dict[str, str] = {}
 PDF_GEOMETRY_PROFILE_CACHE: dict[str, tuple[list[object], list[tuple[float, float]]] | None] = {}
+PDF_LEDGER_COUNT_CACHE: dict[str, int | None] = {}
 # A candidate's original-source plausibility is immutable for one uploaded
 # file. Retain the tiny boolean result so retries never re-extract the same
 # representative pages merely to rediscover that a strategy cannot fit.
@@ -4344,9 +4345,145 @@ def parsed_transaction_fingerprint(transactions: list[dict]) -> Counter | None:
         records.append((date.isoformat(), side, str(abs(Decimal(value)).quantize(Decimal(".01")))))
     return Counter(records) if records else None
 
+def measured_pdf_ledger_record_count(path: Path) -> int | None:
+    """Count ledger records from original PDF coordinates, not reflowed text.
+
+    A text layer may split a single printed row into several lines, especially
+    around long narration/reference text.  Such lines are not independent
+    transaction evidence.  This counter deliberately uses only a measured
+    Date-column anchor plus exactly one measured movement cell in that row's
+    Date-to-Date window.  It remains valid if the running balance is known to
+    be unreliable, because the balance is not used to invent or discard a
+    visible debit/credit movement.
+
+    The code is intentionally independent from the transaction builder: it
+    proves the source denominator for S15 but returns no parsed values and
+    never normalises a row.  Headerless continuation pages may inherit only
+    the immediately preceding page's *same-source* geometry.
+    """
+    if path.suffix.lower() != ".pdf":
+        return None
+    cache_key = str(path.resolve())
+    with EXTRACTION_CACHE_LOCK:
+        if cache_key in PDF_LEDGER_COUNT_CACHE:
+            return PDF_LEDGER_COUNT_CACHE[cache_key]
+    date_re = re.compile(r"^\d{2}(?:-[A-Za-z]{3}-|[-/.]\d{2}[-/.])\d{4}$")
+    count = 0
+    prior: dict[str, object] | None = None
+    try:
+        with open_pdfplumber(path) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
+                roles: dict[str, list[dict]] = {key: [] for key in ("date", "narration", "withdrawal", "deposit", "balance")}
+                for word in words:
+                    role = semantic_header_role(word["text"])
+                    if role in roles:
+                        roles[role].append(word)
+                complete_header = all(roles[key] for key in roles)
+                candidates = [word for word in roles["date"] if all(
+                    any(abs(float(other["top"]) - float(word["top"])) <= 12 for other in roles[key])
+                    for key in ("narration", "withdrawal", "deposit", "balance")
+                )] if complete_header else []
+                if candidates:
+                    header_top = float(max(candidates, key=lambda item: float(item["top"]))["top"])
+                    header_words = [word for word in words if abs(float(word["top"]) - header_top) <= 12]
+                    date_headers = sorted(
+                        (word for word in roles["date"] if abs(float(word["top"]) - header_top) <= 12),
+                        key=lambda item: float(item["x0"]),
+                    )
+                    value_headers = [
+                        item for item in date_headers
+                        if any(norm(label["text"]) in {"value", "settlement", "effective"}
+                                   and 0 <= float(item["x0"]) - float(label["x1"]) <= 28
+                                   for label in header_words)
+                    ]
+                    date_header = value_headers[0] if value_headers else date_headers[0]
+                    def same_line(key: str):
+                        return min(
+                            (item for item in roles[key] if abs(float(item["top"]) - header_top) <= 12),
+                            key=lambda item: float(item["x0"]),
+                        )
+                    x_date = float(date_header["x0"])
+                    x_part = float(same_line("narration")["x0"])
+                    x_wd = float(same_line("withdrawal")["x0"])
+                    x_dp = float(same_line("deposit")["x0"])
+                    x_bal = float(same_line("balance")["x0"])
+                    prior_date = [float(item["x0"]) for item in date_headers if float(item["x0"]) < x_date - 8]
+                    later = [float(item["x0"]) for item in header_words if float(item["x0"]) > x_date + 12]
+                    date_left = (max(prior_date) + x_date) / 2 if prior_date else x_date - 55
+                    date_right = (x_date + min(later)) / 2 if later else x_part - 20
+                    prior = {
+                        "x_date": x_date, "x_part": x_part, "x_wd": x_wd,
+                        "x_dp": x_dp, "x_bal": x_bal,
+                        "date_left": date_left, "date_right": date_right,
+                    }
+                elif prior is not None:
+                    header_top = -1_000.0
+                    x_wd = float(prior["x_wd"])
+                    x_dp = float(prior["x_dp"])
+                    x_bal = float(prior["x_bal"])
+                    date_left = float(prior["date_left"])
+                    date_right = float(prior["date_right"])
+                else:
+                    continue
+                anchors = sorted(
+                    [float(word["top"]) for word in words
+                     if date_re.fullmatch(str(word["text"]))
+                     and date_left <= float(word["x0"]) < date_right
+                     and float(word["top"]) > header_top + 12]
+                )
+                for index, top in enumerate(anchors):
+                    bottom = anchors[index + 1] - .25 if index + 1 < len(anchors) else float(page.height) - 6
+                    block = [word for word in words if top - .25 <= float(word["top"]) < bottom]
+                    # Each financial band ends at the next financial/table
+                    # field.  Do not allow a token to prove both directions.
+                    all_starts = sorted([x_wd, x_dp, x_bal, float(page.width) + 5])
+                    bands = {
+                        "withdrawal": (x_wd - 10, next(value for value in all_starts if value > x_wd) - 1),
+                        "deposit": (x_dp - 10, next(value for value in all_starts if value > x_dp) - 1),
+                    }
+                    movements = 0
+                    for left, right in bands.values():
+                        baselines: dict[int, list[dict]] = {}
+                        for word in block:
+                            center = (float(word["x0"]) + float(word["x1"])) / 2
+                            token = str(word["text"])
+                            if left <= center < right and re.fullmatch(r"[-+()]?[\d,.]+(?:CR|DR)?", token, re.I):
+                                baselines.setdefault(round(float(word["top"]) * 2), []).append(word)
+                        cells = []
+                        for tokens in baselines.values():
+                            token = "".join(str(item["text"]) for item in sorted(tokens, key=lambda item: float(item["x0"])))
+                            value = money(token) or repair_indian_grouping_decimal(token, 2)
+                            if value is not None and value != 0:
+                                cells.append(value)
+                        if len(cells) == 1:
+                            movements += 1
+                    if movements == 1:
+                        count += 1
+                try:
+                    page.close()
+                except Exception:
+                    pass
+    except Exception:
+        result = None
+    else:
+        result = count if count >= 3 else None
+    with EXTRACTION_CACHE_LOCK:
+        if len(PDF_LEDGER_COUNT_CACHE) >= 24:
+            PDF_LEDGER_COUNT_CACHE.pop(next(iter(PDF_LEDGER_COUNT_CACHE)))
+        PDF_LEDGER_COUNT_CACHE[cache_key] = result
+    return result
+
+
 def structured_source_count(path: Path) -> int | None:
     """Independent table evidence used to reject a short fallback extraction."""
     if path.suffix.lower() != ".pdf": return None
+    # Original coordinates are authoritative whenever the PDF exposes them.
+    # Do not let a generic reflowed-text table replace this count: wrapped
+    # narration can make one source record look like several rows.
+    measured_count = measured_pdf_ledger_record_count(path)
+    if measured_count is not None:
+        return measured_count
     try:
         rows, _ = load_rows(path, None)
         header_at = next((i for i, row in enumerate(rows[:20]) if len(map_headers(row)) >= 3), None)
