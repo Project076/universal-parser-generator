@@ -5366,6 +5366,14 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
     # safe here because the token must also be below the measured header and
     # physically inside the measured Date-column band.
     date_re = re.compile(r"^\d{2}(?:-[A-Za-z]{3}-|[-/.]\d{2}[-/.])\d{4}$")
+    # Some bank statements print the ledger header on every page except a
+    # continuation page at a page boundary.  A continuation page is still
+    # source evidence; it must not disappear merely because its inherited
+    # column labels are not redrawn.  Keep only the immediately preceding
+    # *measured* geometry and reuse it on a later page only after that page
+    # independently proves Date-column anchors in the same x-band.  This is
+    # not a cross-bank offset copy and it never coalesces rows.
+    prior_geometry: dict[str, object] | None = None
     with open_pdfplumber(path) as pdf:
         for page in pdf.pages:
             words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
@@ -5390,7 +5398,10 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                     headers["deposits"].append(word)
                 elif role == "balance":
                     headers["balance"].append(word)
-            if not all(headers.get(key) for key in ("date", "particulars", "withdrawals", "deposits", "balance")):
+            has_header_contract = all(
+                headers.get(key) for key in ("date", "particulars", "withdrawals", "deposits", "balance")
+            )
+            if not has_header_contract and prior_geometry is None:
                 continue
             # All five labels must share the actual table-header baseline.
             # A wrapped label (for example ``Transaction\nDate``) can put the
@@ -5399,8 +5410,8 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             candidates = [word for word in headers["date"] if all(
                 any(abs(float(other["top"]) - float(word["top"])) <= 12 for other in headers[key])
                 for key in ("particulars", "withdrawals", "deposits", "balance")
-            )]
-            if not candidates:
+            )] if has_header_contract else []
+            if not candidates and prior_geometry is None:
                 continue
             # A bank may print both ``Transaction Date`` and ``Value Date``.
             # Treating both physical date cells as record anchors splits every
@@ -5409,12 +5420,20 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             # column when it is explicitly labelled, otherwise use the
             # leftmost date column.  This is a column decision, never a guess
             # based on date-looking text in narration.
-            header_top = float(max(candidates, key=lambda word: float(word["top"]))["top"])
-            header_words = [word for word in words if abs(float(word["top"]) - header_top) <= 12]
-            date_headers = sorted(
-                (word for word in headers["date"] if abs(float(word["top"]) - header_top) <= 12),
-                key=lambda word: float(word["x0"]),
-            )
+            if candidates:
+                header_top = float(max(candidates, key=lambda word: float(word["top"]))["top"])
+                header_words = [word for word in words if abs(float(word["top"]) - header_top) <= 12]
+                date_headers = sorted(
+                    (word for word in headers["date"] if abs(float(word["top"]) - header_top) <= 12),
+                    key=lambda word: float(word["x0"]),
+                )
+            else:
+                # A headerless continuation can inherit geometry, but never a
+                # header baseline: all visible Date-column anchors on this
+                # page are transaction evidence.
+                header_top = -1_000.0
+                header_words = list(prior_geometry["header_words"])
+                date_headers = list(prior_geometry["date_headers"])
             value_date_headers = [
                 date_word for date_word in date_headers
                 if any(
@@ -5423,14 +5442,21 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                     for label in header_words
                 )
             ]
-            date_header = value_date_headers[0] if value_date_headers else date_headers[0]
-            def same_line(key: str):
-                return min((word for word in headers[key] if abs(float(word["top"]) - header_top) <= 12), key=lambda word: float(word["x0"]))
-            x_date = float(date_header["x0"])
-            x_part = float(same_line("particulars")["x0"])
-            x_wd = float(same_line("withdrawals")["x0"])
-            x_dp = float(same_line("deposits")["x0"])
-            x_bal = float(same_line("balance")["x0"])
+            if candidates:
+                date_header = value_date_headers[0] if value_date_headers else date_headers[0]
+                def same_line(key: str):
+                    return min((word for word in headers[key] if abs(float(word["top"]) - float(max(candidates, key=lambda item: float(item["top"]))["top"])) <= 12), key=lambda word: float(word["x0"]))
+                x_date = float(date_header["x0"])
+                x_part = float(same_line("particulars")["x0"])
+                x_wd = float(same_line("withdrawals")["x0"])
+                x_dp = float(same_line("deposits")["x0"])
+                x_bal = float(same_line("balance")["x0"])
+            else:
+                x_date = float(prior_geometry["x_date"])
+                x_part = float(prior_geometry["x_part"])
+                x_wd = float(prior_geometry["x_wd"])
+                x_dp = float(prior_geometry["x_dp"])
+                x_bal = float(prior_geometry["x_bal"])
             # Do not assume that every bank prints Debit before Credit and
             # Balance at the far right.  The *meaning* of each column came
             # from the measured header; its source band must now be bounded
@@ -5488,6 +5514,19 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             # second transaction boundary.
             date_left = ((max(prior_date_headers) + x_date) / 2 if prior_date_headers else x_date - 55)
             date_right = ((x_date + min(subsequent_header_starts)) / 2 if subsequent_header_starts else x_part - 20)
+            # Preserve this source's measured bands for one possible
+            # immediately following continuation page.  The page itself must
+            # still supply the date anchors and money cells; only headings are
+            # inherited.
+            prior_geometry = {
+                "header_words": header_words,
+                "date_headers": date_headers,
+                "x_date": x_date,
+                "x_part": x_part,
+                "x_wd": x_wd,
+                "x_dp": x_dp,
+                "x_bal": x_bal,
+            }
             anchors = sorted(
                 [(float(word["top"]), str(word["text"])) for word in words
                  if date_re.fullmatch(str(word["text"]))
