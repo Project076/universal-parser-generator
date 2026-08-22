@@ -3460,6 +3460,22 @@ def source_record_coverage_collapsed(evidence: str) -> bool:
     return expected >= 8 and (parsed == 0 or parsed * 2 < expected)
 
 
+def source_record_coverage_failed(evidence: str) -> bool:
+    """Identify a failed source-record gate, independent of its percentage.
+
+    Once a measured source-count gate is false, downstream narration cannot be
+    considered proven: the missing records may contain the narration that
+    appears unmatched. The repair loop must stay at Step 15 until that gate
+    passes, even after an earlier repair improves 2% coverage to (say) 67%.
+    """
+    normalized = (evidence or "").lower()
+    return (
+        "gate source_coverage=fail" in normalized
+        or '"source_coverage_pass":false' in normalized
+        or '"transaction_count_match":false' in normalized
+    )
+
+
 def failure_type_from_evidence(failure: str) -> str:
     """Classify a failed gate before selecting an AI repair scope.
 
@@ -3472,7 +3488,7 @@ def failure_type_from_evidence(failure: str) -> str:
     # gate also fails. Check it before a persisted narration diagnosis so a
     # resumed job cannot replay continuation repairs after only a handful of
     # source records were reconstructed.
-    if source_record_coverage_collapsed(evidence):
+    if source_record_coverage_collapsed(evidence) or source_record_coverage_failed(evidence):
         return "transaction_count"
     # A worker lease can end after a concrete module was already proven to be
     # the source of the defect.  Its resumed repair context also contains
@@ -3675,11 +3691,16 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
     # record count; reconstruct individual rows through original-PDF column
     # bands before asking an agent to adjust text continuations. This is a
     # bounded additive repair, never copied geometry or weaker validation.
-    if source_record_coverage_collapsed(evidence):
+    if source_record_coverage_collapsed(evidence) or source_record_coverage_failed(evidence):
         failure_type, profile_action = "transaction_count", "repair_source_coverage"
         for name in ("source_coverage", "date_source_cell", "measured_column_evidence", "source_amount_geometry"):
             add_rule(name)
         add_strategy("standard_column_geometry")
+        # This is a separately implemented, untried source-grid reader. It
+        # is used only after the stricter standard-column map proves partial
+        # coverage, so we gain row-reconstruction evidence without repeating
+        # a known failed map or spending an unnecessary agent call.
+        add_strategy("detected_table")
         add_strategy("geometry_profile")
         add_strategy("source_amount_geometry")
         return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
