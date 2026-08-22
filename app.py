@@ -3444,6 +3444,22 @@ def safe_openai_error(error: Exception) -> str:
         return "OpenAI response error" + (f": {detail}" if detail else ".")
     return f"OpenAI response error: {type(error).__name__}."
 
+def source_record_coverage_collapsed(evidence: str) -> bool:
+    """Return true only for a decisive, measured source-row shortfall.
+
+    A narration gate can fail as a *consequence* of losing most ledger rows.
+    Do not send that situation to the continuation library: first reconstruct
+    the rows from the original measured source grid.  The conservative 50%
+    threshold deliberately leaves ordinary small coverage discrepancies to
+    their specific source-proof diagnostics.
+    """
+    match = re.search(r"count\s+parsed\s*=\s*(\d+)\s+expected\s*=\s*(\d+)", evidence or "", re.I)
+    if not match:
+        return False
+    parsed, expected = (int(match.group(1)), int(match.group(2)))
+    return expected >= 8 and (parsed == 0 or parsed * 2 < expected)
+
+
 def failure_type_from_evidence(failure: str) -> str:
     """Classify a failed gate before selecting an AI repair scope.
 
@@ -3452,6 +3468,12 @@ def failure_type_from_evidence(failure: str) -> str:
     later unrelated rule such as furniture cleanup or financial reconciliation.
     """
     evidence = (failure or "").lower()
+    # This is an upstream Step 15 failure even when its downstream narration
+    # gate also fails. Check it before a persisted narration diagnosis so a
+    # resumed job cannot replay continuation repairs after only a handful of
+    # source records were reconstructed.
+    if source_record_coverage_collapsed(evidence):
+        return "transaction_count"
     # A worker lease can end after a concrete module was already proven to be
     # the source of the defect.  Its resumed repair context also contains
     # broad words such as "columns" and "geometry" from the immutable
@@ -3521,7 +3543,7 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
     scoped_failure_type = failure_type_from_evidence(failure)
     learning_packet = compact_ai_learning_packet(source_path, raw=raw, failure_type=scoped_failure_type)
     allowed_rules = list(learning_packet.get("allowed_rule_modules", {}).keys())
-    safe_strategies = ["narration_geometry", "narration_anchor_geometry", "dual_date_narration_anchor_geometry", "dual_date_surrounding_anchor_geometry", "geometry_profile", "source_amount_geometry", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"]
+    safe_strategies = ["narration_geometry", "narration_anchor_geometry", "dual_date_narration_anchor_geometry", "dual_date_surrounding_anchor_geometry", "geometry_profile", "standard_column_geometry", "source_amount_geometry", "value_date_unsigned", "unsigned_running_balance_text", "running_balance_text", "page_text_unsigned", "detected_table"]
     schema = {"type": "object", "additionalProperties": False, "properties": {
         "rules": {"type": "array", "items": {"type": "string", "enum": allowed_rules}, "maxItems": 5},
         "strategies": {"type": "array", "items": {"type": "string", "enum": safe_strategies}, "maxItems": 4},
@@ -3648,6 +3670,22 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         if name not in strategies:
             strategies.append(name)
 
+    # A huge measured count deficit is not a narration problem. The original
+    # source has already proved header roles, date cells, balance cells and
+    # record count; reconstruct individual rows through original-PDF column
+    # bands before asking an agent to adjust text continuations. This is a
+    # bounded additive repair, never copied geometry or weaker validation.
+    if source_record_coverage_collapsed(evidence):
+        failure_type, profile_action = "transaction_count", "repair_source_coverage"
+        for name in ("source_coverage", "date_source_cell", "measured_column_evidence", "source_amount_geometry"):
+            add_rule(name)
+        add_strategy("standard_column_geometry")
+        add_strategy("geometry_profile")
+        add_strategy("source_amount_geometry")
+        return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
+                "upstream_steps": ["transaction_count", "header_mapping", "date_order"],
+                "profile_action": profile_action, "diagnostic_error": ""}
+
     # S29 does not have a parser rule of its own.  It is the promotion
     # decision, so a rejection must be sent back to the first *upstream*
     # interpretation that the promotion proof disproved.  This makes a late
@@ -3733,6 +3771,7 @@ def evidence_repair_plan(errors: list[str], candidate: tuple | None) -> dict[str
         failure_type = "transaction_count"
         for name in ("source_coverage", "bf_preperiod_artifact"):
             add_rule(name)
+        add_strategy("standard_column_geometry")
         add_strategy("geometry_profile")
         return {"rules": rules, "strategies": strategies, "failure_type": failure_type,
                 "profile_action": profile_action, "diagnostic_error": ""}
@@ -3915,6 +3954,7 @@ def final_certification_audit(validation: dict[str, object], receipt: dict[str, 
 # always measured again from its own source before a strategy is run.
 TARGETED_REPAIR_STRATEGIES = frozenset({
     "geometry_profile",
+    "standard_column_geometry",
     "narration_geometry",
     "narration_anchor_geometry",
     "source_amount_geometry",
