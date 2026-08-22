@@ -7058,18 +7058,44 @@ def retry_parser_job(job_id: str, path: Path, fallback_open: str, fallback_close
                             module_plan = ai_diagnose_failure(diagnostic_evidence, repair_context, path, job_id)
                             diagnostic_rules.update(str(rule) for rule in module_plan.get("rules", [])
                                                     if str(rule) in DIAGNOSTIC_RULE_LIBRARY)
+                            # The agent is allowed to select only from the
+                            # measured, deterministic repair strategies.  Its
+                            # selection is not merely advisory: execute each
+                            # genuinely new safe addendum before declaring the
+                            # blocked narration step exhausted.  Previously
+                            # this branch recorded the plan then unconditionally
+                            # set ``candidates = []``; a useful S07 narration
+                            # repair could therefore never reach the parser.
+                            agent_selected = pending_targeted_repair_strategies(
+                                module_plan.get("strategies", []), failed_strategy_keys
+                            )
+                            if agent_selected:
+                                targeted_repair_strategies = list(dict.fromkeys(
+                                    targeted_repair_strategies + agent_selected
+                                ))
+                                planned_strategies.extend(
+                                    strategy for strategy in agent_selected
+                                    if strategy not in planned_strategies
+                                )
+                                candidates = [(strategy, False) for strategy in agent_selected]
+                            else:
+                                candidates = []
                             targeted_repair_history.append({
                                 "failure_type": blocked_type,
                                 "profile_action": module_plan.get("profile_action", "reject_unsafe"),
                                 "rules": module_plan.get("rules", []),
                                 "strategies": module_plan.get("strategies", []),
+                                "executed_strategies": agent_selected,
                             })
                             record_step_learning(job_id, blocked_type, "agent_module_addendum", module_plan.get("rules", []))
                             patch_job(job_id, message=(
-                                "UPG completed a narration-module review. Its measured narration-boundary "
-                                "addendum was already tested; no unrelated column map will be tried."
+                                "UPG completed a narration-module review. "
+                                + ("It is applying the newly selected measured narration addendum."
+                                   if agent_selected else
+                                   "No new safe narration addendum remains; no unrelated column map will be tried.")
                             ))
-                        candidates = []
+                        else:
+                            candidates = []
                     else:
                         candidates = [(None, True)] if (
                             ai_calls_remaining(job_id) > 0
