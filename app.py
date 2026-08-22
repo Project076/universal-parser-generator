@@ -3133,10 +3133,6 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
         if job_id:
             patch_job(job_id, ai_layout_error=reason[:300])
 
-    key = os.environ.get("OPENAI_API_KEY")
-    if not key:
-        record_failure("OPENAI_API_KEY is not configured.")
-        return None
     # The first AI call creates an evidence-led layout blueprint.  Once that
     # map has been tested and failed, the final call must create a *revised
     # map* from the measured failure evidence--not merely diagnose it.
@@ -3170,6 +3166,21 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
         and source_path.suffix.lower() == ".pdf"
         and has_standard_geometry_header_contract(cached_pdf_text(source_path))
     ):
+        # This is a successful deterministic preflight, not an AI failure.
+        # ``parse_statement`` merges this empty addendum with the source's
+        # explicit header map below, so every role continues to come from the
+        # current PDF's measured Date/Particulars/Withdrawal/Deposit/Balance
+        # columns.  Returning ``None`` here used to turn a proven source map
+        # into the misleading fatal "AI layout planning deferred" result.
+        # It also unnecessarily required an API key even though no AI call is
+        # useful or authorised at this point.
+        measured_header_at = next(
+            (i for i, row in enumerate(rows[:20]) if len(map_headers(row)) >= 3),
+            None,
+        )
+        if measured_header_at is None:
+            record_failure("Measured PDF header contract was found but its row could not be located in the source grid.")
+            return None
         if job_id:
             with JOBS_LOCK:
                 job = JOBS.get(job_id, {})
@@ -3177,12 +3188,14 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
                 if "deterministic_geometry_preflight" not in history:
                     history.append("deterministic_geometry_preflight")
                 job["ai_call_purposes"] = history
-                job["ai_layout_error"] = (
-                    "AI layout planning deferred: measured Date/Particulars/"
-                    "Withdrawal/Deposit/Balance geometry is available."
-                )
+                job["ai_layout_mode"] = "measured_source_geometry"
+                job["ai_layout_error"] = ""
                 JOBS[job_id] = job
                 persist_job_locked(job_id)
+        return measured_header_at, {}
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        record_failure("OPENAI_API_KEY is not configured.")
         return None
     if not reserve_ai_call(job_id, purpose):
         record_failure("AI call budget is exhausted before a layout map could be generated.")
