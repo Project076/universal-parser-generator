@@ -6596,6 +6596,49 @@ def reconstruct_unordered_balance_chain(transactions: list[dict], opening: Decim
         return None
     return ordered
 
+def derive_unique_ordered_chain_endpoints(transactions: list[dict]) -> dict[str, object] | None:
+    """Derive endpoints only when one complete measured order proves them.
+
+    A statement need not print separate opening or closing labels when every
+    dated source row contains its movement and running balance. Test measured
+    order and its exact reverse, preserve source order for export, and accept
+    only one uniquely reconciling chain. Same-date rows are never regrouped.
+    """
+    if not transactions:
+        return None
+
+    def prove(sequence: list[dict], order: str) -> dict[str, object] | None:
+        first = sequence[0]
+        if first.get("balance") is None:
+            return None
+        opening = (
+            Decimal(first["balance"])
+            + Decimal(first.get("withdrawal", 0) or 0)
+            - Decimal(first.get("deposit", 0) or 0)
+        )
+        running = opening
+        for row in sequence:
+            balance = row.get("balance")
+            if balance is None:
+                return None
+            expected = running - Decimal(row.get("withdrawal", 0) or 0) + Decimal(row.get("deposit", 0) or 0)
+            if expected.quantize(Decimal(".01")) != Decimal(balance).quantize(Decimal(".01")):
+                return None
+            running = Decimal(balance)
+        return {"opening": opening, "closing": running, "order": order, "count": len(sequence)}
+
+    candidates = []
+    forward = prove(transactions, "forward")
+    if forward is not None:
+        candidates.append(forward)
+    if len(transactions) > 1:
+        reverse = prove(list(reversed(transactions)), "reverse")
+        if reverse is not None:
+            candidates.append(reverse)
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
 def measured_source_date_order(transactions: list[dict]) -> str:
     """Classify the *measured* source order without rearranging source rows.
 
@@ -6911,6 +6954,17 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # silently rearranged merely to make a balance equation pass.
     source_order = measured_source_date_order(tx)
     ledger_sequence = list(reversed(tx)) if source_order == "reverse" else tx
+    # Pre-admission addendum: prove endpoints before rejecting a statement
+    # merely because separate printed OB/CB labels are absent.
+    unique_chain_endpoints = derive_unique_ordered_chain_endpoints(tx)
+    if source_opening is None and tab_opening is None and unique_chain_endpoints is not None:
+        opening = unique_chain_endpoints["opening"]
+    if source_closing is None and tab_closing is None and unique_chain_endpoints is not None:
+        closing = unique_chain_endpoints["closing"]
+    if unique_chain_endpoints is not None:
+        source_order = str(unique_chain_endpoints["order"])
+        ledger_sequence = list(reversed(tx)) if source_order == "reverse" else tx
+        endpoint_derived = "unique_complete_running_balance_chain"
     if source_order == "reverse":
         if source_opening is None and tab_opening is None and ledger_sequence[0]["balance"] is not None:
             opening = ledger_sequence[0]["balance"] - ledger_sequence[0]["deposit"] + ledger_sequence[0]["withdrawal"]
