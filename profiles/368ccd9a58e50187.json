@@ -1,0 +1,256 @@
+{
+  "version": 1,
+  "header_signature": [
+    "Date",
+    "Narration",
+    "Withdrawal",
+    "Deposit",
+    "Instrument Number",
+    "Balance"
+  ],
+  "layout_fingerprint": "b48eb18a4fbabf4f",
+  "columns": {
+    "date": 0,
+    "narration": 1,
+    "withdrawal": 2,
+    "deposit": 3,
+    "instrument_number": 4,
+    "balance": 5,
+    "_addendum_compatibility": {
+      "step": "S28_ADDITIVE_COMPATIBILITY_GATE",
+      "mode": "new_layout",
+      "parent_profile": "",
+      "source_proven_fields": [
+        "balance",
+        "date",
+        "deposit",
+        "withdrawal"
+      ],
+      "inherited_missing_fields_only": [],
+      "conflicting_explicit_fields": [],
+      "column_collision": false,
+      "missing_core_fields": []
+    },
+    "_source_pseudo_rows_removed": 0,
+    "_source_balance_unreliable": false,
+    "_measured_source_order": "forward",
+    "_balance_endpoint_derived": "none",
+    "_source_totals_conflict": false,
+    "_source_columns_distinct": true,
+    "_source_dual_date_contract": false,
+    "_canonical_contract_valid": true,
+    "_source_record_fingerprint_valid": true,
+    "_balance_repaired_from_chain": 0,
+    "_monetary_punctuation_repairs": 0,
+    "_source_narration_cells_valid": true,
+    "_source_balance_cells_valid": true,
+    "_source_date_cells_valid": true,
+    "_source_header_roles_aligned": true,
+    "_source_column_evidence_valid": true
+  },
+  "parent_profile": null,
+  "validated_observations": 1,
+  "last_validated_strategy": "standard_column_geometry",
+  "self_healed_addendum": true,
+  "diagnostic_rules": [
+    "continuation_merge",
+    "furniture_filter",
+    "no_transaction_grouping",
+    "source_record_fingerprint",
+    "coordinate_narration_trace"
+  ],
+  "challenge_history": [
+    "cross_section_continuation",
+    "page_furniture_between_transaction_parts",
+    "prevent_transaction_grouping",
+    "short_split_narration_tokens"
+  ],
+  "rule_groups": [
+    "narration"
+  ],
+  "feature_vector": {
+    "schema_version": 1,
+    "source_kind": "structured_or_text",
+    "mapped_fields": [
+      "balance",
+      "date",
+      "deposit",
+      "instrument_number",
+      "narration",
+      "withdrawal"
+    ],
+    "strategy": "standard_column_geometry",
+    "signals": [
+      "continuation",
+      "running_balance",
+      "separate_debit_credit"
+    ],
+    "capabilities": [
+      "continuation_merge",
+      "coordinate_narration_trace",
+      "furniture_filter",
+      "source_record_fingerprint"
+    ],
+    "rule_ids": [
+      "continuation_merge",
+      "coordinate_narration_trace",
+      "furniture_filter",
+      "no_transaction_grouping",
+      "source_record_fingerprint"
+    ],
+    "challenge_ids": [
+      "cross_section_continuation",
+      "page_furniture_between_transaction_parts",
+      "prevent_transaction_grouping",
+      "short_split_narration_tokens"
+    ]
+  },
+  "capability_provenance": [],
+  "certified_capability_provenance": {
+    "step": "S42_CERTIFIED_CAPABILITY_PROVENANCE",
+    "provider_profile_ids": [],
+    "verified_provider_profile_ids": [],
+    "outcome": "pass"
+  },
+  "capability_composition_safety": {
+    "step": "S43_CAPABILITY_COMPOSITION_SAFETY",
+    "selected_rule_modules": [
+      "continuation_merge"
+    ],
+    "non_module_challenge_context": [
+      "coordinate_narration_trace",
+      "cross_section_continuation",
+      "furniture_filter",
+      "no_transaction_grouping",
+      "page_furniture_between_transaction_parts",
+      "prevent_transaction_grouping",
+      "short_split_narration_tokens",
+      "source_record_fingerprint"
+    ],
+    "declared_rule_groups": [
+      "narration"
+    ],
+    "expected_rule_groups": [
+      "narration"
+    ],
+    "provider_capability_count": 0,
+    "outcome": "pass"
+  },
+  "capability_application_receipt": {
+    "step": "S44_CAPABILITY_APPLICATION_RECEIPT",
+    "outcome": "pass",
+    "applied_rule_modules": [
+      "continuation_merge"
+    ],
+    "capability_receipt": [],
+    "geometry_policy": "measured_from_new_source_only"
+  },
+  "capability_effectiveness_feedback": {
+    "step": "S45_CAPABILITY_EFFECTIVENESS_FEEDBACK",
+    "outcome": "pass",
+    "full_release_gates_passed": true,
+    "financial_pass": true,
+    "narration_pass": true,
+    "source_coverage_pass": true,
+    "effective_capabilities": []
+  },
+  "final_certification_audit": {
+    "step": "S50_FINAL_CERTIFICATION_AUDIT",
+    "checks": {
+      "financial": true,
+      "narration": true,
+      "source_coverage": true,
+      "canonical_contract": true,
+      "application_receipt": true,
+      "capability_effectiveness": true
+    },
+    "policy": "all_release_gates_and_capability_receipts_required",
+    "outcome": "certified"
+  },
+  "step_lessons": [],
+  "profile_activation": {
+    "step": "S30_PROFILE_ACTIVATION_GUARD",
+    "activation_scope": "exact_layout_only",
+    "related_profile_mode": "independent_profile",
+    "mapped_core_fields": [
+      "balance",
+      "date",
+      "deposit",
+      "instrument_number",
+      "narration",
+      "withdrawal"
+    ],
+    "header_contract_pass": true,
+    "release_proof_pass": true,
+    "canonical_contract_pass": true,
+    "source_record_fingerprint_pass": true,
+    "outcome": "active"
+  },
+  "addendum_regression_guard": {
+    "step": "S39_ADDENDUM_REGRESSION_GUARD",
+    "mode": "independent_profile",
+    "parent_profile_id": null,
+    "preserves_parent": true,
+    "duplicate_layout": false,
+    "parent_certified": null,
+    "outcome": "pass"
+  },
+  "certified_lineage_integrity": {
+    "step": "S41_CERTIFIED_LINEAGE_INTEGRITY",
+    "root_profile": true,
+    "chain_profile_ids": [],
+    "max_supported_depth": 8,
+    "outcome": "pass"
+  },
+  "bank_name": "Jammu and Kashmir Bank",
+  "format_name": "PDF STATEMENT",
+  "detection_code": "function detect(text) {\n  const normalized = String(text || '').toLowerCase().replace(/\\s+/g, ' ');\n  const anchors = [\"date\", \"narration\", \"balance\", \"withdrawal\", \"deposit\"];\n  const hasNarration = normalized.includes('narration') || normalized.includes('particular') || normalized.includes('description');\n  const hasDebit = normalized.includes('withdrawal') || normalized.includes('debit') || normalized.includes('dr');\n  const hasCredit = normalized.includes('deposit') || normalized.includes('credit') || normalized.includes('cr');\n  return normalized.includes('date') && normalized.includes('balance') && hasNarration && hasDebit && hasCredit && anchors.length >= 2;\n}",
+  "parser_code": "function parse(text, options) {\n  const lines = String(text || '').split(/\\r?\\n/);\n  const dateRe = /^\\s*(\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4})\\b/;\n  const moneyRe = /-?\\d[\\d,]*\\.\\d{2}\\b/g;\n  const ignored = /^(page\\s+\\d+|generation date|hdfc bank|statement summary|\\*\\*end of statement|date\\s+.*(?:balance|deposit|credit)|account branch|address\\s*:|contents of this statement|opening balance|closing balance|total (?:debit|credit) amt)/i;\n  const amount = (value) => {\n    if (value == null) return null;\n    const n = Number(String(value).replace(/,/g, ''));\n    return Number.isFinite(n) && n !== 0 ? Math.abs(n) : null;\n  };\n  const date = (value) => {\n    const p = String(value).split(/[\\/-]/), months = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};\n    if (p.length !== 3) return String(value);\n    const year = p[2].length === 2 ? `20${p[2]}` : p[2];\n    const month = months[String(p[1]).toLowerCase()] || p[1];\n    return `${p[0].padStart(2, '0')}/${String(month).padStart(2, '0')}/${year}`;\n  };\n  const rows = [];\n  let prefix = [];\n  for (const rawLine of lines) {\n    const line = String(rawLine || '').trim();\n    if (!line || ignored.test(line)) { if (ignored.test(line)) prefix = []; continue; }\n    const match = line.match(dateRe);\n    if (!match) {\n      // Preserve only transaction-like wrapped narration, never page furniture.\n      if (/^(RTGS|NEFT|IMPS|UPI|CHQ|CASH|ADHOC|EMP|EVP|POS|CARD)/i.test(line)) prefix.push(line);\n      continue;\n    }\n    if (/^\\s*(?:B\\s*\\/\\s*F|OPENING\\s+BALANCE)\\b/i.test(line.slice(match[0].length))) { prefix = []; continue; }\n    const rest = line.slice(match[0].length);\n    const money = [...rest.matchAll(moneyRe)];\n    if (money.length < 3) { prefix = []; continue; }\n    const values = money.slice(-3).map((item) => amount(item[0]));\n    const firstAmountAt = money[money.length - 3].index;\n    let detail = rest.slice(0, firstAmountAt)\n      .replace(/\\b\\d{1,2}[\\/-]\\d{1,2}[\\/-]\\d{2,4}\\b/g, ' ')\n      .replace(/\\s+/g, ' ').trim();\n    const refs = detail.match(/\\b[A-Z0-9]{8,}\\b/g) || [];\n    const chqNo = refs.length ? refs[refs.length - 1] : '';\n    if (chqNo) detail = detail.replace(chqNo, ' ').replace(/\\s+/g, ' ').trim();\n    const particulars = [...prefix, detail].join(' ').replace(/\\s+/g, ' ').trim();\n    rows.push({ date: date(match[2] || match[1]), particulars, withdrawal: values[0], deposit: values[1], balance: values[2], chqNo });\n    prefix = [];\n  }\n  return rows;\n}",
+  "validation": {
+    "status": "pass",
+    "financial_pass": true,
+    "narration_pass": true,
+    "balance_chain_pass": true,
+    "transaction_count": 1997,
+    "source_transaction_count": 1997,
+    "source_coverage_pass": true,
+    "source_record_fingerprint_pass": true,
+    "canonical_output_contract_pass": true,
+    "date_output_policy": "value_date_priority_dd_mm_yyyy",
+    "printed_totals_conflict": false
+  },
+  "learning_lineage": {
+    "mode": "additive_immutable_revisions",
+    "previous_revision": null,
+    "preserves_prior_certified_learning": true
+  },
+  "certification": {
+    "status": "certified",
+    "source": "upg_native",
+    "certified_at": "2026-08-23T05:55:02Z",
+    "code_sha256": "c5bc3893df8bd7e91900fdd5cced1134d18048f94d898744c5f9148284234df7"
+  },
+  "layout_match": {
+    "step": "S33_EXACT_LAYOUT_MATCH_CONTRACT",
+    "selection_policy": "exact_layout_fingerprint",
+    "layout_fingerprint": "b48eb18a4fbabf4f",
+    "header_signature": [
+      "date",
+      "narration",
+      "withdrawal",
+      "deposit",
+      "instrumentnumber",
+      "balance"
+    ],
+    "bank_name_is_not_a_match_key": true,
+    "activation_scope": "exact_layout_only",
+    "outcome": "matchable"
+  },
+  "certified_revision_atomicity": {
+    "step": "S40_CERTIFIED_REVISION_ATOMICITY",
+    "release_gates_passed_before_revision": true,
+    "prior_revision_preserved": false,
+    "write_mode": "atomic_replace",
+    "outcome": "active"
+  }
+}

@@ -62,6 +62,71 @@
         "terminal_summary_row_sealing"
       ],
       "parent_profile": null
+    },
+    "368ccd9a58e50187": {
+      "observations": 1,
+      "strategy": "standard_column_geometry",
+      "self_healed_addendum": true,
+      "diagnostic_rules": [
+        "continuation_merge",
+        "furniture_filter",
+        "no_transaction_grouping",
+        "source_record_fingerprint",
+        "coordinate_narration_trace"
+      ],
+      "challenge_history": [
+        "cross_section_continuation",
+        "page_furniture_between_transaction_parts",
+        "prevent_transaction_grouping",
+        "short_split_narration_tokens"
+      ],
+      "rule_groups": [
+        "narration"
+      ],
+      "feature_vector": {
+        "schema_version": 1,
+        "source_kind": "structured_or_text",
+        "mapped_fields": [
+          "balance",
+          "date",
+          "deposit",
+          "instrument_number",
+          "narration",
+          "withdrawal"
+        ],
+        "strategy": "standard_column_geometry",
+        "signals": [
+          "continuation",
+          "running_balance",
+          "separate_debit_credit"
+        ],
+        "capabilities": [
+          "continuation_merge",
+          "coordinate_narration_trace",
+          "furniture_filter",
+          "source_record_fingerprint"
+        ],
+        "rule_ids": [
+          "continuation_merge",
+          "coordinate_narration_trace",
+          "furniture_filter",
+          "no_transaction_grouping",
+          "source_record_fingerprint"
+        ],
+        "challenge_ids": [
+          "cross_section_continuation",
+          "page_furniture_between_transaction_parts",
+          "prevent_transaction_grouping",
+          "short_split_narration_tokens"
+        ]
+      },
+      "capability_provenance": [],
+      "step_lessons": [],
+      "parent_profile": null
     }
-  }
+  },
+  "certified_rule_successes": {
+    "continuation_merge": 1
+  },
+  "certified_capability_successes": {}
 }
