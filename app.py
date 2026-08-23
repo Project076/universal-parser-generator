@@ -734,6 +734,7 @@ def coordinate_narrations_traceable(transactions: list[dict], raw: str) -> bool:
     source_tokens = set(re.findall(r"[a-z][a-z0-9]{2,}", str(raw or "").lower()))
     if not source_tokens:
         return False
+    normalized_raw = normalize_narration(raw)
     strong_rows = 0
     narrated_rows = 0
     for transaction in transactions:
@@ -743,7 +744,17 @@ def coordinate_narrations_traceable(transactions: list[dict], raw: str) -> bool:
         narrated_rows += 1
         tokens = re.findall(r"[a-z][a-z0-9]{2,}", narration.lower())
         if not tokens:
-            return False
+            # Some PDF text layers split every short word in a legitimate
+            # Particulars cell (for example ``I nt.Pd``), leaving no
+            # three-character alphabetic token for the coordinate-token
+            # proof above.  Accept only an exact normalized containment in
+            # the original source text.  This is not fuzzy matching and
+            # cannot admit an invented narration, financial-column amount or
+            # page-furniture fragment.
+            if normalize_narration(narration) not in normalized_raw:
+                return False
+            strong_rows += 1
+            continue
         matched = sum(token in source_tokens for token in tokens)
         score = matched / len(tokens)
         # One corrupted glyph in a scanned/searchable text layer must not
@@ -4345,6 +4356,64 @@ def parsed_transaction_fingerprint(transactions: list[dict]) -> Counter | None:
         records.append((date.isoformat(), side, str(abs(Decimal(value)).quantize(Decimal(".01")))))
     return Counter(records) if records else None
 
+def retain_source_proven_transactions(transactions: list[dict], source_fingerprint: Counter | None) -> tuple[list[dict], int]:
+    """Remove only candidate rows proved absent from a complete source multiset.
+
+    PDF/OCR geometry can occasionally emit an extra dated pseudo-row from a
+    header, footer, or wrapped continuation. Reconciliation must never decide
+    which row to discard. Where native source cells give a complete
+    (date, side, amount) Counter, retain exactly those occurrences in their
+    measured order. Duplicate-looking legitimate postings remain distinct
+    because the Counter consumes one occurrence at a time.
+
+    Fail closed: if the candidate misses even one source occurrence, or a row
+    cannot satisfy the canonical movement shape, return the original rows so
+    the normal coverage/fingerprint gates reject the parser.
+    """
+    if not source_fingerprint:
+        return transactions, 0
+    remaining = Counter(source_fingerprint)
+    retained: list[dict] = []
+    removed = 0
+    for item in transactions:
+        date = transaction_date_value(item.get("date"))
+        withdrawal = item.get("withdrawal")
+        deposit = item.get("deposit")
+        nonzero = [
+            (side, value)
+            for side, value in (("withdrawal", withdrawal), ("deposit", deposit))
+            if value is not None and value != 0
+        ]
+        if date is None or len(nonzero) != 1:
+            return transactions, 0
+        side, value = nonzero[0]
+        key = (date.isoformat(), side, str(abs(Decimal(value)).quantize(Decimal(".01"))))
+        if remaining[key] > 0:
+            retained.append(item)
+            remaining[key] -= 1
+        else:
+            removed += 1
+    if any(remaining.values()):
+        return transactions, 0
+    return (retained, removed) if removed else (transactions, 0)
+
+def normalize_measured_movement_token(raw: object) -> str:
+    """Separate one visible currency suffix from adjacent narration text.
+
+    Borderless bank PDFs occasionally place the last narration glyphs inside
+    the measured debit/credit x-band (for example ``to17-3,894.00``). The
+    terminal currency token remains source evidence, but the attached text is
+    not part of the amount. This is deliberately narrow: it accepts only one
+    terminal two-decimal token and never joins baselines, derives an amount
+    from balance, or changes the measured transaction side.
+    """
+    token = str(raw or "").replace(" ", "")
+    token = re.sub(r"^\d{1,2}-(?=\d[\d,]*\.\d{2}$)", "", token)
+    trailing = re.search(r"([-+()]?\d[\d,]*\.\d{2}(?:CR|DR)?)$", token, re.I)
+    if trailing and not re.fullmatch(r"[-+()]?\d[\d,]*\.\d{2}(?:CR|DR)?", token, re.I):
+        token = trailing.group(1)
+    return token
+
 def measured_pdf_ledger_record_count(path: Path) -> int | None:
     """Count ledger records from original PDF coordinates, not reflowed text.
 
@@ -4369,10 +4438,15 @@ def measured_pdf_ledger_record_count(path: Path) -> int | None:
             return PDF_LEDGER_COUNT_CACHE[cache_key]
     date_re = re.compile(r"^\d{2}(?:-[A-Za-z]{3}-|[-/.]\d{2}[-/.])\d{4}$")
     count = 0
+    diagnostic_pages: list[tuple[int, int]] = []
+    diagnostic_rejections: list[tuple[int, str, int, list[str]]] = []
+    diagnostic_accepts: list[tuple[int, str]] = []
     prior: dict[str, object] | None = None
+    pending_terminal_anchor: tuple[int, str] | None = None
     try:
         with open_pdfplumber(path) as pdf:
-            for page in pdf.pages:
+            for page_number, page in enumerate(pdf.pages, start=1):
+                page_count = 0
                 words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
                 roles: dict[str, list[dict]] = {key: [] for key in ("date", "narration", "withdrawal", "deposit", "balance")}
                 for word in words:
@@ -4426,44 +4500,114 @@ def measured_pdf_ledger_record_count(path: Path) -> int | None:
                     date_right = float(prior["date_right"])
                 else:
                     continue
+                # Establish the real ledger boundary from measured page text.
+                # A footer total is not part of the last transaction window.
+                by_top: dict[int, list[dict]] = {}
+                for word in words:
+                    by_top.setdefault(round(float(word["top"])), []).append(word)
+                furniture_tops: list[float] = []
+                for line_words in by_top.values():
+                    line_words = sorted(line_words, key=lambda item: float(item["x0"]))
+                    line = " ".join(str(item["text"]) for item in line_words)
+                    compact = norm(line)
+                    if any(marker in compact for marker in (
+                        "pagetotal", "grandtotal", "statementsummary",
+                        "thisisasystemgenerated", "thisisacomputergenerated",
+                        "doesnotrequireanysignature", "managerdatestamp",
+                    )):
+                        furniture_tops.append(min(float(item["top"]) for item in line_words))
+                footer_top = min(furniture_tops) if furniture_tops else float(page.height) - 6
                 anchors = sorted(
-                    [float(word["top"]) for word in words
+                    [(float(word["top"]), str(word["text"])) for word in words
                      if date_re.fullmatch(str(word["text"]))
                      and date_left <= float(word["x0"]) < date_right
-                     and float(word["top"]) > header_top + 12]
+                     and float(word["top"]) > header_top + 12
+                     and float(word["top"]) < footer_top]
                 )
-                for index, top in enumerate(anchors):
-                    bottom = anchors[index + 1] - .25 if index + 1 < len(anchors) else float(page.height) - 6
+
+                all_starts = sorted([x_wd, x_dp, x_bal, float(page.width) + 5])
+                bands = {
+                    "withdrawal": (x_wd - 10, next(value for value in all_starts if value > x_wd) - 1),
+                    "deposit": (x_dp - 10, next(value for value in all_starts if value > x_dp) - 1),
+                    "balance": (x_bal - 10, next(value for value in all_starts if value > x_bal) - 1),
+                }
+
+                def measured_cells(block: list[dict], role: str) -> list[Decimal]:
+                    left, right = bands[role]
+                    baselines: dict[int, list[dict]] = {}
+                    for word in block:
+                        center = (float(word["x0"]) + float(word["x1"])) / 2
+                        token = str(word["text"])
+                        if left <= center < right and re.fullmatch(r"[-+()]?[\d,.]+(?:CR|DR)?", token, re.I):
+                            baselines.setdefault(round(float(word["top"]) * 2), []).append(word)
+                    cells: list[Decimal] = []
+                    for tokens in baselines.values():
+                        token = normalize_measured_movement_token("".join(
+                            str(item["text"]) for item in sorted(tokens, key=lambda item: float(item["x0"]))
+                        ))
+                        value = money(token) or repair_indian_grouping_decimal(token, 2)
+                        if value is not None and (role == "balance" or value != 0):
+                            cells.append(value)
+                    return cells
+
+                # A terminal Date row may continue only into the pre-Date band
+                # of the immediately following source page.  Count it only
+                # when one visible movement and one visible running balance
+                # prove completion; never infer either value.
+                first_anchor_top = anchors[0][0] if anchors else footer_top
+                if pending_terminal_anchor is not None:
+                    preamble = [word for word in words
+                                if header_top + 12 < float(word["top"]) < min(first_anchor_top, footer_top)]
+                    wd_cells = measured_cells(preamble, "withdrawal")
+                    dp_cells = measured_cells(preamble, "deposit")
+                    bal_cells = measured_cells(preamble, "balance")
+                    if (len(wd_cells) + len(dp_cells) == 1 and len(bal_cells) == 1
+                            and bool(wd_cells) != bool(dp_cells)):
+                        count += 1
+                        page_count += 1
+                        if os.environ.get("UPG_GEOMETRY_DIAGNOSTICS") == "1":
+                            diagnostic_accepts.append(pending_terminal_anchor)
+                    pending_terminal_anchor = None
+
+                for index, (top, date_text) in enumerate(anchors):
+                    bottom = anchors[index + 1][0] - .25 if index + 1 < len(anchors) else footer_top
                     block = [word for word in words if top - .25 <= float(word["top"]) < bottom]
                     # Each financial band ends at the next financial/table
                     # field.  Do not allow a token to prove both directions.
-                    all_starts = sorted([x_wd, x_dp, x_bal, float(page.width) + 5])
-                    bands = {
-                        "withdrawal": (x_wd - 10, next(value for value in all_starts if value > x_wd) - 1),
-                        "deposit": (x_dp - 10, next(value for value in all_starts if value > x_dp) - 1),
-                    }
-                    movements = 0
-                    for left, right in bands.values():
-                        baselines: dict[int, list[dict]] = {}
-                        for word in block:
-                            center = (float(word["x0"]) + float(word["x1"])) / 2
-                            token = str(word["text"])
-                            if left <= center < right and re.fullmatch(r"[-+()]?[\d,.]+(?:CR|DR)?", token, re.I):
-                                baselines.setdefault(round(float(word["top"]) * 2), []).append(word)
-                        cells = []
-                        for tokens in baselines.values():
-                            token = "".join(str(item["text"]) for item in sorted(tokens, key=lambda item: float(item["x0"])))
-                            value = money(token) or repair_indian_grouping_decimal(token, 2)
-                            if value is not None and value != 0:
-                                cells.append(value)
-                        if len(cells) == 1:
-                            movements += 1
-                    if movements == 1:
+                    wd_cells = measured_cells(block, "withdrawal")
+                    dp_cells = measured_cells(block, "deposit")
+                    movements = int(len(wd_cells) == 1) + int(len(dp_cells) == 1)
+                    diagnostic_cells: list[str] = []
+                    if os.environ.get("UPG_GEOMETRY_DIAGNOSTICS") == "1":
+                        diagnostic_cells = [
+                            "|".join(str(value) for value in wd_cells),
+                            "|".join(str(value) for value in dp_cells),
+                        ]
+                    if movements == 1 and bool(wd_cells) != bool(dp_cells):
                         count += 1
+                        page_count += 1
+                        if os.environ.get("UPG_GEOMETRY_DIAGNOSTICS") == "1":
+                            date_tokens = [str(word["text"]) for word in block
+                                           if date_left <= float(word["x0"]) < date_right]
+                            diagnostic_accepts.append((page_number, date_tokens[0] if date_tokens else "?"))
+                    elif index + 1 == len(anchors) and movements == 0:
+                        pending_terminal_anchor = (page_number, date_text)
+                    elif os.environ.get("UPG_GEOMETRY_DIAGNOSTICS") == "1":
+                        date_tokens = [str(word["text"]) for word in block
+                                       if date_left <= float(word["x0"]) < date_right]
+                        diagnostic_rejections.append(
+                            (page_number, date_tokens[0] if date_tokens else "?", movements, diagnostic_cells)
+                        )
+                if os.environ.get("UPG_GEOMETRY_DIAGNOSTICS") == "1":
+                    diagnostic_pages.append((page_number, page_count))
                 try:
                     page.close()
                 except Exception:
                     pass
+        if diagnostic_pages:
+            print(f"[geometry-diagnostic] source-count pages={diagnostic_pages}")
+            print(f"[geometry-diagnostic] source-count rejected={diagnostic_rejections}")
+            print(f"[geometry-diagnostic] source-count accepted={diagnostic_accepts}")
     except Exception:
         result = None
     else:
@@ -5511,8 +5655,18 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
     # independently proves Date-column anchors in the same x-band.  This is
     # not a cross-bank offset copy and it never coalesces rows.
     prior_geometry: dict[str, object] | None = None
+    # A transaction can begin at the bottom of page N while its remaining
+    # Particulars text, source movement and running balance are printed below
+    # the repeated ledger header on page N+1.  Retain only that single
+    # incomplete Date-column anchor, and resolve it only from the immediately
+    # following page when exactly one measured movement side and one balance
+    # are present.  This is source-order continuation, never row grouping.
+    pending_page_tail: dict[str, object] | None = None
+    diagnostic_pages: list[tuple[int, int]] = []
+    diagnostic_accepts: list[tuple[int, str]] = []
     with open_pdfplumber(path) as pdf:
-        for page in pdf.pages:
+        for page_number, page in enumerate(pdf.pages, start=1):
+            page_row_start = len(rows)
             words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
             # The five required *fields* are often labelled differently by a
             # bank.  For example ICICI Saving statements use ``Transaction
@@ -5664,14 +5818,143 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 "x_dp": x_dp,
                 "x_bal": x_bal,
             }
-            anchors = sorted(
-                [(float(word["top"]), str(word["text"])) for word in words
-                 if date_re.fullmatch(str(word["text"]))
-                 and date_left <= float(word["x0"]) < date_right
-                 and float(word["top"]) > header_top + 12],
-                key=lambda item: item[0],
-            )
-            for index, (top, date_text) in enumerate(anchors):
+            # A browser-generated PDF can place the end of logical ledger
+            # page N and the beginning of logical ledger page N+1 on the same
+            # physical PDF page.  Such pages contain:
+            #
+            #   transactions -> Page Total -> furniture -> repeated header
+            #   -> more transactions
+            #
+            # Selecting only the last header silently drops the first ledger
+            # fragment; using one broad Date-to-Date window merges furniture
+            # into the final transaction.  Build every source-proven ledger
+            # section instead.  The only headerless leading section accepted
+            # is one that is sealed by a Page Total before the first header,
+            # which proves it is the continuation of the preceding page.
+            candidate_tops = sorted({float(word["top"]) for word in candidates})
+            page_total_tops: list[float] = []
+            line_words: dict[int, list[dict]] = {}
+            for word in words:
+                line_words.setdefault(round(float(word["top"]) * 2), []).append(word)
+            for grouped in line_words.values():
+                line_text = " ".join(
+                    str(item["text"]) for item in sorted(grouped, key=lambda item: float(item["x0"]))
+                )
+                if re.search(r"(?i)\bpage\s+total\s*:", line_text):
+                    page_total_tops.append(min(float(item["top"]) for item in grouped) - 2)
+            page_total_tops.sort()
+            ledger_sections: list[tuple[float, float]] = []
+            if candidate_tops:
+                first_header = candidate_tops[0]
+                leading_totals = [top for top in page_total_tops if top < first_header]
+                if leading_totals and prior_geometry is not None:
+                    ledger_sections.append((-1.0, leading_totals[0]))
+                for candidate_top in candidate_tops:
+                    ending_totals = [top for top in page_total_tops if top > candidate_top + 12]
+                    section_end = ending_totals[0] if ending_totals else float(page.height) - 6
+                    ledger_sections.append((candidate_top + 12, section_end))
+            elif prior_geometry is not None:
+                section_end = page_total_tops[0] if page_total_tops else float(page.height) - 6
+                ledger_sections.append((-1.0, section_end))
+            # Keep sections disjoint and source ordered.  A semantically
+            # header-like footer line cannot create a second copy of a region.
+            ledger_sections = sorted({(start, end) for start, end in ledger_sections if end > start + 1})
+            anchor_records: list[tuple[float, str, float, float]] = []
+            for word in words:
+                word_top = float(word["top"])
+                if not (date_re.fullmatch(str(word["text"]))
+                        and date_left <= float(word["x0"]) < date_right):
+                    continue
+                for section_start, section_end in ledger_sections:
+                    if section_start < word_top < section_end:
+                        anchor_records.append((word_top, str(word["text"]), section_start, section_end))
+                        break
+            anchors = sorted(anchor_records, key=lambda item: item[0])
+            narration_right_candidates = [
+                measured_starts[field] - 10
+                for field in ("withdrawal", "deposit", "balance")
+                if measured_starts[field] > x_narration_left
+            ]
+            narration_right = min(narration_right_candidates, default=float(page.width) + 5)
+
+            def one_money_cell(source_words: list[dict], left: float, right: float) -> str | None:
+                """Return one monetary token proved by one visual baseline."""
+                by_baseline: dict[int, list[dict]] = {}
+                for source_word in source_words:
+                    center = (float(source_word["x0"]) + float(source_word["x1"])) / 2
+                    token = str(source_word["text"])
+                    if (left <= center < right
+                            and re.fullmatch(r"[-+()]?[\d,.]+(?:CR|DR)?", token, re.I)):
+                        by_baseline.setdefault(round(float(source_word["top"]) * 2), []).append(source_word)
+                candidates: list[str] = []
+                for tokens in by_baseline.values():
+                    raw_cell = "".join(str(item["text"]) for item in sorted(tokens, key=lambda item: float(item["x0"])))
+                    if money(raw_cell) is not None or repair_indian_grouping_decimal(raw_cell, 2) is not None:
+                        candidates.append(raw_cell)
+                return candidates[0] if len(candidates) == 1 else None
+
+            # Resolve an incomplete terminal row from page N using only the
+            # measured pre-first-Date ledger band on page N+1. Repeated bank
+            # headings are above header_top and therefore cannot enter it.
+            if pending_page_tail is not None:
+                resolved = False
+                if anchors:
+                    first_section_start = anchors[0][2]
+                    # Only the source lines immediately preceding the first
+                    # Date anchor can complete the prior page's terminal
+                    # transaction.  The physical-page banner (for example
+                    # ``Page 8 of 136``) is also above that anchor and its
+                    # page number sits inside the Balance x-band.  Scanning
+                    # the whole page preamble therefore creates two numeric
+                    # baselines and wrongly makes an otherwise unambiguous
+                    # continuation look unsafe.  A transaction continuation
+                    # is locally adjacent to the next dated row; restrict the
+                    # evidence window accordingly while retaining enough
+                    # height for wrapped narration lines.
+                    continuation_floor = max(first_section_start, anchors[0][0] - 45)
+                    preamble = [
+                        word for word in words
+                        if continuation_floor < float(word["top"]) < anchors[0][0] - 0.25
+                    ]
+                    pre_wd = one_money_cell(preamble, *field_bands["withdrawal"])
+                    pre_dp = one_money_cell(preamble, *field_bands["deposit"])
+                    pre_bal = one_money_cell(preamble, *field_bands["balance"])
+                    wd_value = money(pre_wd) or repair_indian_grouping_decimal(pre_wd or "", 2)
+                    dp_value = money(pre_dp) or repair_indian_grouping_decimal(pre_dp or "", 2)
+                    bal_value = money(pre_bal) or repair_indian_grouping_decimal(pre_bal or "", 2)
+                    if bool(wd_value) != bool(dp_value) and bal_value is not None:
+                        continuation_words = [
+                            word for word in preamble
+                            if x_narration_left <= float(word["x0"]) < narration_right
+                        ]
+                        continuation = clean_narration(" ".join(
+                            str(word["text"]) for word in sorted(
+                                continuation_words,
+                                key=lambda item: (float(item["top"]), float(item["x0"])),
+                            )
+                        ))
+                        narration = clean_narration(
+                            " ".join(filter(None, [str(pending_page_tail["narration"]), continuation]))
+                        )
+                        refs = re.findall(r"\b\d{6,}\b", narration)
+                        rows.append([
+                            pending_page_tail["date"], narration,
+                            pre_wd or "", pre_dp or "", refs[-1] if refs else "", pre_bal or "",
+                        ])
+                        if os.getenv("UPG_DEBUG_BOUNDARIES") == "1":
+                            print("BOUNDARY_RESOLVED", pending_page_tail.get("source_page"), page_number,
+                                  pending_page_tail.get("date"), pre_wd, pre_dp, pre_bal, flush=True)
+                        resolved = True
+                    elif os.getenv("UPG_DEBUG_BOUNDARIES") == "1":
+                        print("BOUNDARY_UNRESOLVED", pending_page_tail.get("source_page"), page_number,
+                              pending_page_tail.get("date"), pre_wd, pre_dp, pre_bal,
+                              [(round(float(w["top"]), 1), round(float(w["x0"]), 1), str(w["text"]))
+                               for w in preamble], flush=True)
+                # A fragment may cross one adjacent page only.  If the next
+                # page cannot prove it, discard the candidate evidence rather
+                # than attaching it to a later transaction.
+                pending_page_tail = None
+            for index, (top, date_text, section_start, section_end) in enumerate(anchors):
                 # S27 exact-ledger-window addendum.  A measured Date-column
                 # anchor starts a transaction; it owns every source line from
                 # that anchor until (but never including) the next measured
@@ -5683,7 +5966,7 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 # that row's movement.  Transaction records must mirror the
                 # source ledger, never be grouped to make reconciliation fit.
                 block_start = top - 0.25
-                if index + 1 < len(anchors):
+                if index + 1 < len(anchors) and anchors[index + 1][2:] == (section_start, section_end):
                     next_top = anchors[index + 1][0] - 0.25
                 else:
                     # The final transaction may be followed by a Total row
@@ -5696,7 +5979,8 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                                        "total", "grand", "page", "www.icici.bank.in",
                                        "www.", "please", "never", "disclaimer",
                                    }]
-                    next_top = min(footer_tops) if footer_tops else float(page.height) - 6
+                    next_top = min(footer_tops) if footer_tops else section_end
+                    next_top = min(next_top, section_end)
                 block = [word for word in words if block_start <= float(word["top"]) < next_top]
                 # Amounts and running balance can be printed on a wrapped
                 # physical line below the Date cell.  Read them from this
@@ -5714,19 +5998,7 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                     the candidate for a targeted geometry repair rather than
                     summing or moving either amount.
                     """
-                    by_baseline: dict[int, list[dict]] = {}
-                    for word in line:
-                        center = (float(word["x0"]) + float(word["x1"])) / 2
-                        token = str(word["text"])
-                        if (left <= center < right
-                                and re.fullmatch(r"[-+()]?[\d,.]+(?:CR|DR)?", token, re.I)):
-                            by_baseline.setdefault(round(float(word["top"]) * 2), []).append(word)
-                    candidates: list[str] = []
-                    for tokens in by_baseline.values():
-                        raw = "".join(str(word["text"]) for word in sorted(tokens, key=lambda item: float(item["x0"])))
-                        if money(raw) is not None or repair_indian_grouping_decimal(raw, 2) is not None:
-                            candidates.append(raw)
-                    return candidates[0] if len(candidates) == 1 else None
+                    return one_money_cell(line, left, right)
                 # Do not overlap adjacent measured money columns.  Earlier
                 # broad bands could read the same deposit once as deposit and
                 # again as the final balance, which then tempted later logic
@@ -5740,14 +6012,12 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 # overlap the debit column (``to17-3,894.00``).  The final
                 # currency token is still source text in the debit band; do
                 # not turn its leading narration fragment into amount 17.
-                withdrawal_text = re.sub(r"^\d{1,2}-(?=\d[\d,]*\.\d{2}$)", "", withdrawal_text)
-                trailing_amount = re.search(r"(\d[\d,]*\.\d{2})$", withdrawal_text)
-                if trailing_amount and not re.fullmatch(r"-?\d[\d,]*\.\d{2}", withdrawal_text):
-                    withdrawal_text = trailing_amount.group(1)
+                withdrawal_text = normalize_measured_movement_token(withdrawal_text)
                 deposit_text = measured_money_cell(*field_bands["deposit"])
                 if deposit_text is None:
                     raw_deposit = band(*field_bands["deposit"]).replace(" ", "")
                     deposit_text = "" if not raw_deposit else "__AMBIGUOUS__"
+                deposit_text = normalize_measured_movement_token(deposit_text)
                 balance_text = measured_money_cell(*field_bands["balance"])
                 if balance_text is None:
                     raw_balance = band(*field_bands["balance"]).replace(" ", "")
@@ -5758,21 +6028,9 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 # punctuation defect without changing the measured columns.
                 withdrawal = money(withdrawal_text) or repair_indian_grouping_decimal(withdrawal_text, 2) or Decimal("0")
                 deposit = money(deposit_text) or repair_indian_grouping_decimal(deposit_text, 2) or Decimal("0")
-                # Date + visibly measured source amount establishes a record;
-                # an unusable balance cannot erase it or change its direction.
-                if not withdrawal and not deposit:
-                    continue
                 # Particulars is a measured cell, never the remainder of the
-                # page.  Its right edge is the first financial/balance column
-                # to its right on this source page.  This prevents a reversed
-                # Credit/Debit layout from leaking a printed amount into the
-                # narration field.
-                narration_right_candidates = [
-                    measured_starts[field] - 10
-                    for field in ("withdrawal", "deposit", "balance")
-                    if measured_starts[field] > x_narration_left
-                ]
-                narration_right = min(narration_right_candidates, default=float(page.width) + 5)
+                # page. Calculate it before movement acceptance because an
+                # incomplete terminal anchor may need to continue on page N+1.
                 narration_words = [word for word in block if x_narration_left <= float(word["x0"]) < narration_right]
                 narration = clean_narration(" ".join(str(word["text"]) for word in sorted(narration_words, key=lambda item: (float(item["top"]), float(item["x0"])))) )
                 narration = re.split(
@@ -5780,6 +6038,99 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                     r"this\s+is\s+an\s+auto|this\s+is\s+a\s+system\s+generated)\b",
                     narration,
                 )[0].strip()
+
+                # Date + visibly measured source amount establishes a record;
+                # an unusable balance cannot erase it or change its direction.
+                # Exactly one source movement side is mandatory. A broad
+                # final Date-to-footer window can contain page totals or the
+                # following page's repeated account furniture in both money
+                # bands. Keeping that window creates a pseudo-transaction and
+                # later classification may appear to "repair" it. Refuse it
+                # here instead: no grouping, no balance-derived side, and no
+                # compensating amount may enter the candidate.
+                if bool(withdrawal) == bool(deposit):
+                    incomplete_source_anchor = (
+                        not withdrawal and not deposit and narration
+                        and not re.search(r"(?i)^(?:opening\s+balance|b\s*/\s*f)\b", narration)
+                    )
+                    if incomplete_source_anchor:
+                        # A browser/print-generated physical PDF page may
+                        # contain two logical statement pages.  The final
+                        # dated row of the first section can start immediately
+                        # before Page Total, while its remaining narration,
+                        # movement and balance continue after the repeated
+                        # ledger header on the *same physical page*.  Resolve
+                        # that handoff from the next section's measured
+                        # pre-first-Date band exactly as for a physical page
+                        # boundary.  Never group it with the next dated row.
+                        next_anchor = anchors[index + 1] if index + 1 < len(anchors) else None
+                        subsequent_sections = [
+                            (start, end) for start, end in ledger_sections
+                            if start >= section_end - 0.25 and end > start + 1
+                        ]
+                        # The next logical ledger section may contain only
+                        # the undated continuation of this transaction.  In
+                        # that case there is deliberately no ``next_anchor``
+                        # to point at it.  Use the measured section boundary
+                        # itself and inspect only its first local row band.
+                        # This covers ``Date/narration -> Page Total ->
+                        # repeated header -> remaining narration + amount +
+                        # balance`` without attaching the continuation to a
+                        # later dated record or grouping two source rows.
+                        if subsequent_sections:
+                            next_section_start, next_section_end = subsequent_sections[0]
+                            next_top = (
+                                next_anchor[0]
+                                if next_anchor is not None
+                                and next_anchor[2:] == (next_section_start, next_section_end)
+                                else min(next_section_end, next_section_start + 45)
+                            )
+                            continuation_floor = next_section_start
+                            continuation_band = [
+                                word for word in words
+                                if continuation_floor < float(word["top"]) < next_top - 0.25
+                            ]
+                            section_wd = one_money_cell(continuation_band, *field_bands["withdrawal"])
+                            section_dp = one_money_cell(continuation_band, *field_bands["deposit"])
+                            section_bal = one_money_cell(continuation_band, *field_bands["balance"])
+                            wd_proof = money(section_wd) or repair_indian_grouping_decimal(section_wd or "", 2)
+                            dp_proof = money(section_dp) or repair_indian_grouping_decimal(section_dp or "", 2)
+                            bal_proof = money(section_bal) or repair_indian_grouping_decimal(section_bal or "", 2)
+                            if bool(wd_proof) != bool(dp_proof) and bal_proof is not None:
+                                continuation_words = [
+                                    word for word in continuation_band
+                                    if x_narration_left <= float(word["x0"]) < narration_right
+                                ]
+                                continuation = clean_narration(" ".join(
+                                    str(word["text"]) for word in sorted(
+                                        continuation_words,
+                                        key=lambda item: (float(item["top"]), float(item["x0"])),
+                                    )
+                                ))
+                                completed_narration = clean_narration(
+                                    " ".join(filter(None, [narration, continuation]))
+                                )
+                                refs = re.findall(r"\b\d{6,}\b", completed_narration)
+                                rows.append([
+                                    display_date(date_text), completed_narration,
+                                    section_wd or "", section_dp or "",
+                                    refs[-1] if refs else "", section_bal or "",
+                                ])
+                                continue
+                        if index == len(anchors) - 1:
+                            pending_page_tail = {
+                                "date": display_date(date_text),
+                                "narration": narration,
+                                "source_page": page_number,
+                            }
+                            if os.getenv("UPG_DEBUG_BOUNDARIES") == "1":
+                                print("BOUNDARY_PENDING", page_number, date_text, narration, flush=True)
+                    continue
+                # Particulars is a measured cell, never the remainder of the
+                # page.  Its right edge is the first financial/balance column
+                # to its right on this source page.  This prevents a reversed
+                # Credit/Debit layout from leaking a printed amount into the
+                # narration field.
                 # A final narration word can visually overlap the debit x-band
                 # in borderless source PDFs.  A currency-shaped tail is not
                 # narration; it is the source movement already measured above.
@@ -5788,10 +6139,17 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                     continue
                 refs = re.findall(r"\b\d{6,}\b", narration)
                 rows.append([display_date(date_text), narration, withdrawal_text, deposit_text, refs[-1] if refs else "", balance_text])
+                if os.environ.get("UPG_GEOMETRY_DIAGNOSTICS") == "1":
+                    diagnostic_accepts.append((page_number, date_text))
             try:
                 page.close()
             except Exception:
                 pass
+            if os.environ.get("UPG_GEOMETRY_DIAGNOSTICS") == "1":
+                diagnostic_pages.append((page_number, len(rows) - page_row_start))
+    if diagnostic_pages:
+        print(f"[geometry-diagnostic] parsed-row pages={diagnostic_pages}")
+        print(f"[geometry-diagnostic] parsed-row accepted={diagnostic_accepts}")
     return rows if len(rows) > 1 else []
 
 def extract_pdf_rows(path: Path, strategy_override: str | None = None, job_id: str | None = None) -> tuple[list[list[object]], str]:
@@ -6500,6 +6858,26 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
                     source_amount = printed_amount
             source_balance_value = monetary_cell("balance")
             tx.append({"date": display_date(table_date), "narration": narration, "withdrawal": withdrawal, "deposit": deposit, "instrument_number": str(cell("instrument_number") or ""), "balance": source_balance_value, "source_amount": source_amount, "_source_narration": source_narration, "_source_balance_value": source_balance_value, "_source_date_raw": source_date_raw, "_date_repaired_from_source": date_repaired_from_source})
+    # Step 15 addendum: a measured native table can independently prove every
+    # source movement. If a geometry/OCR candidate is an exact superset of that
+    # complete multiset, discard only its extra pseudo-rows. This is not amount
+    # grouping, equation repair, or balance-derived invention: every retained
+    # row already exists in the source Date + side + amount cells.
+    native_source_fingerprint = (
+        source_transaction_fingerprint(rows, header_at, columns)
+        if not generated_canonical_headers(headers) else None
+    )
+    native_source_count = count_source_transactions(rows, header_at, columns)
+    fingerprint_count = sum(native_source_fingerprint.values()) if native_source_fingerprint is not None else 0
+    source_fingerprint_complete = bool(
+        native_source_fingerprint
+        and fingerprint_count >= 3
+        and fingerprint_count == native_source_count
+    )
+    source_pseudo_rows_removed = 0
+    if source_fingerprint_complete:
+        tx, source_pseudo_rows_removed = retain_source_proven_transactions(tx, native_source_fingerprint)
+    columns["_source_pseudo_rows_removed"] = source_pseudo_rows_removed
     # Transaction extraction uses the furniture-cleaned text, but statement
     # endpoints must come from the original PDF text.  A repeated J&K Bank
     # header block can sit before B/F and the final Grand Total; cleaning it is
@@ -6670,9 +7048,29 @@ def parse_statement(path: Path, fallback_open: str, fallback_close: str, strateg
     # canonical rows to reproduce it exactly.  Generic text layouts do not
     # have sufficiently independent cells, so they rely on their stricter raw
     # record count and per-row source_amount checks instead.
+    # A canonical header is normally synthetic and therefore cannot prove its
+    # own coverage.  Original-coordinate geometry is different: each
+    # canonical source row was assembled from independently measured Date,
+    # Withdrawal/Deposit and Balance x-bands before transaction conversion.
+    # Retain that exact source multiset as the coverage contract.  This closes
+    # a gap where a weaker page counter missed rows completed after a repeated
+    # header/furniture section and rejected a complete extraction (or, worse,
+    # could have accepted the same-sized wrong subset).
+    measured_geometry_strategies = {
+        "geometry_profile", "narration_geometry", "narration_anchor_geometry",
+        "dual_date_geometry", "dual_date_narration_geometry",
+        "dual_date_narration_anchor_geometry",
+        "dual_date_surrounding_anchor_geometry", "standard_column_geometry",
+        "source_amount_geometry",
+    }
+    source_rows_are_independently_measured = (
+        effective_strategy in measured_geometry_strategies
+        and path.suffix.lower() == ".pdf"
+    )
     source_fingerprint = (
         source_transaction_fingerprint(rows, header_at, columns)
-        if not generated_canonical_headers(headers) else None
+        if (not generated_canonical_headers(headers) or source_rows_are_independently_measured)
+        else None
     )
     parsed_fingerprint = parsed_transaction_fingerprint(tx) if source_fingerprint is not None else None
     source_fingerprint_valid = (
