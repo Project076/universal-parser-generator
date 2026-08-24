@@ -559,7 +559,7 @@ def semantic_header_role(value: object) -> str | None:
         return "date"
     if "amount" in label:
         return "amount"
-    if label in {"type", "transactiontype", "drcr"}:
+    if label in {"type", "transactiontype", "drcr", "crdr", "creditdebit", "debitcredit"}:
         return "transaction_type"
     return None
 
@@ -2798,7 +2798,13 @@ def open_pdf_reader(path: Path) -> PdfReader:
     reader = PdfReader(str(path))
     if reader.is_encrypted:
         password = pdf_password(path)
-        if not password or not reader.decrypt(password):
+        # Some banks/JasperReports exports carry an encryption dictionary but
+        # are intentionally readable without a user password (owner/security
+        # restrictions only).  pypdf reports those files as encrypted and
+        # successfully opens them with the empty password.  Try that source-
+        # faithful route before asking the user for a password; never confuse
+        # owner protection with an unreadable statement.
+        if not reader.decrypt(password or ""):
             raise ValueError("PASSWORD_REQUIRED: This PDF is password protected. Enter its password and submit it again; UPG will not retry unreadable encrypted files.")
     return reader
 
@@ -5570,7 +5576,19 @@ def has_standard_geometry_header_contract(raw: str) -> bool:
         "deposit": r"\b(?:deposits?|credits?|amount\s+credited)\b",
         "balance": r"\b(?:running|available|closing)?\s*balance\b",
     }
-    return all(re.search(pattern, compact, re.I) for pattern in concepts.values())
+    core = all(
+        re.search(concepts[name], compact, re.I)
+        for name in ("date", "narration", "balance")
+    )
+    split_movement = bool(
+        re.search(concepts["withdrawal"], compact, re.I)
+        and re.search(concepts["deposit"], compact, re.I)
+    )
+    typed_amount_movement = bool(
+        re.search(r"\b(?:transaction\s*)?amount(?:\s*\(\s*inr\s*\))?\b", compact, re.I)
+        and re.search(r"\b(?:cr\s*/\s*dr|dr\s*/\s*cr|credit\s*/\s*debit|debit\s*/\s*credit)\b", compact, re.I)
+    )
+    return core and (split_movement or typed_amount_movement)
 
 def has_dual_date_header_contract(headers: list[object]) -> bool:
     """Recognize a two-date ledger from measured header *cells*.
@@ -5628,6 +5646,145 @@ def source_has_dual_date_contract(headers: list[object], raw: str, strategy: str
     )
 
 
+def extract_typed_amount_geometry_rows(path: Path) -> list[list[object]]:
+    """Extract a measured ledger with one Amount column and explicit CR/DR.
+
+    This capability is deliberately source-structural rather than bank-
+    specific.  It applies only when the original PDF proves distinct columns
+    for Date, Particulars/Description, CR/DR, Amount and Balance.  A numbered
+    source-row column, when present, is used as an independent one-to-one row
+    anchor.  Amounts are copied from the measured Amount band and classified
+    only by the explicit source CR/DR token; balance differences are never
+    used to invent, combine or repair movements.
+    """
+    header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
+    rows: list[list[object]] = [header]
+    measured: dict[str, float] | None = None
+    expected_sequence: int | None = None
+
+    def word_mid_x(word: dict) -> float:
+        return (float(word["x0"]) + float(word["x1"])) / 2
+
+    def header_word(words: list[dict], pattern: str) -> dict | None:
+        return next((word for word in words if re.fullmatch(pattern, str(word["text"]), re.I)), None)
+
+    with open_pdfplumber(path) as pdf:
+        for page_number, page in enumerate(pdf.pages, start=1):
+            words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False)
+            if measured is None:
+                no_word = header_word(words, r"No\.?")
+                transaction_word = header_word(words, r"Transactio(?:n)?")
+                value_word = header_word(words, r"Value")
+                posted_word = header_word(words, r"Txn")
+                cheque_word = header_word(words, r"ChequeNo\.?")
+                description_word = header_word(words, r"Description|Particulars?|Remarks?|Narration")
+                type_word = header_word(words, r"Cr/Dr|Dr/Cr")
+                amount_word = header_word(words, r"Transaction")
+                balance_word = header_word(words, r"Available|Running")
+                amount_label = header_word(words, r"Amount(?:\(INR\))?")
+                balance_label = header_word(words, r"Balance(?:\(INR\)?)?")
+                required_words = (
+                    no_word, transaction_word, value_word, posted_word,
+                    cheque_word, description_word, type_word,
+                    amount_word or amount_label, balance_word or balance_label,
+                )
+                if not all(required_words):
+                    continue
+                # All coordinates come from this source's own original-PDF
+                # header.  Description headings are commonly centred over a
+                # wide column, so its left edge is the right edge of the
+                # preceding Cheque column plus a small measured gutter.
+                measured = {
+                    "header_bottom": max(float(word["bottom"]) for word in words if 0 <= float(word["top"]) <= 300 and word in required_words if word),
+                    "sequence_right": (word_mid_x(no_word) + word_mid_x(transaction_word)) / 2,
+                    "transaction_left": (word_mid_x(no_word) + word_mid_x(transaction_word)) / 2,
+                    "transaction_right": (word_mid_x(transaction_word) + word_mid_x(value_word)) / 2,
+                    "value_left": (word_mid_x(transaction_word) + word_mid_x(value_word)) / 2,
+                    "value_right": (word_mid_x(value_word) + word_mid_x(posted_word)) / 2,
+                    "narration_left": float(cheque_word["x1"]) + 8,
+                    "narration_right": float(type_word["x0"]) - 8,
+                    "type_left": float(type_word["x0"]) - 12,
+                    "type_right": (word_mid_x(type_word) + word_mid_x(amount_word or amount_label)) / 2,
+                    "amount_left": (word_mid_x(type_word) + word_mid_x(amount_word or amount_label)) / 2,
+                    "amount_right": (word_mid_x(amount_word or amount_label) + word_mid_x(balance_word or balance_label)) / 2,
+                    "balance_left": (word_mid_x(amount_word or amount_label) + word_mid_x(balance_word or balance_label)) / 2,
+                }
+
+            if measured is None:
+                continue
+
+            anchors: list[tuple[int, dict]] = []
+            for word in words:
+                text_value = str(word["text"]).strip()
+                if not text_value.isdigit() or word_mid_x(word) >= measured["sequence_right"]:
+                    continue
+                sequence = int(text_value)
+                if sequence <= 0:
+                    continue
+                anchors.append((sequence, word))
+            anchors.sort(key=lambda item: float(item[1]["top"]))
+            if not anchors:
+                continue
+
+            for anchor_index, (sequence, anchor) in enumerate(anchors):
+                anchor_top = float(anchor["top"])
+                previous_top = float(anchors[anchor_index - 1][1]["top"]) if anchor_index else 0.0
+                next_top = float(anchors[anchor_index + 1][1]["top"]) if anchor_index + 1 < len(anchors) else float(page.height)
+                block_top = (previous_top + anchor_top) / 2 if anchor_index else max(0.0, anchor_top - 45)
+                block_bottom = (anchor_top + next_top) / 2 if anchor_index + 1 < len(anchors) else min(float(page.height), anchor_top + 55)
+                block = [word for word in words if block_top <= float(word["top"]) < block_bottom]
+
+                def band(left: float, right: float) -> list[dict]:
+                    return [word for word in block if left <= word_mid_x(word) < right]
+
+                value_dates = [
+                    str(word["text"]) for word in band(measured["value_left"], measured["value_right"])
+                    if transaction_date_value(word["text"])
+                ]
+                kinds = [
+                    str(word["text"]).upper().replace(" ", "")
+                    for word in band(measured["type_left"], measured["type_right"])
+                    if str(word["text"]).upper().replace(" ", "") in {"CR", "DR"}
+                ]
+                amount_tokens = band(measured["amount_left"], measured["amount_right"])
+                balance_tokens = band(measured["balance_left"], float(page.width) + 1)
+                amount = next((source_money(word["text"]) for word in amount_tokens if source_money(word["text"]) is not None), None)
+                balance = next((source_money(word["text"]) for word in balance_tokens if source_money(word["text"]) is not None), None)
+                if len(value_dates) != 1 or len(kinds) != 1 or amount is None or balance is None:
+                    continue
+
+                narration_words = band(measured["narration_left"], measured["narration_right"])
+                narration = clean_narration(" ".join(
+                    str(word["text"]) for word in sorted(
+                        narration_words, key=lambda item: (float(item["top"]), float(item["x0"]))
+                    )
+                ))
+                narration = re.split(
+                    r"(?i)\b(?:page\s+total|grand\s+total|closing\s+balance|statement\s+summary|this\s+is\s+a\s+system\s+generated)\b",
+                    narration,
+                )[0].strip()
+                transaction_ids = [
+                    str(word["text"]) for word in band(measured["transaction_left"], measured["transaction_right"])
+                    if str(word["text"]).strip()
+                ]
+                kind = kinds[0]
+                withdrawal = amount if kind == "DR" else Decimal("0")
+                deposit = amount if kind == "CR" else Decimal("0")
+                rows.append([
+                    display_date(value_dates[0]), narration, withdrawal, deposit,
+                    " ".join(transaction_ids).strip(), balance,
+                ])
+                if expected_sequence is None:
+                    expected_sequence = sequence
+                if sequence != expected_sequence:
+                    # Coverage must remain independently auditable.  A gap or
+                    # duplicate in the printed row-number chain invalidates
+                    # this extractor rather than encouraging row grouping.
+                    return []
+                expected_sequence += 1
+    return rows if len(rows) > 1 else []
+
+
 def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
     """Extract a normal Date / Particulars / Debit / Credit / Balance ledger.
 
@@ -5636,6 +5793,9 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
     compensating movement.  This avoids an OCR/text-layer defect turning, for
     example, a visible withdrawal of 9.00 into a fictional 5,00,345 deposit.
     """
+    typed_rows = extract_typed_amount_geometry_rows(path)
+    if typed_rows:
+        return typed_rows
     header = ["Date", "Narration", "Withdrawal", "Deposit", "Instrument Number", "Balance"]
     rows: list[list[object]] = [header]
     # Bank PDFs use both textual (18-Feb-2026) and numeric (18-02-2026,
@@ -6793,7 +6953,10 @@ def additive_compatibility_gate(source_columns: dict[str, int], inherited_column
     records only field identities and mapping facts; it does not retain source
     values, narration, or transactions.
     """
-    required = ("date", "particular", "withdrawal", "deposit", "balance")
+    required = (
+        "date", "particular", "withdrawal", "deposit", "balance",
+        "amount", "transaction_type",
+    )
     source_conflicts = [
         field for field, index in source_columns.items()
         if field in proposed_columns and proposed_columns[field] != index
@@ -6806,7 +6969,9 @@ def additive_compatibility_gate(source_columns: dict[str, int], inherited_column
     # anchors; a blank Particulars field is preserved as blank rather than
     # causing a false rejection.
     missing = [field for field in ("date", "balance") if field not in mapped]
-    if "withdrawal" not in mapped and "deposit" not in mapped:
+    split_movement = "withdrawal" in mapped or "deposit" in mapped
+    typed_movement = "amount" in mapped and "transaction_type" in mapped
+    if not split_movement and not typed_movement:
         missing.append("movement")
     metadata: dict[str, object] = {
         "step": pipeline_step_key("addendum_compatibility"),
@@ -6817,6 +6982,11 @@ def additive_compatibility_gate(source_columns: dict[str, int], inherited_column
         "conflicting_explicit_fields": source_conflicts,
         "column_collision": collisions,
         "missing_core_fields": missing,
+        "movement_contract": (
+            "separate_withdrawal_deposit" if split_movement
+            else "explicit_cr_dr_plus_amount" if typed_movement
+            else "missing"
+        ),
     }
     return (not source_conflicts and not collisions and not missing), metadata
 
