@@ -551,7 +551,7 @@ def semantic_header_role(value: object) -> str | None:
         return "deposit"
     if any(token in label for token in ("narration", "particular", "remark", "description", "detail", "transactioninfo")):
         return "narration"
-    if any(token in label for token in ("cheque", "check", "instrument", "reference", "refno", "transactionid", "utr", "rrn")):
+    if any(token in label for token in ("cheque", "check", "instrument", "reference", "refno", "transactionid", "utr", "rrn")) or label in {"chq", "chqno", "noref"}:
         return "instrument_number"
     if "date" in label:
         # Value/settlement/effective dates are still dates; callers that can
@@ -5681,13 +5681,15 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             # Capture header *meaning* first, then use this page's physical
             # coordinates.  Banks freely vary wording and wrap labels, but a
             # vocabulary difference is not a new parser family.
-            headers: dict[str, list[dict]] = {key: [] for key in ("date", "particulars", "withdrawals", "deposits", "balance")}
+            headers: dict[str, list[dict]] = {key: [] for key in ("date", "particulars", "instrument_number", "withdrawals", "deposits", "balance")}
             for word in words:
                 role = semantic_header_role(word["text"])
                 if role == "date":
                     headers["date"].append(word)
                 elif role == "narration":
                     headers["particulars"].append(word)
+                elif role == "instrument_number":
+                    headers["instrument_number"].append(word)
                 elif role == "withdrawal":
                     headers["withdrawals"].append(word)
                 elif role == "deposit":
@@ -5744,12 +5746,21 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                     return min((word for word in headers[key] if abs(float(word["top"]) - float(max(candidates, key=lambda item: float(item["top"]))["top"])) <= 12), key=lambda word: float(word["x0"]))
                 x_date = float(date_header["x0"])
                 x_part = float(same_line("particulars")["x0"])
+                instrument_headers = [
+                    word for word in headers["instrument_number"]
+                    if abs(float(word["top"]) - header_top) <= 12
+                ]
+                x_instr = float(min(instrument_headers, key=lambda word: float(word["x0"]))["x0"]) if instrument_headers else None
                 x_wd = float(same_line("withdrawals")["x0"])
                 x_dp = float(same_line("deposits")["x0"])
                 x_bal = float(same_line("balance")["x0"])
             else:
                 x_date = float(prior_geometry["x_date"])
                 x_part = float(prior_geometry["x_part"])
+                x_instr = (
+                    float(prior_geometry["x_instr"])
+                    if prior_geometry.get("x_instr") is not None else None
+                )
                 x_wd = float(prior_geometry["x_wd"])
                 x_dp = float(prior_geometry["x_dp"])
                 x_bal = float(prior_geometry["x_bal"])
@@ -5767,6 +5778,13 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 "deposit": x_dp,
                 "balance": x_bal,
             }
+            # Cheque/reference/instrument is optional, but when its own
+            # measured header exists it is a real source column boundary.
+            # Omitting it makes the Particulars band swallow reference
+            # tokens and later encourages code to guess an instrument from
+            # narration.  Preserve the column independently instead.
+            if x_instr is not None:
+                measured_starts["instrument_number"] = x_instr
             ordered_fields = sorted(measured_starts, key=measured_starts.get)
             field_bands: dict[str, tuple[float, float]] = {}
             for position, field in enumerate(ordered_fields):
@@ -5819,6 +5837,7 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 "date_headers": date_headers,
                 "x_date": x_date,
                 "x_part": x_part,
+                "x_instr": x_instr,
                 "x_wd": x_wd,
                 "x_dp": x_dp,
                 "x_bal": x_bal,
@@ -5912,8 +5931,8 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             anchors = sorted(anchor_records, key=lambda item: item[0])
             narration_right_candidates = [
                 measured_starts[field] - 10
-                for field in ("withdrawal", "deposit", "balance")
-                if measured_starts[field] > x_narration_left
+                for field in ("instrument_number", "withdrawal", "deposit", "balance")
+                if field in measured_starts and measured_starts[field] > x_narration_left
             ]
             narration_right = min(narration_right_candidates, default=float(page.width) + 5)
 
@@ -6103,6 +6122,20 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 if balance_text is None:
                     raw_balance = band(*field_bands["balance"]).replace(" ", "")
                     balance_text = "" if not raw_balance else "__AMBIGUOUS__"
+                instrument_text = ""
+                if "instrument_number" in field_bands:
+                    instrument_words = [
+                        word for word in line
+                        if field_bands["instrument_number"][0]
+                        <= (float(word["x0"]) + float(word["x1"])) / 2
+                        < field_bands["instrument_number"][1]
+                    ]
+                    instrument_text = clean_narration(" ".join(
+                        str(word["text"]) for word in sorted(
+                            instrument_words,
+                            key=lambda item: (float(item["top"]), float(item["x0"])),
+                        )
+                    ))
                 # Preserve raw monetary source cells.  The statement-level
                 # normalizer can infer the column's decimal precision from
                 # every valid row, then safely repair an isolated text-layer
@@ -6219,7 +6252,10 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 if re.search(r"(?i)^(?:opening\s+balance|b\s*/\s*f)\b", narration):
                     continue
                 refs = re.findall(r"\b\d{6,}\b", narration)
-                rows.append([display_date(date_text), narration, withdrawal_text, deposit_text, refs[-1] if refs else "", balance_text])
+                rows.append([
+                    display_date(date_text), narration, withdrawal_text, deposit_text,
+                    instrument_text or (refs[-1] if refs else ""), balance_text,
+                ])
                 if os.environ.get("UPG_GEOMETRY_DIAGNOSTICS") == "1":
                     diagnostic_accepts.append((page_number, date_text))
             if len(rows) > page_row_start:
