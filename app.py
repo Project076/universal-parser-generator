@@ -5662,6 +5662,11 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
     # following page when exactly one measured movement side and one balance
     # are present.  This is source-order continuation, never row grouping.
     pending_page_tail: dict[str, object] | None = None
+    # A complete transaction can also have only its wrapped Particulars text
+    # continued below the repeated header on the next physical page.  Keep a
+    # pointer to the immediately preceding source row so a narration-only
+    # prefix can be appended without changing its Date, movement or balance.
+    pending_narration_row_index: int | None = None
     diagnostic_pages: list[tuple[int, int]] = []
     diagnostic_accepts: list[tuple[int, str]] = []
     with open_pdfplumber(path) as pdf:
@@ -5860,14 +5865,49 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
             # header-like footer line cannot create a second copy of a region.
             ledger_sections = sorted({(start, end) for start, end in ledger_sections if end > start + 1})
             anchor_records: list[tuple[float, str, float, float]] = []
+            # Some native PDF generators (not OCR) emit a visible date such
+            # as ``11 Mar 2026`` as three independently positioned words.
+            # The old geometry path accepted only a single token such as
+            # ``11-Mar-2026`` and therefore saw a perfectly ordinary ledger
+            # as a header followed by zero transactions.  Reconstruct a date
+            # phrase only from one visual baseline inside the already
+            # measured Date column.  Date-looking text in Particulars can
+            # never enter this path.
+            date_words_by_baseline: dict[int, list[dict]] = {}
             for word in words:
                 word_top = float(word["top"])
-                if not (date_re.fullmatch(str(word["text"]))
-                        and date_left <= float(word["x0"]) < date_right):
+                if date_left <= float(word["x0"]) < date_right:
+                    date_words_by_baseline.setdefault(round(word_top * 2), []).append(word)
+
+            for baseline_words in date_words_by_baseline.values():
+                baseline_words = sorted(baseline_words, key=lambda item: float(item["x0"]))
+                word_top = min(float(item["top"]) for item in baseline_words)
+                compact_tokens = [str(item["text"]).strip() for item in baseline_words]
+                compact_tokens = [token for token in compact_tokens if token]
+                date_text: str | None = None
+                if len(compact_tokens) == 1 and date_re.fullmatch(compact_tokens[0]):
+                    date_text = compact_tokens[0]
+                else:
+                    phrase = " ".join(compact_tokens)
+                    phrase_match = re.fullmatch(
+                        r"(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})",
+                        phrase,
+                    )
+                    if phrase_match:
+                        day, month_name, year = phrase_match.groups()
+                        try:
+                            parsed_phrase = datetime.strptime(
+                                f"{int(day):02d} {month_name[:3].title()} {year}",
+                                "%d %b %Y",
+                            )
+                            date_text = parsed_phrase.strftime("%d-%b-%Y")
+                        except ValueError:
+                            date_text = None
+                if date_text is None:
                     continue
                 for section_start, section_end in ledger_sections:
                     if section_start < word_top < section_end:
-                        anchor_records.append((word_top, str(word["text"]), section_start, section_end))
+                        anchor_records.append((word_top, date_text, section_start, section_end))
                         break
             anchors = sorted(anchor_records, key=lambda item: item[0])
             narration_right_candidates = [
@@ -5892,6 +5932,47 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                     if money(raw_cell) is not None or repair_indian_grouping_decimal(raw_cell, 2) is not None:
                         candidates.append(raw_cell)
                 return candidates[0] if len(candidates) == 1 else None
+
+            # Resolve a narration-only continuation across a physical page
+            # boundary.  It is accepted only between the repeated measured
+            # header and the first new Date-column anchor, only inside the
+            # measured Particulars band, and only when that prefix contains
+            # no movement or balance cell.  This preserves a wrapped
+            # narration while making it impossible to group two transaction
+            # amounts or invent a ledger value.
+            if pending_narration_row_index is not None:
+                prior_row_index = pending_narration_row_index
+                pending_narration_row_index = None
+                if anchors and pending_page_tail is None:
+                    continuation_floor = anchors[0][2]
+                    continuation_ceiling = anchors[0][0] - 0.25
+                    prefix_words = [
+                        word for word in words
+                        if continuation_floor < float(word["top"]) < continuation_ceiling
+                    ]
+                    prefix_wd = one_money_cell(prefix_words, *field_bands["withdrawal"])
+                    prefix_dp = one_money_cell(prefix_words, *field_bands["deposit"])
+                    prefix_bal = one_money_cell(prefix_words, *field_bands["balance"])
+                    continuation_words = [
+                        word for word in prefix_words
+                        if x_narration_left <= float(word["x0"]) < narration_right
+                    ]
+                    continuation = clean_narration(" ".join(
+                        str(word["text"]) for word in sorted(
+                            continuation_words,
+                            key=lambda item: (float(item["top"]), float(item["x0"])),
+                        )
+                    ))
+                    if (
+                        continuation
+                        and prefix_wd is None
+                        and prefix_dp is None
+                        and prefix_bal is None
+                        and 0 < prior_row_index < len(rows)
+                    ):
+                        rows[prior_row_index][1] = clean_narration(
+                            " ".join(filter(None, [str(rows[prior_row_index][1]), continuation]))
+                        )
 
             # Resolve an incomplete terminal row from page N using only the
             # measured pre-first-Date ledger band on page N+1. Repeated bank
@@ -6141,6 +6222,8 @@ def extract_standard_column_geometry_rows(path: Path) -> list[list[object]]:
                 rows.append([display_date(date_text), narration, withdrawal_text, deposit_text, refs[-1] if refs else "", balance_text])
                 if os.environ.get("UPG_GEOMETRY_DIAGNOSTICS") == "1":
                     diagnostic_accepts.append((page_number, date_text))
+            if len(rows) > page_row_start:
+                pending_narration_row_index = len(rows) - 1
             try:
                 page.close()
             except Exception:
