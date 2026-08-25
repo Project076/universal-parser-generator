@@ -24,6 +24,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from specialist_workers import build_blocked_step_escalation, build_specialist_worker_registry
+
 try:
     from PIL import Image
     import pytesseract
@@ -2148,6 +2150,11 @@ PIPELINE_STEP_MANIFEST: dict[int, str] = {
 if set(PIPELINE_STEP_MANIFEST) != set(range(1, 51)) or len(set(PIPELINE_STEP_MANIFEST.values())) != 50:
     raise RuntimeError("Pipeline step manifest must contain one unique name for every step 1 through 50")
 
+# Turn the immutable manifest into fifty scoped logical specialists.  These
+# contracts route knowledge and repairs; they are deliberately not fifty OS
+# processes competing for the Railway container's memory.
+SPECIALIST_WORKERS = build_specialist_worker_registry(PIPELINE_STEP_MANIFEST)
+
 STEP_NAMES = {
     "source_intake": (1, "SOURCE_INTAKE"),
     "native_structure": (2, "NATIVE_STRUCTURE_READ"),
@@ -2198,6 +2205,10 @@ def pipeline_step_key(failure_type: str) -> str:
     name = PIPELINE_STEP_MANIFEST[number]
     return f"S{number:02d}_{name}"
 
+def specialist_worker_for_failure(failure_type: str) -> dict[str, object]:
+    number, _name = STEP_NAMES.get(failure_type, STEP_NAMES["column_geometry"])
+    return dict(SPECIALIST_WORKERS[number])
+
 def certified_lessons_for_step(profile_id: object, failure_type: str) -> list[dict[str, object]]:
     """Read only the safe, already-certified lessons for one pipeline step."""
     ident = str(profile_id or "")
@@ -2222,11 +2233,16 @@ def record_step_learning(job_id: str | None, failure_type: str, status: str,
     if not job_id:
         return
     step = pipeline_step_key(failure_type)
+    specialist = specialist_worker_for_failure(failure_type)
     safe_rules = [str(item) for item in (rules or []) if str(item) in DIAGNOSTIC_RULE_LIBRARY][:8]
     with JOBS_LOCK:
         job = JOBS.get(job_id, {})
         history = [dict(item) for item in job.get("pipeline_step_history", []) if isinstance(item, dict)][-20:]
-        event = {"step": step, "failure_type": failure_type, "status": status, "rules": safe_rules,
+        event = {"step": step, "worker_id": specialist["worker_id"],
+                 "specialist_domain": specialist["domain"],
+                 "certified_library_scopes": specialist["library_scopes"],
+                 "failure_type": failure_type, "status": status, "rules": safe_rules,
+                 "learning_policy": "versioned_addendum_only",
                  "agent_used": bool(agent_used), "at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
         if not history or history[-1] != event:
             history.append(event)
@@ -2246,6 +2262,7 @@ def compact_ai_learning_packet(path: Path | None = None, headers: list[object] |
     distracted by, for example, a B/F or narration-only lesson.
     """
     step_number, step_name = STEP_NAMES.get(failure_type, STEP_NAMES["column_geometry"])
+    specialist = specialist_worker_for_failure(failure_type)
     capabilities = source_capability_plan(raw, headers)
     selected_rules = list(dict.fromkeys(
         rule for item in capabilities if isinstance(item, dict)
@@ -2282,6 +2299,14 @@ def compact_ai_learning_packet(path: Path | None = None, headers: list[object] |
             "mode": "source_proven_rules_and_closest_certified_lessons_only",
             "included_rule_count": len(allowed_rules),
             "excluded": "unrelated rule libraries, foreign parser code, coordinates, transaction data, and unproven capabilities",
+        },
+        "specialist_worker": specialist,
+        "supervisor_contract": {
+            "primary_route": "configured_primary_llm",
+            "fallback_route": "gpt_only_when_primary_cannot_produce_a_safe_addendum",
+            "task": "propose_one_measured_addendum_for_the_blocked_specialist",
+            "replay_from_step": step_number,
+            "may_overwrite_certified_learning": False,
         },
         "output_contract": {
             "required": list(MANDATORY_TRANSACTION_FIELDS),
@@ -3890,6 +3915,10 @@ def module_level_repair_route(investigation: dict[str, object],
     drift_findings = []
     if isinstance(capability_drift, dict):
         drift_findings = [str(item) for item in capability_drift.get("findings", []) if str(item)][:4]
+    specialist = specialist_worker_for_failure(failure_type)
+    escalation = build_blocked_step_escalation(
+        specialist, failure_type, rules, affected_groups, upstream or [failure_type]
+    )
     return {
         "step": pipeline_step_key("module_level_repair_routing"),
         "blocked_step": pipeline_step_key(failure_type),
@@ -3899,6 +3928,9 @@ def module_level_repair_route(investigation: dict[str, object],
         "upstream_steps_rechecked": upstream or [failure_type],
         "capability_drift_findings": drift_findings,
         "repair_mode": "additive_module_addendum",
+        "specialist_worker": specialist,
+        "supervisor_escalation": escalation,
+        "replay_from_step": specialist["replay_from_step"],
         "forbidden": ["replace_certified_parser", "copy_foreign_geometry", "weaken_release_gates"],
         "outcome": "routed",
     }
@@ -8840,6 +8872,22 @@ class App(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_url = urlparse(self.path)
         path = parsed_url.path
+        if path == "/pipeline-specialists":
+            if not self.api_authorized(): return
+            # Read-only architecture telemetry. This intentionally exposes no
+            # statement text, tenant data, parser code, or learned examples.
+            # It lets an operator verify that every named pipeline step is
+            # backed by one scoped logical specialist before submitting work.
+            workers = [SPECIALIST_WORKERS[number] for number in sorted(SPECIALIST_WORKERS)]
+            self.json({
+                "ok": True,
+                "worker_count": len(workers),
+                "architecture": "named_logical_specialists",
+                "learning_policy": "versioned_addendum_only",
+                "certified_learning_is_immutable": True,
+                "workers": workers,
+            })
+            return
         if path == "/queue-status":
             # Safe operational telemetry: no tenant names, files, or parser
             # details are exposed.  This lets BS Analyzer distinguish a real

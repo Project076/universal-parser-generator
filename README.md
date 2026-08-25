@@ -24,6 +24,32 @@ certified capabilities, and validation do not consume this allowance. Set
 `UPG_MAX_AI_CALLS_PER_JOB` between `1` and `3` only when an operator needs a
 different limit. Validation is never relaxed by this limit.
 
+## Specialist pipeline architecture
+
+UPG defines exactly 50 named logical specialist workers. They are pipeline
+stages, not 50 operating-system processes. Each specialist can retrieve only
+the certified knowledge relevant to its domain. For example, the furniture
+removal specialist uses page-header, footer, summary, disclaimer, and
+cross-page-boundary knowledge; it does not retrieve narration or amount rules.
+
+If a stage is blocked, UPG produces a structured escalation containing the
+blocked step, measured source evidence, applicable certified rules, attempted
+candidates, and exact validation failures. The supervisor may propose only a
+versioned addendum for that specialist. It cannot overwrite an earlier
+certified rule, import another layout's geometry, invent statement values, or
+weaken validation. Processing then replays from the earliest affected step and
+must pass the complete independent certification gates before a parser is
+saved.
+
+Authenticated operators can inspect the registry with
+`GET /pipeline-specialists`. The response contains worker names, domains,
+scoped libraries, and repair policy, but never statement data or parser code.
+
+The current deployment continues to use the configured OpenAI model for
+agentic decisions. A local Qwen model should be connected as a separate
+inference service before making it the primary model; the existing 1 GB web
+container is intentionally not used to host the model.
+
 ## Validation
 
 The app extracts declared opening and closing balances from the source separately from transactions. It validates:
