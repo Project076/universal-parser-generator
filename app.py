@@ -348,6 +348,13 @@ FIVE_MINUTES_MS = 300000
 # achieved by eliminating repeated, low-evidence calls below—not by lowering
 # the reasoning capability available for unfamiliar layouts.
 AI_MODEL = os.environ.get("UPG_AI_MODEL", "gpt-5.6-sol")
+QWEN_API_BASE_URL = os.environ.get("QWEN_API_BASE_URL", "").strip().rstrip("/")
+QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "").strip()
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-upg-agent").strip() or "qwen-upg-agent"
+try:
+    QWEN_REQUEST_TIMEOUT_SECONDS = min(180, max(20, int(os.environ.get("QWEN_REQUEST_TIMEOUT_SECONDS", "90"))))
+except ValueError:
+    QWEN_REQUEST_TIMEOUT_SECONDS = 90
 try:
     AI_MAX_OUTPUT_TOKENS = min(1_200, max(250, int(os.environ.get("UPG_AI_MAX_OUTPUT_TOKENS", "750"))))
 except ValueError:
@@ -3237,8 +3244,8 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
                 persist_job_locked(job_id)
         return measured_header_at, {}
     key = os.environ.get("OPENAI_API_KEY")
-    if not key:
-        record_failure("OPENAI_API_KEY is not configured.")
+    if not agent_ai_configured():
+        record_failure("No agentic AI provider is configured.")
         return None
     if not reserve_ai_call(job_id, purpose):
         record_failure("AI call budget is exhausted before a layout map could be generated.")
@@ -3309,9 +3316,17 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
     request = urllib.request.Request(
         "https://api.openai.com/v1/responses", data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST",
-    )
+    ) if key else None
     try:
-        generated = request_openai_schema(request, job_id, purpose)
+        generated = request_agent_schema(
+            instruction,
+            json.dumps(evidence, default=str),
+            schema,
+            "bank_layout",
+            job_id,
+            purpose,
+            request,
+        )
         header_row = int(generated["header_row"])
         columns = normalized_profile_columns(generated.get("columns"))
         if columns is None:
@@ -3357,7 +3372,7 @@ def ai_generated_profile(rows: list[list[object]], raw: str, repair_context: str
             patch_job(job_id, ai_layout_maps=maps, ai_layout_error="")
         return header_row, columns
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError) as error:
-        record_failure(safe_openai_error(error))
+        record_failure(safe_agent_error(error))
         return None
 
 def response_schema_object(result: object) -> dict:
@@ -3443,10 +3458,120 @@ def request_openai_schema(request: urllib.request.Request, job_id: str | None, p
             continue
     raise ValueError("OpenAI returned no usable schema object after one controlled retry.")
 
+
+def qwen_configured() -> bool:
+    return bool(QWEN_API_BASE_URL and QWEN_API_KEY)
+
+
+def agent_ai_configured() -> bool:
+    return qwen_configured() or bool(os.environ.get("OPENAI_API_KEY"))
+
+
+def record_ai_provider_event(job_id: str | None, purpose: str, provider: str, status: str, detail: str = "") -> None:
+    """Retain bounded provider routing telemetry without recording credentials or source text."""
+    if not job_id:
+        return
+    with JOBS_LOCK:
+        job = JOBS.get(job_id, {})
+        events = list(job.get("ai_provider_events", []))[-11:]
+        event = {"purpose": purpose, "provider": provider, "status": status}
+        if detail:
+            event["detail"] = detail[:220]
+        events.append(event)
+        job["ai_provider_events"] = events
+        job["last_ai_provider"] = provider
+        JOBS[job_id] = job
+        persist_job_locked(job_id)
+
+
+def chat_schema_object(result: object) -> dict:
+    """Extract one JSON object from an OpenAI-compatible chat-completions response."""
+    if not isinstance(result, dict):
+        raise ValueError("Qwen returned a non-object response.")
+    choices = result.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ValueError("Qwen returned no completion choice.")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise ValueError("Qwen returned no completion message.")
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(
+            str(item.get("text") or "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Qwen returned empty structured output.")
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("Qwen returned no JSON object.")
+        value = json.loads(text[start:end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("Qwen structured output was not an object.")
+    return value
+
+
+def request_qwen_schema(system_prompt: str, user_prompt: str, schema: dict, schema_name: str) -> dict:
+    payload = {
+        "model": QWEN_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": AI_MAX_OUTPUT_TOKENS,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
+        },
+    }
+    request = urllib.request.Request(
+        f"{QWEN_API_BASE_URL}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {QWEN_API_KEY}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=QWEN_REQUEST_TIMEOUT_SECONDS) as response:
+        return chat_schema_object(json.loads(response.read().decode("utf-8-sig")))
+
+
+def request_agent_schema(
+    system_prompt: str,
+    user_prompt: str,
+    schema: dict,
+    schema_name: str,
+    job_id: str | None,
+    purpose: str,
+    openai_request: urllib.request.Request | None = None,
+) -> dict:
+    """Use local Qwen first; use GPT only as fallback for the same logical decision."""
+    qwen_error = ""
+    if qwen_configured():
+        try:
+            result = request_qwen_schema(system_prompt, user_prompt, schema, schema_name)
+            record_ai_provider_event(job_id, purpose, "qwen", "success")
+            return result
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError) as error:
+            qwen_error = f"{type(error).__name__}: {str(error)[:160]}"
+            record_ai_provider_event(job_id, purpose, "qwen", "fallback", qwen_error)
+    if openai_request is not None and os.environ.get("OPENAI_API_KEY"):
+        result = request_openai_schema(openai_request, job_id, purpose)
+        record_ai_provider_event(job_id, purpose, "openai", "success")
+        return result
+    if qwen_error:
+        raise ValueError(f"Qwen specialist failed and GPT fallback is unavailable ({qwen_error}).")
+    raise ValueError("No agentic AI provider is configured.")
+
 def ai_choose_text_strategy(raw: str, job_id: str | None = None) -> str | None:
     """Let the parser-generator select a supported extraction path for a new layout."""
     key = os.environ.get("OPENAI_API_KEY")
-    if not key: return None
+    if not agent_ai_configured(): return None
     if not reserve_ai_call(job_id, "strategy_classification"):
         return None
     schema = {
@@ -3454,18 +3579,20 @@ def ai_choose_text_strategy(raw: str, job_id: str | None = None) -> str | None:
         "properties": {"strategy": {"type": "string", "enum": ["running_balance_text", "unsigned_running_balance_text", "value_date_unsigned", "needs_ocr", "unsupported"]}},
         "required": ["strategy"],
     }
+    system_prompt = (AI_LAYOUT_CONTRACT + "\nClassify this bank statement layout. Choose running_balance_text when dated entries have Dr/Cr running balances. Choose unsigned_running_balance_text when dated entries have unsigned running balances whose changes can infer debit or credit; choose "
+        "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported.")
+    user_prompt = "UPG learning: " + json.dumps(compact_ai_learning_packet(raw=raw)) + "\n\n" + raw[:3500]
     payload = {
         "model": AI_MODEL,
-        "input": (AI_LAYOUT_CONTRACT + "\nClassify this bank statement layout. Choose running_balance_text when dated entries have Dr/Cr running balances. Choose unsigned_running_balance_text when dated entries have unsigned running balances whose changes can infer debit or credit; choose "
-            "value_date_unsigned when there are both posting Date and Value Date columns plus unsigned running balances; choose needs_ocr for image/scanned text; otherwise choose unsupported.\nUPG learning: " + json.dumps(compact_ai_learning_packet(raw=raw)) + "\n\n" + raw[:3500]
-        ),
+        "input": [{"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+                  {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}],
         "max_output_tokens": AI_MAX_OUTPUT_TOKENS,
         "text": {"format": {"type": "json_schema", "name": "extraction_strategy", "strict": True, "schema": schema}},
     }
-    request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
+    request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST") if key else None
     try:
-        with urllib.request.urlopen(request, timeout=90) as response: result = json.loads(response.read().decode("utf-8-sig"))
-        return str(response_schema_object(result)["strategy"])
+        result = request_agent_schema(system_prompt, user_prompt, schema, "extraction_strategy", job_id, "strategy_classification", request)
+        return str(result["strategy"])
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
         return None
 
@@ -3486,6 +3613,14 @@ def safe_openai_error(error: Exception) -> str:
         detail = re.sub(r"\s+", " ", str(error)).strip()[:220]
         return "OpenAI response error" + (f": {detail}" if detail else ".")
     return f"OpenAI response error: {type(error).__name__}."
+
+
+def safe_agent_error(error: Exception) -> str:
+    """Return provider-neutral diagnostics for the Qwen-first AI chain."""
+    detail = re.sub(r"\s+", " ", str(error)).strip()[:220]
+    if detail.startswith("Qwen specialist failed") or detail.startswith("No agentic AI provider"):
+        return detail
+    return safe_openai_error(error)
 
 def source_record_coverage_collapsed(evidence: str) -> bool:
     """Return true only for a decisive, measured source-row shortfall.
@@ -3595,8 +3730,8 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
     transactions, balances, executable code, or a weaker validation standard.
     """
     key = os.environ.get("OPENAI_API_KEY")
-    if not key:
-        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI diagnosis unavailable: OPENAI_API_KEY is not configured."}
+    if not agent_ai_configured():
+        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI diagnosis unavailable: no agentic AI provider is configured."}
     if not reserve_ai_call(job_id, "targeted_repair_plan"):
         return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI call budget reached for this job; no new evidence-led repair remains."}
     scoped_failure_type = failure_type_from_evidence(failure)
@@ -3609,12 +3744,12 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
         "failure_type": {"type": "string", "enum": ["source_shape", "column_geometry", "header_mapping", "amount_normalization", "date_order", "bf_summary", "classification", "continuation", "page_furniture", "balance_direction", "unreliable_balance", "endpoint", "source_totals", "narration_coverage", "transaction_count", "balance_chain", "addendum_compatibility", "novel_layout"]},
         "profile_action": {"type": "string", "enum": ["reuse_geometry", "repair_header_map", "repair_continuations", "repair_date_order", "repair_balance_direction", "reject_unsafe"]},
     }, "required": ["rules", "strategies", "failure_type", "profile_action"]}
-    prompt = AI_LAYOUT_CONTRACT + "\nThis is the final AI decision for this job and it is being made AFTER the first source-layout extraction failed. Repair only " + str(learning_packet["ai_context_scope"]["pipeline_step"]) + ". Do not move downstream until this step has source proof. Produce one targeted, evidence-led repair plan using only the supplied certified modules and strategies. Do not write code or transactions, do not relax validation, and do not request another AI layout addendum. If evidence is insufficient, choose reject_unsafe.\nScoped rules: " + json.dumps(learning_packet["allowed_rule_modules"]) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(learning_packet) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
-    payload = {"model": AI_MODEL, "input": prompt, "max_output_tokens": AI_MAX_OUTPUT_TOKENS, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
-    request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
+    system_prompt = AI_LAYOUT_CONTRACT + "\nYou are the targeted repair planner. Do not write code or transactions, relax validation, or request another broad layout attempt."
+    user_prompt = "This is the final AI decision for this job and it is being made AFTER the first source-layout extraction failed. Repair only " + str(learning_packet["ai_context_scope"]["pipeline_step"]) + ". Do not move downstream until this step has source proof. Produce one targeted, evidence-led repair plan using only the supplied certified modules and strategies. If evidence is insufficient, choose reject_unsafe.\nScoped rules: " + json.dumps(learning_packet["allowed_rule_modules"]) + "\nStrategies: " + json.dumps(safe_strategies) + "\nUPG learning: " + json.dumps(learning_packet) + "\nFailure evidence: " + failure[-1800:] + "\nSource excerpt: " + raw[:3500]
+    payload = {"model": AI_MODEL, "input": [{"role": "system", "content": [{"type": "input_text", "text": system_prompt}]}, {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}], "max_output_tokens": AI_MAX_OUTPUT_TOKENS, "text": {"format": {"type": "json_schema", "name": "diagnostic_rules", "strict": True, "schema": schema}}}
+    request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST") if key else None
     try:
-        with urllib.request.urlopen(request, timeout=90) as response: result = json.loads(response.read().decode("utf-8-sig"))
-        plan = response_schema_object(result)
+        plan = request_agent_schema(system_prompt, user_prompt, schema, "diagnostic_rules", job_id, "targeted_repair_plan", request)
         return {
             "rules": [rule for rule in plan["rules"] if rule in allowed_rules],
             "strategies": [strategy for strategy in plan["strategies"] if strategy in safe_strategies],
@@ -3628,7 +3763,7 @@ def ai_diagnose_failure(raw: str, failure: str, source_path: Path | None = None,
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError) as error:
         # Keep only a short, non-sensitive diagnostic.  This lets the retry
         # loop distinguish an AI/API failure from a genuine but empty plan.
-        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI diagnosis unavailable: " + safe_openai_error(error)}
+        return {"rules": [], "strategies": [], "failure_type": "novel_layout", "profile_action": "reject_unsafe", "diagnostic_error": "AI diagnosis unavailable: " + safe_agent_error(error)}
 
 def candidate_failure_evidence(candidate: tuple | None) -> list[str]:
     """Emit compact, non-sensitive proof for the one module that failed.
