@@ -3552,7 +3552,7 @@ def request_agent_schema(
 ) -> dict:
     """Use local Qwen first; use GPT only as fallback for the same logical decision."""
     qwen_error = ""
-    if qwen_configured():
+    if os.environ.get("QWEN_PRIMARY", "0").lower() in {"1", "true", "yes"} and qwen_configured():
         try:
             result = request_qwen_schema(system_prompt, user_prompt, schema, schema_name)
             record_ai_provider_event(job_id, purpose, "qwen", "success")
