@@ -3517,19 +3517,30 @@ def chat_schema_object(result: object) -> dict:
     return value
 
 
+def qwen_schema_prompt_suffix(schema: dict, schema_name: str) -> str:
+    """Describe the required JSON output as a plain-language instruction.
+
+    vLLM 0.27.1's Qwen chat template validates the payload strictly and
+    rejects OpenAI's structured-output `response_format` field with HTTP 400.
+    Qwen therefore receives the schema as part of the prompt instead; the
+    reply is still parsed and validated locally via `chat_schema_object`.
+    """
+    return (
+        f"\n\nOutput schema (\"{schema_name}\"): {json.dumps(schema)}"
+        "\nRespond with exactly one JSON object matching this schema and nothing else."
+    )
+
+
 def request_qwen_schema(system_prompt: str, user_prompt: str, schema: dict, schema_name: str) -> dict:
+    prompt_with_schema = user_prompt + qwen_schema_prompt_suffix(schema, schema_name)
     payload = {
         "model": QWEN_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": prompt_with_schema},
         ],
         "temperature": 0,
         "max_tokens": AI_MAX_OUTPUT_TOKENS,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": schema_name, "strict": True, "schema": schema},
-        },
     }
     request = urllib.request.Request(
         f"{QWEN_API_BASE_URL}/chat/completions",
@@ -3558,7 +3569,7 @@ def request_agent_schema(
             record_ai_provider_event(job_id, purpose, "qwen", "success")
             return result
         except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError) as error:
-            qwen_error = f"{type(error).__name__}: {str(error)[:160]}"
+            qwen_error = safe_qwen_error(error)
             record_ai_provider_event(job_id, purpose, "qwen", "fallback", qwen_error)
     if openai_request is not None and os.environ.get("OPENAI_API_KEY"):
         result = request_openai_schema(openai_request, job_id, purpose)
@@ -3595,6 +3606,48 @@ def ai_choose_text_strategy(raw: str, job_id: str | None = None) -> str | None:
         return str(result["strategy"])
     except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError, json.JSONDecodeError):
         return None
+
+def sanitize_upstream_error_text(message: str) -> str:
+    """Reduce an upstream error string to a short, non-sensitive diagnostic.
+
+    Collapses whitespace, truncates to 220 characters, and redacts anything
+    that looks like a bearer token, API key, or other long secret so that no
+    credential, prompt text, or account data ever reaches job records or logs.
+    """
+    text = re.sub(r"\s+", " ", message or "").strip()
+    text = re.sub(r"(?i)(bearer\s+)\S+", r"\1[redacted]", text)
+    text = re.sub(r"(?i)((?:api|access)[_-]?(?:key|token)\s*[:=]\s*)\S+", r"\1[redacted]", text)
+    text = re.sub(r"\b[A-Za-z0-9_\-]{24,}\b", "[redacted]", text)
+    return text[:220]
+
+
+def safe_qwen_error(error: Exception) -> str:
+    """Return a sanitized, upstream-only diagnostic for a failed Qwen call.
+
+    vLLM's Qwen chat template can reject an unsupported payload field (for
+    example the OpenAI `response_format` field) with HTTP 400. Only the
+    upstream error message is captured here, sanitized and capped at 220
+    characters; the request payload, prompts, and any secrets are never
+    logged or recorded.
+    """
+    if isinstance(error, urllib.error.HTTPError):
+        message = ""
+        try:
+            body = json.loads(error.read().decode("utf-8", errors="replace"))
+            if isinstance(body, dict):
+                raw_error = body.get("error", "")
+                message = str(raw_error.get("message", "")) if isinstance(raw_error, dict) else str(raw_error or body.get("message", ""))
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        message = sanitize_upstream_error_text(message)
+        return f"Qwen HTTP {error.code}" + (f": {message}" if message else ".")
+    if isinstance(error, urllib.error.URLError):
+        return f"Qwen network error: {type(error.reason).__name__}."
+    if isinstance(error, ValueError):
+        detail = sanitize_upstream_error_text(str(error))
+        return "Qwen response error" + (f": {detail}" if detail else ".")
+    return f"Qwen response error: {type(error).__name__}."
+
 
 def safe_openai_error(error: Exception) -> str:
     """Expose actionable provider diagnostics without exposing keys or source text."""
